@@ -1,0 +1,12 @@
+# Game disassembly dumps -- not our code, don't publish
+scratch/
+
+# Generated telemetry / flight logs
+sfsprobe/archive/
+*.jsonl
+
+# Build artifacts (regenerate via sfsprobe/build.sh)
+*.dll
+
+# macOS
+.DS_Store
