@@ -10,3 +10,6 @@ sfsprobe/archive/
 
 # macOS
 .DS_Store
+
+# Local working-procedure notes -- not for the repo
+CLAUDE.md
