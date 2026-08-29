@@ -251,3 +251,124 @@ tell Christian to start a new session before continuing.
 A fresh session starts by reading this file plus
 `docs/sfs_reference/INDEX.md` (once it exists) to see exactly where the
 last one left off.
+
+---
+
+## Operation: Tidal Wave -- system-level reconstruction documentation
+
+**This is a separate, parallel track, not Phase 4.** It does not block
+on, and is not blocked by, Phases 1-3 above. It can start any time --
+ideally once Step 1.5 is done and a meaningful chunk of per-class
+coverage exists to draw from, but it doesn't have to wait for that.
+Sessions on this track pull from whatever's currently confirmed in
+`docs/sfs_reference/` (and `sfs_source_reference.md` for anything not
+yet migrated), and flag/cross-link rather than block when they hit an
+under-documented class.
+
+**What this actually is.** The per-class reference (Phases 1-3) answers
+"what does this method do." Operation: Tidal Wave answers "how does the
+game actually work, end to end, well enough that someone could rebuild
+it -- or correctly extend it -- without ever touching the source or the
+IL." It is the kind of documentation an engineer on the original team
+would maintain for onboarding, not what a fan-made wiki produces: it
+covers how to use a system, how it works internally, what must be true
+before you touch it, and exactly where people get it wrong.
+
+**No code.** Prose, sequences, data-flow descriptions, cross-references
+-- not reproduced C#/IL. Consistent with how the rest of this project
+already documents behavior (describing what a method does, not pasting
+its body) -- the difference here is scope (a whole system, not one
+method) and audience (someone building a new feature, not someone
+looking up a signature).
+
+**Why this exists, concretely.** The `loadblueprint` incident
+(2026-08-29) was a SCENE-LIFECYCLE problem -- `RocketManager.
+SpawnBlueprint` needing `World_PC` isn't a fact about that one method,
+it's a fact about how the game's Hub_PC/Build_PC/World_PC/Home_PC scene
+lifecycle populates and tears down singletons like `WorldView.main`.
+No per-class doc, however good, tells you that on its own -- you'd need
+to already know to go look. A system-level doc titled "Scene Lifecycle"
+would have stated it as a fact about the system, found once and never
+relearned the hard way again.
+
+**Definition of done, per system** (this is what keeps "reconstruct the
+entire game" from being unbounded): a developer with zero access to the
+source or the IL could build a NEW feature that correctly integrates
+with that system, using ONLY this doc plus the per-class reference it
+links to -- no guessing, no re-deriving a precondition by crashing into
+it first. If a system's doc can't clear that bar, it isn't done.
+
+**Format.** `docs/sfs_reference/tidal_wave/`, one file per system.
+Template:
+
+```markdown
+## System Name
+
+**Status:** [CONFIRMED] | [PARTIAL] | [OPEN]
+**Key participants:** classes/methods involved, each linking to its
+  per-class entry (this doc doesn't re-derive signatures, it connects them)
+
+### Overview
+What this system does and why it exists.
+
+### How it works, end to end
+The actual sequence/flow -- real call chains, real ordering, what
+runs when, on rails vs live, what's gated and by what.
+
+### How to use / integrate
+If you're building a feature that touches this system, here's the
+real entry points and the correct way to call them.
+
+### Prerequisites
+What must already be true before this system can be used --
+scene, populated singletons, initialization order.
+
+### Pitfalls
+Known gotchas, wrong assumptions already made and corrected (e.g. the
+Build_PC/World_PC case belongs here, in "Scene Lifecycle" and/or
+"Rocket Construction & Spawning").
+```
+
+**Starting system list** (not exhaustive, not rigid -- refine as work
+proceeds; prioritize systems SFSProbe.cs's existing commands already
+touch, since those are live risk, before expanding outward):
+
+- Scene lifecycle (Hub_PC/Build_PC/World_PC/Home_PC transitions; what's
+  populated/torn down at each; `WorldView.main`'s lifecycle -- this one
+  directly would have prevented the loadblueprint incident)
+- Rocket construction & spawning (`Blueprint` -> `PartSave` -> `Part` ->
+  `Rocket`, both routes: `BuildState.LoadBlueprint` (editor) and
+  `RocketManager.SpawnBlueprint` (world) -- including WHY they differ
+  and when each is actually appropriate, not just that they exist)
+- Physics tick loop (`FixedUpdate` order of operations: gravity, drag,
+  thrust, RCS, heat, staging checks -- what runs when, live vs on rails)
+- Timewarp system (physics warp vs rails warp, what's gated off in each)
+- Save/load pipeline (`WorldSave`, `RocketSave`, `Blueprint`, the
+  `JsonWrapper` layer, on-disk file layout)
+- Parametric part variable system (`Composed_Float` expression
+  evaluation, `VariablesModule`, how part configuration actually resolves)
+- Staging system (`Staging.Load`, stage IDs, part-to-stage mapping,
+  separation events)
+- Drag/aerodynamics system (`GetDragSurfaces` -> `GetExposedSurfaces` ->
+  `CalculateDragForce`, rotation-matrix derivation)
+- Heat/destruction system (temperature accumulation, tolerance
+  thresholds, destruction triggers)
+- Control input system (`Arrowkeys`, `hasControl` gating in the UI
+  layer, direct-write bypass implications)
+- Engine/thrust system (`EngineModule`, gimbal, throttle resolution
+  chain, the multi-engine independent-force model)
+- RCS system (thruster selection logic, on/off thresholds)
+- Editor/build system (`BuildState`, `BuildMenus`, `BuildGrid`,
+  `BuildOrientation`, part placement/undo)
+- Mod loading system (`ModLoader.Mod` contract, the Harmony/MonoMod
+  situation)
+- Achievement/challenge system (`Challenge` catalog, completion tracking)
+- SOI/orbital mechanics system (`Kepler` library, trajectory prediction,
+  SOI-crossing physics-mode transitions)
+- Resource/fuel system (`ResourceModule`, per-stage fuel aggregation)
+
+**Session boundaries for this track:** checkpoint after every 1-2
+complete system docs (these are much larger than a single class entry),
+run `/session-save`, hand off. This track's checkpoints are independent
+of Phases 1-3's -- interleave however makes sense; they don't block
+each other.
