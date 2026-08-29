@@ -133,14 +133,19 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
 - [ ] **Editor automation vs. file-writing** — does the agent play the
       in-game editor, or write blueprint files directly. **Substantially
       de-risked, 2026-08-29** (not yet fully decided, since multi-part is
-      untested): the file-writing route is now **live-confirmed working**
-      for a single-part design — `RocketManager.SpawnBlueprint(Blueprint)`
-      spawns a real part with zero editor interaction, called via
-      reflection from a plain JSON file. Required finding, the hard way,
-      that the call must happen from `World_PC` (a loaded flight), not
-      `Build_PC` — see `docs/sfs_reference/07-saveload/RocketManager.md`.
-      Still open: whether `GenerateJoints` actually connects a multi-part
-      design into something flyable, and whether the documented
+      untested): the file-writing route now has TWO confirmed-working
+      mechanisms depending on intent -- `BuildState.LoadBlueprint`
+      (requires `Build_PC`, replaces the design currently open in the
+      editor, the real "Load Blueprint" button, SAFE for routine use) and
+      `RocketManager.SpawnBlueprint` (requires `World_PC`, adds a rocket
+      to an already-running flight -- but per the mod changelog's safety
+      note, likely a one-time internal launch-transition primitive, NOT
+      for routine use). Both spawn a real part with zero editor
+      interaction, called via reflection from a plain JSON file. Finding
+      the `Build_PC`/`World_PC` split required a real crash first -- see
+      `docs/sfs_reference/07-saveload/RocketManager.md`. Still open:
+      whether `GenerateJoints` actually connects a multi-part design into
+      something flyable, and whether the documented
       `OnPartNotOwned`/`OwnershipState` DLC gate blocks any non-free
       parts (untested by the free-part `Capsule` case).
 - [ ] **Exact state-message contents** — what the flight agent actually

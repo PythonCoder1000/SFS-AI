@@ -193,11 +193,19 @@ all), sets `BuildOrientation.main.SetOrientation`, and loads staging via
 **This is the better fit for a design-iteration workflow** than
 `RocketManager.SpawnBlueprint` above: it's the real editor mechanism,
 requires `Build_PC` (not `World_PC`), and replaces rather than adds.
-Implemented as the mod's `loadblueprintbuild` command (v0.33.0) — built
-and installed, **not yet live-tested**. `RocketManager.SpawnBlueprint`
-(above) remains useful for a different case: adding an *additional*
-rocket to an already-running flight, which `BuildState.LoadBlueprint`
-cannot do (it's editor-only).
+Implemented as the mod's `loadblueprintbuild` command (v0.33.0) — built,
+installed, and **confirmed working live, 2026-08-29**: loading a
+single-part blueprint (`single_capsule`) correctly replaced the design
+already open in the editor. One minor known gap, not pursued further:
+the spawned part didn't land at the editor viewport's visual center
+(the internals of `Part_Utility.CenterParts`/`GridSize.
+GetOwnedGridSize` were never read) — low priority, since a real launch
+auto-centers the rocket regardless, so it has no practical effect.
+`RocketManager.SpawnBlueprint` (above) remains useful for a different
+case: adding an *additional* rocket to an already-running flight, which
+`BuildState.LoadBlueprint` cannot do (it's editor-only) -- but per
+`mod_changelog.md`'s safety note, that route should not be used as
+routine operation, only one-off research.
 
 ---
 
@@ -211,8 +219,10 @@ cannot do (it's editor-only).
 | `PartsLoader.parts` is the catalog, keyed by name | [CONFIRMED] |
 | `CreateParts` signature, including the ownership out-parameter | [CONFIRMED] |
 | Single-part blueprint spawns successfully via `RocketManager.SpawnBlueprint` | [CONFIRMED WORKING] 2026-08-29, live-tested |
+| Single-part blueprint spawns successfully via `BuildState.LoadBlueprint` (replaces current editor design) | [CONFIRMED WORKING] 2026-08-29, live-tested |
 | `SpawnBlueprint` body past the scene-check opening | [OPEN] |
 | `CreateParts` / `GenerateJoints` bodies | [OPEN] |
+| `Part_Utility.CenterParts` / `GridSize.GetOwnedGridSize` bodies | [OPEN] -- known effect: spawned part isn't at the editor viewport's visual center; not pursued, no practical impact |
 | Ownership / DLC gating (`OnPartNotOwned`, `OwnershipState`) | [OPEN] — not exercised by the free-part test |
 | `MergeRockets` / `DestroyRocket` / `CreateRocket_Child` bodies | [OPEN] |
 | Multi-part blueprint spawning (joint generation/connectivity) | [UNTESTED-LIVE] |

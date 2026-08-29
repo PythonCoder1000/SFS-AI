@@ -48,11 +48,15 @@ editor UI interaction needed for either.
 thing:**
 
 - **`target='build'` (default) — `loadblueprintbuild`. SAFE, routinely
-  repeatable.** The real mechanism behind the game's own "Load
-  Blueprint" button (`BuildState.LoadBlueprint`). **Replaces** the
-  current editor design (calls `BuildState.Clear()` first). Requires
-  `Build_PC`. No `WorldView` dependency at all — confirmed by reading
-  the actual IL body. **Not yet live-tested.**
+  repeatable. CONFIRMED WORKING, 2026-08-29.** The real mechanism
+  behind the game's own "Load Blueprint" button (`BuildState.
+  LoadBlueprint`). **Replaces** the current editor design (calls
+  `BuildState.Clear()` first) — confirmed live: loaded `single_capsule`
+  and it correctly replaced the prior design. Requires `Build_PC`. One
+  minor known gap: the part doesn't land at the editor's visual center
+  (only somewhere grid-valid) — `Part_Utility.CenterParts`'s internals
+  were never read, and this wasn't pursued further since a real launch
+  auto-centers the rocket regardless, so it has no practical effect.
 - **`target='world'` — `loadblueprint`. DO NOT USE DURING A LIVE
   FLIGHT.** Its first action moves the camera to the launch pad — the
   signature of a one-time internal Build-to-World launch-transition

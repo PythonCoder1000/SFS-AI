@@ -112,10 +112,11 @@ falls back to the full flight range -- worth double-checking
   bypassing the editor UI's file picker. Resolves by `name` (looked up
   in `blueprints/research/<name>/Blueprint.txt`) or an explicit `path`.
   Two modes via `target`: **`'build'` (default, SAFE, routinely
-  repeatable)** -- the real "Load Blueprint" button mechanism
-  (`BuildState.LoadBlueprint`), REPLACES the current editor design,
-  requires `Build_PC`, **not yet live-tested**; **`'world'` (DO NOT USE
-  DURING A LIVE FLIGHT)** -- spawns an additional rocket into an active
+  repeatable, CONFIRMED WORKING)** -- the real "Load Blueprint" button
+  mechanism (`BuildState.LoadBlueprint`), REPLACES the current editor
+  design, requires `Build_PC` (minor known gap: doesn't land at the
+  editor's visual center, no practical effect since a real launch
+  auto-centers anyway); **`'world'` (DO NOT USE DURING A LIVE FLIGHT)** -- spawns an additional rocket into an active
   flight (`RocketManager.SpawnBlueprint`), requires `World_PC`.
   **Confirmed working live** (single-part blueprint spawned a real,
   visually-confirmed part, 2026-08-29) -- but that only proves the

@@ -34,8 +34,14 @@ fact from session notes rather than logged at the time.
   `read_error`/`type_resolution`/`fromjson_method_not_found`/
   `deserialize_error`/`deserialize_null`.
 
-  Built and installed clean, first try. **Not yet live-tested** — next
-  step is confirming it actually replaces the current design in-game.
+  Built and installed clean, first try. **Confirmed working live,
+  2026-08-29** (same day): loaded `single_capsule` from `Build_PC`,
+  correctly replaced the prior design (not added alongside it). One
+  minor known gap, not investigated further -- `Part_Utility.CenterParts`/
+  `GetOwnedGridSize`'s internals were never read, so the part didn't
+  land at the editor viewport's visual center, just somewhere
+  grid-valid. Not pursued: a real launch auto-centers the rocket
+  regardless, so this has no practical effect on the loader's actual use.
 
   **IMPORTANT SAFETY NOTE, added after a live-test debrief (2026-08-29):**
   `loadblueprint` (this command, `RocketManager.SpawnBlueprint`) should
