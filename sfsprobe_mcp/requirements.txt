@@ -1,0 +1,5 @@
+# Pinned per the AGI House connector's own finding (2026-08-26): mcp v2
+# renamed FastMCP to MCPServer, which breaks this server's imports. Do not
+# bump past the 1.x line without checking that rename first.
+mcp==1.29.1
+pydantic>=2.0
