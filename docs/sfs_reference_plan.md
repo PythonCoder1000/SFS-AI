@@ -82,6 +82,17 @@ not one file per category.
 - **Access:** public/private/protected, static/instance
 - **Parameters:** what each one means, valid range/units if known
 - **Returns:** what it means, including null/default cases
+- **Preconditions:** REQUIRED for every FULL-depth method, not optional
+  prose. What must already be true/exist before calling this --
+  required scene, a live singleton that must be populated (e.g.
+  "requires World_PC -- WorldView.main must be non-null"), an object
+  that must already be initialized, an ordering requirement relative to
+  other calls. If nothing is required beyond a valid instance/args,
+  write "None beyond valid arguments" explicitly -- don't leave the
+  field out, since an absent field looks identical to "not checked yet."
+  This is the field that would have caught the loadblueprint World_PC/
+  Build_PC mixup (2026-08-29) before any mod code was written, instead
+  of after a real crash.
 - **Behavior:** what the IL body actually does (FULL depth only --
   LIGHT depth may skip this and note "not read, low-priority UI class")
 - **Side effects:** state mutation, events fired, allocations
@@ -97,6 +108,28 @@ UI-only classes with no simulation relevance. Every class still gets an
 entry either way -- LIGHT is not "skip," it's "less depth, explicitly
 marked as such."
 
+**HARD RULE, added 2026-08-29 after a real incident:** a method whose
+body is marked `[OPEN]` (not read) must not be wired into a live
+SFSProbe.cs command if that command mutates game state -- spawns or
+destroys objects, writes save data, changes scene, or otherwise does
+something irreversible or state-dependent. A read-only probe/dump
+command built on an `[OPEN]`-body method is lower-risk and can proceed
+with the risk noted; a command that DOES something to the live game
+cannot. This is not a new documentation requirement so much as a
+restatement of "live IL-body reads not signatures-only" (already a
+standing rule below) with the enforcement point made explicit: the
+body must be read BEFORE the mod command is written, not discovered to
+be necessary after a live failure. (What actually happened 2026-08-29:
+`RocketManager.SpawnBlueprint` was correctly marked `[OPEN]` body in
+the docs -- the documentation was honest. A live mod command was built
+and shipped around it anyway, which is the actual rule violation. The
+first live call crashed; reading the body after the fact explained why
+and revealed the method needed `World_PC`, not the `Build_PC` that had
+been guessed. The new Preconditions field above is the structural fix
+so this class of gap is visible before code is written, not just
+after -- but the underlying discipline of reading bodies before
+shipping state-mutating commands is what actually prevents it.)
+
 **`INDEX.md`** -- one row per documented type: name, namespace, kind,
 file path, one-line summary, status, depth, coverage count.
 
@@ -108,14 +141,17 @@ kept in sync incrementally per class, not regenerated in one pass.
 Every class's documentation needs to answer: real signature, inputs,
 outputs; what the code does and how (FULL depth: from IL bodies, not
 names; LIGHT depth: at minimum an accurate signature and purpose);
-how it's structured; when/how/where it's accessible; what can/cannot be
-safely run. AND it needs to live in the right file, follow the template,
-and be reflected in INDEX.md and manifest.json.
+how it's structured; when/how/where it's accessible (Preconditions,
+above -- not optional); what can/cannot be safely run. AND it needs to
+live in the right file, follow the template, and be reflected in
+INDEX.md and manifest.json.
 
 Standing rules throughout: live IL-body reads not signatures-only (for
 FULL-depth classes), Confirmed/Partial/Open per member, document
 corrections rather than silently overwrite, save incrementally (disk +
 Mnemoverse) not batched at the end, checkpoint every 3-4 classes and wait.
+Added 2026-08-29: a state-mutating SFSProbe.cs command must not be built
+on a method whose body is still `[OPEN]` -- see the HARD RULE above.
 
 ## Phases
 
@@ -129,6 +165,48 @@ but bounded job. Split into the new structure, one class per file,
 reformatted into the strict template. `docs/` is untracked in git --
 scratch-backup first, diff-check nothing gets silently dropped. Build
 `INDEX.md` and `manifest.json` from this as you go.
+
+**Phase 1, Step 1.5 -- Mod-Integration Safety Audit. NEW, added
+2026-08-29, run once, high priority -- do this before continuing
+general Step 2 coverage.** Prompted by a real incident: a live
+SFSProbe.cs command (`loadblueprint`) was built around
+`RocketManager.SpawnBlueprint`, a method correctly marked `[OPEN]` body
+in the docs, and its first live call crashed for a reason (a `World_PC`
+scene requirement) that reading the body up front would have caught.
+This step finds any OTHER instance of the same gap already shipped.
+
+Procedure: read `sfsprobe/SFSProbe.cs`'s `Command()` switch top to
+bottom. For every `case`, list every SFS game method it calls via
+reflection (`FindType`/`GetMethod`/`Invoke`, or a direct call on an
+already-resolved type). Cross-reference each against
+`docs/sfs_reference/`'s current coverage (or `sfs_source_reference.md`
+for anything not yet migrated): is its body `[CONFIRMED]`,
+`[PARTIAL]`, or `[OPEN]`? Classify each command:
+
+- **Read-only** (dumps/snapshots/telemetry -- `snapshot`, `world`,
+  `menu`, `ping`, `dragarea`, `achievements`, `geometry`, `diag`) --
+  lower risk even if body is `[OPEN]`, since nothing is mutated. Note
+  but don't block on these.
+- **State-mutating** (`throttle`, `master`, `ignite`, `revert`,
+  `autostop`, `cheat`, `loadblueprint`, `loadblueprintbuild`, and any
+  future one) -- if the underlying method's body is still `[OPEN]`,
+  **read it now**, out of normal coverage order, and add a
+  Preconditions entry per the template above. If reading it reveals a
+  wrong assumption already shipped in `SFSProbe.cs` (like the
+  Build_PC/World_PC case), flag it clearly as a finding -- don't fix
+  the mod code in this session (that's Python/C# work, a different
+  session's job), just document the gap precisely enough that fixing
+  it is a five-minute follow-up, and note it in the handoff.
+
+Output: a short table in the handoff (command name, methods called,
+body status, risk classification, any concrete findings) plus updated
+Preconditions fields for every method now read. This step is NOT about
+achieving full coverage of these classes -- it's specifically about
+closing the "body unread, already shipped" gap. Move on to Step 2 once
+every state-mutating command's underlying methods have a real
+Preconditions entry (even if that entry is "requires further reading,
+flagged, not yet resolved" -- honesty beats silence, but it must be a
+deliberate, visible flag, not an absent field).
 
 **Phase 1, Step 2 -- cover everything else.** ~90% of the total work.
 Includes all of UI/Builds/ModGUI now. Same template, tiered depth bar
@@ -162,7 +240,8 @@ This task is too large for one continuous session. At each of these
 points: run `/session-save`, summarize progress and what's next, and
 tell Christian to start a new session before continuing.
 
-- After Step 1 (migration) -- before starting Step 2
+- After Step 1 (migration) -- before starting Step 1.5
+- After Step 1.5 (mod-integration safety audit) -- before starting Step 2
 - Roughly every 15-20 classes within Step 2
 - After Step 2, before Step 3
 - Between Phase 1 and Phase 2

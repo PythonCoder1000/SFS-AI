@@ -493,3 +493,38 @@ which is the honest description.
   the assembly's is `cbad19d24f73252e5a7acd6b88cfa9c1`. Both are recorded in
   `manifest.json` so a future session can tell whether its dump matches what
   the reference was written against.
+
+## Added after writing — the template changed underneath this session
+
+A **concurrent session** edited `docs/sfs_reference_plan.md` while this
+work was in progress (the edit is still uncommitted in the working tree as
+of this handoff, alongside commits `1f8542d`, `5a3645f`, `c28e4a9` from that
+same line of work on the blueprint loader). Two changes matter to Step 2:
+
+1. **The per-class template gained a required `Preconditions` field** on
+   every FULL-depth method — what must already be true before the call
+   (required scene, a live singleton that must be non-null, initialization
+   or ordering requirements). If nothing is required, the field must still
+   be present, reading "None beyond valid arguments", because an absent
+   field is indistinguishable from "not checked yet". The stated motivation
+   is that this would have caught the `loadblueprint` `World_PC`/`Build_PC`
+   mixup before any mod code was written.
+
+2. **A hard rule:** a method whose body is marked `[OPEN]` must not be
+   wired into a live `SFSProbe.cs` command if that command mutates game
+   state.
+
+**Consequence for this session's output: the four files written today
+predate change (1) and do not carry `Preconditions` fields.** They are
+otherwise template-conformant. Back-filling them is a bounded job — the
+FULL-depth methods needing it are in `terrain-chunks.md` (about 25 methods)
+and `TerrainModule.md` (7), and the preconditions are mostly already stated
+as prose under **Gotchas** (`TerrainColliderManager.main` must be populated;
+`SetupSamplers` must have run before `GetTerrainPoints`; `SetupSamplers`
+itself needs a loaded world for `Base.worldBase.settings.difficulty`;
+`CalculateBest` requires a non-empty `activeChunks`). **A future session
+should back-fill these before writing more Step 2 files**, so the corpus
+doesn't split into pre- and post-rule halves.
+
+Nothing in this session's files is *wrong* under the new template — only
+incomplete against it.
