@@ -1,37 +1,74 @@
 # SFS AI
 
 LLM agent that designs rockets in Spaceflight Simulator, flies them, and
-adapts mid-flight when the design underperforms. Successor to Geometry Dash AI.
+adapts mid-flight when the design underperforms. Built from scratch --
+unlike prior projects in this space (KSP has kRPC, an existing mature
+community API), SFS had no mod-loader RPC layer, no existing probe, and
+no reliable community data on part physics. Every piece of tooling here
+-- the probe mod, the reflection toolkit, the analysis/orchestration
+layer, and the source-code documentation -- was built from a blank
+editor and a decompiler.
 
 **Everything SFS-related lives in this folder.**
 
-## Target build — pinned
+## Target build -- pinned
 
 | | |
 |---|---|
 | Game | Spaceflight Simulator **1.6.00.16** (Steam, macOS) |
-| Unity | 6000.1.17f1 |
-| Bundle | `com.StefMorojna.SpaceflightSimulator` |
+| Unity | 6000.1.17f1 (Mono scripting backend, Apple Silicon ARM64) |
 | Install | `~/Library/Application Support/Steam/steamapps/common/Spaceflight Simulator/` |
-| Mods folder | `SpaceflightSimulatorGame.app/Contents/Resources/Mods` |
+| Mods folder | `SpaceflightSimulatorGame.app/Mods/SFSProbe/` |
 
-**Steam auto-update must stay off.** Every value and field offset derived so
-far is tied to this exact build. An update doesn't just stale the numbers —
-it makes measurements taken before and after incomparable.
+**Steam auto-update must stay off.** Every value and field offset derived
+so far is tied to this exact build. An update doesn't just stale the
+numbers -- it makes measurements taken before and after incomparable.
+`python/il_inventory.py` and `sfsprobe_regression_check` exist specifically
+to catch this if it ever happens.
 
 ## Layout
 
 ```
 SFS AI/
-  README.md      this file
-  sfsprobe/      read-only mod that dumps live part + planet data to JSON
+  README.md              this file
+  CLAUDE.md               local working notes (gitignored, not in the repo)
+  mod_changelog.md        SFSProbe.cs version history
+  python_changelog.md     Python-side (analysis/tooling) history
+  flights_log.jsonl       tagged flight bookkeeping (gitignored)
+
+  sfsprobe/               the C# probe mod (SFSProbe.cs, build.sh)
+    probe_cmd.py           standalone adaptive-polling CLI (superseded by sfsprobe_mcp, kept as a thin fallback)
+
+  sfsprobe_mcp/           MCP server -- the primary way to talk to the mod
+    server.py               ~30 tools: live game control, telemetry analysis,
+                             flight orchestration, bookkeeping
+    README.md                full tool reference
+
+  python/                 shared analysis engine + standalone scripts
+    sfs_telemetry.py        the analysis logic sfsprobe_mcp's tools call into
+    analyze_dragarea.py      standalone CLI validation script
+    il_inventory.py          type/method/field inventory generator (re-runnable
+                             after an SFS update as a "did anything change" diff)
+    reference_index.py       docs/sfs_reference/'s manifest/INDEX.md generator
+    reference_add.py         adds one class's docs into the reference set
+
+  docs/                   research, physics reference, and the SFS Documentation
+    sfs_reference/           per-class API reference of SFS's own decompiled
+                             source (see below) -- generated, not hand-maintained
+    sfs_physics_reference.md  confirmed physics formulas + constants
+    high_level_checklist.md   Tier 1 research status tracker
+    sfs_reference_plan.md     standing instructions for the SFS Documentation effort
+
+  scratch/                gitignored -- raw IL dumps, not our code
 ```
 
-## sfsprobe
+## sfsprobe (the mod)
 
-First mod for the project, and deliberately small. It walks game objects by
-reflection rather than hardcoded field offsets, so it should survive most
-game updates.
+Walks game objects by reflection rather than hardcoded field offsets, so
+it survives most game updates. Confirmed working end-to-end: live physics
+reads, drag/aero force computation (validated against real measured
+flight deceleration), scoped telemetry recording with zero-rebuild field
+selection, and batched multi-command execution in a single game tick.
 
 ```bash
 cd sfsprobe
@@ -39,20 +76,36 @@ brew install mono     # once
 ./build.sh
 ```
 
-Then launch SFS, enable "SFS Probe" in the in-game Mod Loader, and wait ~10s
-on the main menu. Output appears in `Contents/Resources/Mods/SFSProbe/`:
+Then launch SFS, enable "SFS Probe" in the in-game Mod Loader, wait ~10s
+on the menu. See `sfsprobe_mcp/README.md` for the full command/tool set --
+that's the intended interface now, not talking to the mod's files by hand.
 
-- `sfs_probe_dump.json` — the data
-- `probe.log` — diagnostics; matters more than the dump on the first run
+## sfsprobe_mcp (the MCP server)
 
-Beyond the values, a successful run settles four things nothing static could:
-whether mods load at all on the macOS Steam build, whether the `Mod` contract
-matches the metadata, what `Application.version` reports at runtime, and what
-`Time.fixedDeltaTime` actually reads on this machine.
+The primary interface to the mod and to flight analysis. Live game
+control (send commands, batch commands, scripted flight profiles with
+condition-based waits), telemetry analysis (stats, search, phase/event
+detection, scoped analysis, formula validation, comparison/regression),
+and bookkeeping (tagged flight log, CSV export). See its own README for
+the complete tool reference.
+
+## The SFS Documentation (`docs/sfs_reference/`)
+
+A standalone, complete reference to SFS 1.6.00.16's own decompiled
+source code -- not documentation of this project's mod, and not scoped
+to only what this project currently needs. Built via a structured,
+multi-session Claude Code effort: one file per class, a strict template
+(signature/behavior/access/gotchas/status per member), generated
+`INDEX.md`/`manifest.json` that can't drift from the real assembly since
+they're built from `inventory.json`. In progress -- see
+`docs/sfs_reference_plan.md` for the standing plan and current phase.
 
 ## Status
 
-Research phase. No agent code written yet.
-
-Key findings so far live in the chat history and the open-questions register;
-**both still need consolidating into this folder.**
+Tier 1 physics research is substantially complete: gravity, thrust,
+throttle, fuel-flow, rotation, staging, mass, and drag (force law +
+`dragArea` computation) are all confirmed against live measurements, most
+to well under 0.1% error. The SFS Documentation effort is in progress
+(migration + full coverage of ~940 real types). Design/flight agent code
+has not started yet -- current work is entirely research and tooling
+infrastructure to make that phase reliable once it begins.

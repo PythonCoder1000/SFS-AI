@@ -8,6 +8,12 @@ sfsprobe/archive/
 # Build artifacts (regenerate via sfsprobe/build.sh)
 *.dll
 
+# Python virtual environments and caches (regenerate via
+# `pip install -r requirements.txt` in each service's own venv)
+venv/
+__pycache__/
+*.pyc
+
 # macOS
 .DS_Store
 
