@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
+using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -27,17 +29,39 @@ namespace SFSProbe
         public override string DisplayName => "SFS Probe (remote)";
         public override string Author => "christian";
         public override string MinimumGameVersionNecessary => "1.6.00.00";
-        public override string ModVersion => "0.24.0";
+        public override string ModVersion => "0.29.0";
         public override string Description => "Remote-controlled data probe. Poll command.txt.";
 
         public static string OutDir;
 
         public override void Load()
         {
+            // Must happen BEFORE any Harmony/MonoMod type is touched --
+            // MonoMod.Utils.DynamicMethodDefinition reads this env var at
+            // static-init time. Kept from the v0.25.x diagnostics even
+            // though this build no longer uses the game's own 0Harmony.dll
+            // -- harmless either way, cheap insurance.
+            try { Environment.SetEnvironmentVariable("MONOMOD_DMDType", "Cecil"); }
+            catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
+
             OutDir = ModFolder;
-            Log("=== v0.24 loaded (achievements command: reads SFS.Logs.Challenge catalog + per-rocket completion) ===");
+            Log("=== v0.29.0 loaded (scoped telemetry: 'telemetry on field1,field2,computed:name' records only requested fields, no rebuild needed to add a plain reflection path -- see ResolvePath/AppendComputedField; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
+            try
+            {
+                bool trivialOk = GeometryPatches.TestTrivialPatch();
+                Log("[trivial-patch-test] patching our OWN no-op method: " + (trivialOk ? "OK" : "FAILED") +
+                    "  (if this fails too, the problem is environment-wide, not specific to Part.InitializePart)");
+            }
+            catch (Exception e) { Log("[trivial-patch-test] threw: " + e.Message); }
+            try
+            {
+                var harmony = new HarmonyLib.Harmony("sfs_probe.geometry_capture");
+                bool geomOk = GeometryPatches.Apply(harmony);
+                Log("geometry capture patch: " + (geomOk ? "OK" : "FAILED"));
+            }
+            catch (Exception e) { Log("harmony init FAILED: " + e.Message); }
             try
             {
                 GameObject go = new GameObject("SFSProbeRunner");
@@ -135,6 +159,16 @@ namespace SFSProbe
         public static bool Telemetry;
         static int sampleCount;
         static int flightNumber;
+
+        // Scoped-telemetry field spec (v0.29). null = default full-schema
+        // recording (unchanged behavior). Non-null = only these fields are
+        // sampled each tick, written to truth.jsonl alone (inputs.jsonl is
+        // skipped entirely in this mode). Each entry is either a dotted
+        // reflection path (e.g. "rb2d.mass", "location.velocity.x") walked
+        // via ResolvePath, or "computed:NAME" for a registered multi-field
+        // helper (e.g. "computed:dragArea") dispatched via AppendComputedField.
+        // See Command()'s "telemetry" case for the command syntax.
+        static string[] telemetryFields;
 
         public static bool AutoStop;
         static string autoStopMode = "turnover";   // "turnover" or "land"
@@ -287,7 +321,7 @@ namespace SFSProbe
 
         // ---------- hotkey recording ----------
 
-        public static void StartRecording()
+        public static void StartRecording(string[] fields = null)
         {
             if (Telemetry) return;
             flightNumber++;
@@ -295,9 +329,11 @@ namespace SFSProbe
             lastRocketCount = -1;   // fresh baseline each flight -- avoids a false
                                     // separation trigger from leftover debris or
                                     // the previous recording's rocket count
+            telemetryFields = fields;
             ArchiveTelemetry();
             Telemetry = true;
-            ProbeMod.Result("[hotkey] recording STARTED  flight #" + flightNumber);
+            string scopeNote = fields == null ? "full" : ("scoped[" + fields.Length + "]: " + string.Join(",", fields));
+            ProbeMod.Result("[hotkey] recording STARTED  flight #" + flightNumber + "  mode=" + scopeNote);
         }
 
         public static void StopRecording()
@@ -309,6 +345,7 @@ namespace SFSProbe
             ProbeMod.Result("[hotkey] recording STOPPED  flight #" + flightNumber +
                              "  samples=" + sampleCount +
                              "  -> " + (a1 ?? "(no inputs)") + "  " + (a2 ?? "(no truth)"));
+            telemetryFields = null;   // next hotkey (Enter) always starts back in full mode
         }
 
         // ---------- command dispatch ----------
@@ -332,8 +369,30 @@ namespace SFSProbe
                 case "menu":     DumpMenu("cmd"); break;
 
                 case "telemetry":
-                    if (arg == "on") StartRecording(); else StopRecording();
+                {
+                    // "telemetry on" -> default full-schema mode (unchanged).
+                    // "telemetry on rb2d.mass,location.velocity.x,computed:dragArea"
+                    //   -> scoped mode (v0.29): only these fields are recorded, one
+                    //   truth.jsonl row per tick, no rebuild required to add/remove a
+                    //   plain reflection path. "computed:NAME" dispatches to a
+                    //   registered multi-field helper (see AppendComputedField) --
+                    //   currently just "dragArea", more can be added there without
+                    //   touching this parsing. "telemetry off" stops either mode.
+                    string[] parts3 = line.Split(new char[] { ' ' }, 3);
+                    string mode = parts3.Length > 1 ? parts3[1] : null;
+                    if (mode == "on")
+                    {
+                        string[] fields = null;
+                        if (parts3.Length > 2 && !string.IsNullOrWhiteSpace(parts3[2]))
+                            fields = parts3[2].Split(',');
+                        StartRecording(fields);
+                    }
+                    else
+                    {
+                        StopRecording();
+                    }
                     break;
+                }
 
                 case "throttle":
                 {
@@ -514,6 +573,189 @@ namespace SFSProbe
                     break;
                 }
 
+                case "geometry":
+                {
+                    // Reads whatever GeometryCapture has captured so far via the
+                    // Harmony postfix on Part.InitializePart() -- passive capture,
+                    // this command never triggers init itself. See the
+                    // GeometryCapture/GeometryPatches classes below for how/why.
+                    object r = ActiveRocket();
+                    object holder = Get(r, "partHolder");
+                    object parts = Get(holder, "parts");
+                    var en = parts as System.Collections.IEnumerable;
+                    var items = new List<string>();
+                    int withGeom = 0, total = 0;
+                    if (en != null)
+                    {
+                        foreach (object part in en)
+                        {
+                            total++;
+                            string pname = "?";
+                            try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+
+                            GeometryCapture.Captured cap;
+                            bool has = GeometryCapture.TryGet(part, out cap);
+                            if (has) withGeom++;
+
+                            var gsb = new StringBuilder();
+                            gsb.Append("{\"name\":").Append(Q(pname));
+                            gsb.Append(",\"hasGeometry\":").Append(has ? "true" : "false");
+                            if (has)
+                            {
+                                gsb.Append(",\"captureCount\":").Append(cap.CaptureCount);
+                                gsb.Append(",\"loops\":[");
+                                for (int i = 0; i < cap.Loops.Count; i++)
+                                {
+                                    if (i > 0) gsb.Append(",");
+                                    gsb.Append("{\"loop\":").Append(cap.LoopFlags[i] ? "true" : "false");
+                                    gsb.Append(",\"points\":[");
+                                    Vector2[] pts = cap.Loops[i];
+                                    for (int j = 0; j < pts.Length; j++)
+                                    {
+                                        if (j > 0) gsb.Append(",");
+                                        gsb.Append("[").Append(pts[j].x.ToString("R"))
+                                          .Append(",").Append(pts[j].y.ToString("R")).Append("]");
+                                    }
+                                    gsb.Append("]}");
+                                }
+                                gsb.Append("]");
+                            }
+                            gsb.Append("}");
+                            items.Add(gsb.ToString());
+                        }
+                    }
+                    var geomOutSb = new StringBuilder();
+                    geomOutSb.Append("{\"parts\":[").Append(string.Join(",", items.ToArray()));
+                    geomOutSb.Append("],\"withGeometry\":").Append(withGeom).Append(",\"total\":").Append(total).Append("}");
+                    Write("sfs_probe_geometry.json", geomOutSb, "geometry dump");
+                    ProbeMod.Result("geometry: " + withGeom + "/" + total + " parts have captured geometry -> sfs_probe_geometry.json");
+                    break;
+                }
+
+                case "dragarea":
+                {
+                    // Harmony-free path (2026-08-27): dragArea and center-of-pressure
+                    // are directly callable via plain reflection on methods the game
+                    // already calls every FixedUpdate -- no geometry capture, no
+                    // Harmony patch needed at all (that path was fully abandoned; see
+                    // GeometryPatches/GeometryCapture below, kept only for reference).
+                    // Confirmed via IL, not guessed:
+                    //   - Aero_Rocket.GetDragSurfaces(Matrix2x2) -- 1-arg INSTANCE
+                    //     overload, callable on rocket.aero directly. A 2-arg static
+                    //     overload shares the name, so plain GetMethod(name) would throw
+                    //     AmbiguousMatchException -- resolved below with explicit types.
+                    //   - AeroModule.GetExposedSurfaces(List<Surface>) -- static.
+                    //   - AeroModule.CalculateDragForce(List<Surface>) -- static, returns
+                    //     ValueTuple<float,Vector2> = (drag, centerOfDrag), confirmed via
+                    //     the method's own TupleElementNamesAttribute metadata. THIS is
+                    //     the real dragArea value, straight from the game's own calc.
+                    //   - Rotation input is NOT identity -- traced from the real call
+                    //     site inside AeroModule.FixedUpdate()'s own IL body:
+                    //     rotationInput = -(velocity.AngleRadians - PI/2).
+                    object r = ActiveRocket();
+                    if (r == null) { ProbeMod.Result("dragarea: no active rocket"); break; }
+                    object aero = Get(r, "aero");
+                    if (aero == null) { ProbeMod.Result("dragarea: rocket.aero is null"); break; }
+
+                    Type matrixType = FindType("Matrix2x2");
+                    Type aeroModuleType = FindType("SFS.World.Drag.AeroModule");
+                    if (matrixType == null || aeroModuleType == null)
+                    {
+                        ProbeMod.Result("dragarea: FAILED to resolve Matrix2x2 or AeroModule type");
+                        break;
+                    }
+
+                    object dloc = Unwrap(Get(r, "location"));
+                    object velocity = GetWrapped(dloc, "velocity");
+                    double velocityAngle = ToD(Get(velocity, "AngleRadians"));
+                    float rotationInput = (float)(-(velocityAngle - Math.PI / 2.0));
+                    object matrix = InvokeStatic(matrixType, "Angle", new Type[] { typeof(float) }, new object[] { rotationInput });
+                    if (matrix == null) { ProbeMod.Result("dragarea: Matrix2x2.Angle FAILED"); break; }
+
+                    MethodInfo getDragSurfaces = aero.GetType().GetMethod("GetDragSurfaces",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        null, new Type[] { matrixType }, null);
+                    if (getDragSurfaces == null)
+                    {
+                        ProbeMod.Result("dragarea: couldn't resolve the 1-arg GetDragSurfaces overload");
+                        break;
+                    }
+
+                    object allSurfaces;
+                    try { allSurfaces = getDragSurfaces.Invoke(aero, new object[] { matrix }); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("dragarea: GetDragSurfaces threw: " + msg);
+                        break;
+                    }
+
+                    var allEn = allSurfaces as System.Collections.IEnumerable;
+                    int allCount = 0;
+                    if (allEn != null) foreach (object s in allEn) allCount++;
+
+                    object exposedSurfaces = allSurfaces == null ? null :
+                        InvokeStatic(aeroModuleType, "GetExposedSurfaces",
+                            new Type[] { allSurfaces.GetType() }, new object[] { allSurfaces });
+                    var exposedEn = exposedSurfaces as System.Collections.IEnumerable;
+                    int exposedCount = 0;
+                    if (exposedEn != null) foreach (object s in exposedEn) exposedCount++;
+
+                    var dsb = new StringBuilder();
+                    dsb.Append("{\"allSurfaceCount\":").Append(allCount);
+                    dsb.Append(",\"exposedSurfaceCount\":").Append(exposedCount);
+
+                    dsb.Append(",\"sampleSegments\":[");
+                    if (allEn != null)
+                    {
+                        int shown = 0; bool firstSeg = true;
+                        foreach (object s in allEn)
+                        {
+                            if (shown >= 10) break;
+                            object segLine = Get(s, "line");
+                            object start = Get(segLine, "start");
+                            object end = Get(segLine, "end");
+                            if (!(start is Vector2) || !(end is Vector2)) continue;
+                            Vector2 sp = (Vector2)start, ep = (Vector2)end;
+                            if (!firstSeg) dsb.Append(",");
+                            firstSeg = false;
+                            dsb.Append("{\"start\":[").Append(sp.x.ToString("R")).Append(",").Append(sp.y.ToString("R")).Append("]");
+                            dsb.Append(",\"end\":[").Append(ep.x.ToString("R")).Append(",").Append(ep.y.ToString("R")).Append("]}");
+                            shown++;
+                        }
+                    }
+                    dsb.Append("]");
+
+                    if (exposedSurfaces != null)
+                    {
+                        MethodInfo calcDrag = aeroModuleType.GetMethod("CalculateDragForce",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                            null, new Type[] { exposedSurfaces.GetType() }, null);
+                        if (calcDrag != null)
+                        {
+                            try
+                            {
+                                object tupleObj = calcDrag.Invoke(null, new object[] { exposedSurfaces });
+                                var tuple = (System.ValueTuple<float, Vector2>)tupleObj;
+                                dsb.Append(",\"calculateDragForce\":{\"item1\":").Append(tuple.Item1.ToString("R"));
+                                dsb.Append(",\"item2\":[").Append(tuple.Item2.x.ToString("R"))
+                                   .Append(",").Append(tuple.Item2.y.ToString("R")).Append("]}");
+                            }
+                            catch (Exception e)
+                            {
+                                string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                                dsb.Append(",\"calculateDragForceError\":").Append(Q(msg));
+                            }
+                        }
+                        else { dsb.Append(",\"calculateDragForceError\":\"couldn't resolve CalculateDragForce overload\""); }
+                    }
+
+                    dsb.Append("}");
+                    Write("sfs_probe_dragarea.json", dsb, "dragarea dump");
+                    ProbeMod.Result("dragarea: all=" + allCount + " exposed=" + exposedCount + " -> sfs_probe_dragarea.json");
+                    break;
+                }
+
                 case "cheat":
                 {
                     object ss = FindComponent("SFS.World.SandboxSettings");
@@ -537,10 +779,42 @@ namespace SFSProbe
                 object r = ActiveRocket();
                 if (r == null) return;
                 object loc = Unwrap(Get(r, "location"));
+                double t = ToD(Get(loc, "time"));
+
+                if (telemetryFields != null)
+                {
+                    // Scoped mode (v0.29): caller-selected fields only, single
+                    // file (truth.jsonl), one JSON key per requested field. See
+                    // ResolvePath/AppendComputedField below and the "telemetry"
+                    // command case above for the spec syntax. inputs.jsonl is
+                    // deliberately NOT written in this mode.
+                    var sb3 = new StringBuilder();
+                    sb3.Append("{\"t\":").Append(Num(t));
+                    foreach (string rawField in telemetryFields)
+                    {
+                        string f = rawField.Trim();
+                        if (f.Length == 0) continue;
+                        if (f.StartsWith("computed:"))
+                        {
+                            string name = f.Substring("computed:".Length);
+                            if (!AppendComputedField(name, r, sb3))
+                                sb3.Append(",\"").Append(name).Append("Error\":\"unknown computed field\"");
+                        }
+                        else
+                        {
+                            object val = ResolvePath(r, f);
+                            sb3.Append(",\"").Append(f).Append("\":").Append(Num(val));
+                        }
+                    }
+                    sb3.Append("}");
+                    ProbeMod.Append("truth.jsonl", sb3.ToString());
+                    sampleCount++;
+                    return;
+                }
+
                 object rb = Get(r, "rb2d");
                 object throttle = Get(r, "throttle");
                 object arrowkeys = Get(r, "arrowkeys");
-                double t = ToD(Get(loc, "time"));
                 float fdt = Time.fixedDeltaTime;
                 float thr = ToF(GetWrapped(throttle, "throttlePercent"));
                 bool thrOn = ToB(GetWrapped(throttle, "throttleOn"));
@@ -599,6 +873,15 @@ namespace SFSProbe
                 var heat = GetHeatState(r);
                 st.Append(",\"partCount\":").Append(heat.Item1);
                 st.Append(",\"maxTemp\":").Append(Num(heat.Item2));
+                float dragArea, dragCopX, dragCopY;
+                int dragAllSurfaces, dragExposedSurfaces;
+                bool dragOk = TryComputeDragArea(r, out dragArea, out dragCopX, out dragCopY,
+                                                  out dragAllSurfaces, out dragExposedSurfaces);
+                st.Append(",\"dragArea\":").Append(dragOk ? Num(dragArea) : "null");
+                st.Append(",\"dragCopX\":").Append(dragOk ? Num(dragCopX) : "null");
+                st.Append(",\"dragCopY\":").Append(dragOk ? Num(dragCopY) : "null");
+                st.Append(",\"dragSurfaces\":").Append(dragAllSurfaces);
+                st.Append(",\"dragExposed\":").Append(dragExposedSurfaces);
                 object planet = Unwrap(Get(loc, "planet"));
                 st.Append(",\"body\":\"").Append(Get(planet, "codeName")).Append("\"");
                 st.Append("}");
@@ -683,7 +966,7 @@ namespace SFSProbe
         // HeatModuleBase, ControlModule, INJ_Throttle, ...). Confirmed via
         // diag: one real Hawk engine, six identical entries. Dedupe by
         // reference identity or every module gets double/triple/6x-counted.
-        static IEnumerable<object> ModuleValues(object part)
+        internal static IEnumerable<object> ModuleValues(object part)
         {
             var mf = part.GetType().GetField("modules", BindingFlags.NonPublic | BindingFlags.Instance);
             object modules = mf != null ? mf.GetValue(part) : null;
@@ -848,7 +1131,7 @@ namespace SFSProbe
         }
         static double ToD(object o) { try { return Convert.ToDouble(o); } catch { return 0; } }
         static float ToF(object o) { try { return Convert.ToSingle(o); } catch { return 0f; } }
-        static bool ToB(object o) { return (o is bool) && (bool)o; }
+        internal static bool ToB(object o) { return (o is bool) && (bool)o; }
 
         static object GetWrapped(object owner, string member) { return GetWrapped2(Get(owner, member)); }
         static object GetWrapped2(object w)
@@ -1103,6 +1386,145 @@ namespace SFSProbe
             try { return m.Invoke(target, args); } catch { return null; }
         }
 
+        // Explicit-overload-safe STATIC invoke -- needed because some classes
+        // in this codebase (e.g. Aero_Rocket.GetDragSurfaces) have two static/
+        // instance overloads sharing the same name; plain GetMethod(name, flags)
+        // throws AmbiguousMatchException in that case. Callers pass the exact
+        // parameter types to disambiguate.
+        static object InvokeStatic(Type t, string method, Type[] paramTypes, object[] args)
+        {
+            try
+            {
+                MethodInfo m = t.GetMethod(method,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                    null, paramTypes, null);
+                if (m == null) return null;
+                return m.Invoke(null, args);
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("InvokeStatic " + method + " failed: " +
+                    (e.InnerException != null ? e.InnerException.Message : e.Message));
+                return null;
+            }
+        }
+
+        // Shared drag computation (v0.28) -- same confirmed call chain as the
+        // 'dragarea' command case above (Aero_Rocket.GetDragSurfaces ->
+        // AeroModule.GetExposedSurfaces -> AeroModule.CalculateDragForce, real
+        // velocity-derived rotation, not identity), minus the sample-segment
+        // diagnostic dump. Reused per-tick by Sample() so every truth.jsonl row
+        // carries a real, live dragArea reading instead of needing a separate
+        // manual 'dragarea' command each time. Returns false (all-zero outs) on
+        // any resolution/invocation failure so a caller can write null rather
+        // than a misleading zero.
+        static bool TryComputeDragArea(object rocket, out float drag, out float copX, out float copY,
+                                        out int allCount, out int exposedCount)
+        {
+            drag = 0f; copX = 0f; copY = 0f; allCount = 0; exposedCount = 0;
+            try
+            {
+                object aero = Get(rocket, "aero");
+                if (aero == null) return false;
+
+                Type matrixType = FindType("Matrix2x2");
+                Type aeroModuleType = FindType("SFS.World.Drag.AeroModule");
+                if (matrixType == null || aeroModuleType == null) return false;
+
+                object dloc = Unwrap(Get(rocket, "location"));
+                object velocity = GetWrapped(dloc, "velocity");
+                double velocityAngle = ToD(Get(velocity, "AngleRadians"));
+                float rotationInput = (float)(-(velocityAngle - Math.PI / 2.0));
+                object matrix = InvokeStatic(matrixType, "Angle", new Type[] { typeof(float) }, new object[] { rotationInput });
+                if (matrix == null) return false;
+
+                MethodInfo getDragSurfaces = aero.GetType().GetMethod("GetDragSurfaces",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    null, new Type[] { matrixType }, null);
+                if (getDragSurfaces == null) return false;
+
+                object allSurfaces;
+                try { allSurfaces = getDragSurfaces.Invoke(aero, new object[] { matrix }); }
+                catch { return false; }
+                if (allSurfaces == null) return false;
+
+                var allEn = allSurfaces as System.Collections.IEnumerable;
+                if (allEn != null) foreach (object s in allEn) allCount++;
+
+                object exposedSurfaces = InvokeStatic(aeroModuleType, "GetExposedSurfaces",
+                    new Type[] { allSurfaces.GetType() }, new object[] { allSurfaces });
+                if (exposedSurfaces == null) return false;
+                var exposedEn = exposedSurfaces as System.Collections.IEnumerable;
+                if (exposedEn != null) foreach (object s in exposedEn) exposedCount++;
+
+                MethodInfo calcDrag = aeroModuleType.GetMethod("CalculateDragForce",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                    null, new Type[] { exposedSurfaces.GetType() }, null);
+                if (calcDrag == null) return false;
+
+                object tupleObj;
+                try { tupleObj = calcDrag.Invoke(null, new object[] { exposedSurfaces }); }
+                catch { return false; }
+                var tuple = (System.ValueTuple<float, Vector2>)tupleObj;
+                drag = tuple.Item1;
+                copX = tuple.Item2.x;
+                copY = tuple.Item2.y;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // Generic dot-path walker for scoped telemetry field specs (v0.29),
+        // e.g. "rb2d.mass" or "location.velocity.x". Starts from the given
+        // root (the active rocket, currently the only supported root) and
+        // chases each segment via the SAME Get()+GetWrapped2 semantics already
+        // used everywhere else in this file -- not a new resolution mechanism,
+        // just the existing one driven by a string instead of hardcoded per
+        // field. Unwrapping after every hop is a harmless no-op on values that
+        // aren't wrapper types (Composed_Float, Double_Reference, etc.).
+        static object ResolvePath(object root, string path)
+        {
+            object cur = root;
+            foreach (string seg in path.Split('.'))
+            {
+                if (cur == null) return null;
+                cur = GetWrapped2(Get(cur, seg));
+            }
+            return cur;
+        }
+
+        // Registry of named "computed" fields for scoped telemetry (v0.29) --
+        // fields that need real logic first, not just a property read (e.g.
+        // dragArea needs the velocity-derived rotation matrix). Appends the
+        // field's own named sub-keys directly into the caller's StringBuilder
+        // and returns true, or returns false for an unknown name so the caller
+        // can report it. Kept as a switch (not a delegate dictionary) to match
+        // this file's existing style -- no DI, no registries elsewhere.
+        // ADDING A NEW COMPUTED FIELD: add one case here reusing an existing
+        // helper -- SumEnabledTorque, CountFiringThrusters, GetHeatState,
+        // FuelByStage, GetPredictedOrbit, and GetEngineDirection all already
+        // exist and could be wired in exactly the same way as "dragArea" below,
+        // with no new physics/reflection code needed, just a rebuild.
+        static bool AppendComputedField(string name, object rocket, StringBuilder sb)
+        {
+            switch (name)
+            {
+                case "dragArea":
+                {
+                    float drag, copX, copY; int allC, expC;
+                    bool ok = TryComputeDragArea(rocket, out drag, out copX, out copY, out allC, out expC);
+                    sb.Append(",\"dragArea\":").Append(ok ? Num(drag) : "null");
+                    sb.Append(",\"dragCopX\":").Append(ok ? Num(copX) : "null");
+                    sb.Append(",\"dragCopY\":").Append(ok ? Num(copY) : "null");
+                    sb.Append(",\"dragSurfaces\":").Append(allC);
+                    sb.Append(",\"dragExposed\":").Append(expC);
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        }
+
         static StringBuilder Header()
         {
             var sb = new StringBuilder();
@@ -1154,7 +1576,7 @@ namespace SFSProbe
             return null;
         }
 
-        static object Get(object o, string member)
+        internal static object Get(object o, string member)
         {
             if (o == null) return null;
             Type t = o as Type ?? o.GetType();
@@ -1263,6 +1685,282 @@ namespace SFSProbe
         {
             return t == typeof(string) || t == typeof(bool) || t.IsPrimitive
                 || t == typeof(double) || t == typeof(float) || t.IsEnum;
+        }
+    }
+
+    // ---------- dragArea geometry capture (v0.25) ----------
+    //
+    // Captures Part.surfacesFast the instant the game's OWN code populates it,
+    // via a Harmony Postfix on Part.InitializePart() -- rather than trying to
+    // trigger population ourselves (both prior reflection-based attempts at
+    // that failed; see docs/sfs_physics_reference.md 7.1 and the dead-ends in
+    // session-2026-08-26-gpu-session-1.md).
+    //
+    // Confirmed via IL (2026-08-26, monodis on Assembly-CSharp.dll): Part.
+    // InitializePart() takes ZERO arguments -- not InitializePart(bool) as an
+    // earlier research pass claimed. It unconditionally does:
+    //   GetComponentsInChildren<I_InitializePartModule>(true) -> sort by
+    //   .Priority -> call .Initialize() on each, every single call, no
+    //   internal "already done" skip-gate. So this method is safe and cheap
+    //   to observe repeatedly -- if the game calls it again later (revert,
+    //   respawn, etc.) our cache just refreshes with new geometry.
+    //
+    // ConditionalWeakTable keys on the live Part instance by reference
+    // identity and doesn't keep it alive or leak once the part is
+    // destroyed/GC'd.
+    public static class GeometryCapture
+    {
+        public class Captured
+        {
+            public List<Vector2[]> Loops = new List<Vector2[]>();
+            public List<bool> LoopFlags = new List<bool>();
+            public int CaptureCount;   // how many times we've observed this part re-init
+        }
+
+        static readonly ConditionalWeakTable<object, Captured> Cache =
+            new ConditionalWeakTable<object, Captured>();
+
+        // Called from the Harmony postfix -- runs inside the game's own call
+        // stack, immediately after real game code. Everything here is
+        // defensive: nothing is ever allowed to throw back out, since an
+        // uncaught exception at this point risks corrupting that call.
+        public static void OnPartInitialized(object partInstance)
+        {
+            try
+            {
+                if (partInstance == null) return;
+
+                foreach (object mv in Probe.ModuleValues(partInstance))
+                {
+                    if (mv.GetType().Name != "SurfaceData") continue;
+                    object fast = Probe.Get(mv, "surfacesFast");
+                    var sen = fast as System.Collections.IEnumerable;
+                    if (sen == null) return;
+
+                    var loops = new List<Vector2[]>();
+                    var flags = new List<bool>();
+                    foreach (object surf in sen)
+                    {
+                        object pts = Probe.Get(surf, "points");
+                        bool loop = Probe.ToB(Probe.Get(surf, "loop"));
+                        var pen = pts as System.Collections.IEnumerable;
+                        var list = new List<Vector2>();
+                        if (pen != null)
+                            foreach (object p in pen)
+                                if (p is Vector2) list.Add((Vector2)p);
+                        if (list.Count == 0) continue;   // don't record an empty loop
+                        loops.Add(list.ToArray());
+                        flags.Add(loop);
+                    }
+
+                    if (loops.Count == 0) return;   // nothing real captured yet, skip
+
+                    Captured existing;
+                    if (Cache.TryGetValue(partInstance, out existing))
+                    {
+                        existing.Loops = loops;
+                        existing.LoopFlags = flags;
+                        existing.CaptureCount++;
+                    }
+                    else
+                    {
+                        Cache.Add(partInstance, new Captured
+                        {
+                            Loops = loops,
+                            LoopFlags = flags,
+                            CaptureCount = 1
+                        });
+                    }
+                    return;
+                }
+            }
+            catch (Exception e)
+            {
+                try { ProbeMod.Log("[geometry-capture] error: " + e.Message); } catch { }
+            }
+        }
+
+        public static bool TryGet(object partInstance, out Captured c)
+        {
+            c = null;
+            if (partInstance == null) return false;
+            return Cache.TryGetValue(partInstance, out c);
+        }
+    }
+
+    // Manual (non-attribute) Harmony patching -- consistent with the rest of
+    // this file, which never references SFS.* types at compile time. Targets
+    // exactly SFS.Parts.Part.InitializePart(), confirmed via IL to be a
+    // single method with no overloads (zero arguments).
+    public static class GeometryPatches
+    {
+        // Isolates whether the geometry-capture failure is specific to
+        // Part.InitializePart(), or a total environment-wide Harmony/
+        // MonoMod incompatibility. Patches a trivial no-op method in OUR
+        // OWN assembly -- the simplest possible case, eliminating any
+        // cross-assembly (Assembly-CSharp.dll) complexity from the test.
+        public static void TrivialNoOp() { }
+        static int trivialCallCount;
+        static void TrivialNoOpPostfix() { trivialCallCount++; }
+
+        public static bool TestTrivialPatch()
+        {
+            try
+            {
+                var harmony = new HarmonyLib.Harmony("sfs_probe.trivial_test");
+                MethodInfo target = typeof(GeometryPatches).GetMethod(nameof(TrivialNoOp),
+                    BindingFlags.Public | BindingFlags.Static);
+                MethodInfo postfixMethod = typeof(GeometryPatches).GetMethod(nameof(TrivialNoOpPostfix),
+                    BindingFlags.NonPublic | BindingFlags.Static);
+                harmony.Patch(target, postfix: new HarmonyLib.HarmonyMethod(postfixMethod));
+                // Actually call it once to confirm the postfix really fires,
+                // not just that Patch() returned without throwing.
+                trivialCallCount = 0;
+                TrivialNoOp();
+                return trivialCallCount == 1;
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[trivial-patch-test] FAILED: " + e.GetType().FullName + ": " + e.Message);
+                return false;
+            }
+        }
+
+        public static bool Apply(HarmonyLib.Harmony harmony)
+        {
+            try
+            {
+                Type partType = FindPartType();
+                if (partType == null)
+                {
+                    ProbeMod.Log("[geometry-capture] FAILED: could not resolve SFS.Parts.Part");
+                    return false;
+                }
+
+                MethodInfo target = partType.GetMethod("InitializePart",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    null, Type.EmptyTypes, null);
+                if (target == null)
+                {
+                    ProbeMod.Log("[geometry-capture] FAILED: Part.InitializePart() not found " +
+                                 "(signature may have changed since this was verified)");
+                    return false;
+                }
+
+                MethodInfo postfixMethod = typeof(GeometryPatches).GetMethod(nameof(Postfix),
+                    BindingFlags.Static | BindingFlags.NonPublic);
+                if (postfixMethod == null)
+                {
+                    ProbeMod.Log("[geometry-capture] FAILED: could not resolve Postfix MethodInfo via reflection");
+                    return false;
+                }
+
+                var postfix = new HarmonyLib.HarmonyMethod(postfixMethod);
+
+                try
+                {
+                    harmony.Patch(target, postfix: postfix);
+                }
+                catch (HarmonyLib.HarmonyException he)
+                {
+                    // Under Mono, HarmonyException carries the exact failing IL
+                    // instruction (confirmed via the official HarmonyLib docs) --
+                    // GetErrorIndex()/GetInstructions() pinpoint it instead of
+                    // just the generic wrapped message. v0.25.2 found these come
+                    // back empty (-1, 0) for THIS failure, meaning it happens
+                    // before IL is even generated -- so this adds the inner
+                    // exception's own STACK TRACE, which is the only remaining
+                    // way to see which internal Harmony/MonoMod method actually
+                    // threw the NullReferenceException.
+                    string detail;
+                    try
+                    {
+                        int idx = he.GetErrorIndex();
+                        var instrs = he.GetInstructions();
+                        var sb2 = new StringBuilder();
+                        sb2.Append("errorIndex=").Append(idx);
+                        sb2.Append(" totalInstructions=").Append(instrs != null ? instrs.Count : -1);
+                        if (instrs != null && idx >= 0)
+                        {
+                            int lo = Math.Max(0, idx - 3);
+                            int hi = Math.Min(instrs.Count - 1, idx + 3);
+                            sb2.Append(" context=[");
+                            for (int k = lo; k <= hi; k++)
+                            {
+                                if (k > lo) sb2.Append(" | ");
+                                if (k == idx) sb2.Append(">>>");
+                                sb2.Append(instrs[k]);
+                            }
+                            sb2.Append("]");
+                        }
+
+                        Exception deepest = he;
+                        while (deepest.InnerException != null) deepest = deepest.InnerException;
+                        sb2.Append("\n    deepest=").Append(deepest.GetType().FullName);
+                        sb2.Append("\n    deepestStackTrace=").Append(deepest.StackTrace ?? "(null)");
+
+                        detail = sb2.ToString();
+                    }
+                    catch (Exception diagEx) { detail = "(couldn't extract IL detail: " + diagEx.Message + ")"; }
+
+                    ProbeMod.Log("[geometry-capture] harmony.Patch() FAILED: " + FullError(he) + "  " + detail);
+                    return false;
+                }
+                catch (Exception patchEx)
+                {
+                    ProbeMod.Log("[geometry-capture] harmony.Patch() FAILED: " + FullError(patchEx));
+                    return false;
+                }
+                ProbeMod.Log("[geometry-capture] patched " + partType.FullName + ".InitializePart()");
+                return true;
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[geometry-capture] Apply() failed: " + FullError(e));
+                return false;
+            }
+        }
+
+        // Walks the FULL exception chain (type name + message per level, incl.
+        // InnerException and, for AggregateException-style cases, any nested
+        // chain) -- Harmony/MonoMod failures are frequently a generic outer
+        // exception wrapping the REAL cause one or more levels down, and a
+        // bare e.Message alone (as used everywhere else in this file) throws
+        // that away. Used only for this one Harmony-patching path since it's
+        // the one place a vague top-level message has already proven useless
+        // ("IL Compile Error (unknown location)", 2026-08-27).
+        static string FullError(Exception e)
+        {
+            var sb = new StringBuilder();
+            int depth = 0;
+            while (e != null && depth < 6)
+            {
+                if (depth > 0) sb.Append(" ---> ");
+                sb.Append(e.GetType().FullName).Append(": ").Append(e.Message);
+                e = e.InnerException;
+                depth++;
+            }
+            return sb.ToString();
+        }
+
+        // __instance declared as `object` deliberately -- this file never
+        // references the real Part type at compile time, and Harmony passes
+        // the live instance through regardless of the postfix's declared
+        // parameter type.
+        static void Postfix(object __instance)
+        {
+            GeometryCapture.OnPartInitialized(__instance);
+        }
+
+        static Type FindPartType()
+        {
+            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type t = null;
+                try { t = a.GetType("SFS.Parts.Part", false); } catch { }
+                if (t != null) return t;
+            }
+            return null;
         }
     }
 }
