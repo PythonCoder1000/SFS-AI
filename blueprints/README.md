@@ -38,33 +38,31 @@ stored -- connectivity is derived from geometry at spawn time
 
 ## Loading into the game
 
-Via `sfsprobe_load_blueprint` (sfsprobe_mcp) / the mod's `loadblueprint`
-command -- reads the file directly (does NOT require it to be inside the
-game's own `Saving/Blueprints/` folder), deserializes it via the game's
-own `JsonWrapper.FromJson<Blueprint>`, and calls
-`RocketManager.SpawnBlueprint` through reflection. No editor UI
-interaction needed.
+Via `sfsprobe_load_blueprint` (sfsprobe_mcp) with a `target` param, or
+the mod's two commands directly. Both read the file directly (does NOT
+require it to be inside the game's own `Saving/Blueprints/` folder) and
+deserialize via the game's own `JsonWrapper.FromJson<Blueprint>` — no
+editor UI interaction needed for either.
 
-**Must be called from `World_PC` (a loaded flight/world), not
-`Build_PC` (the editor).** Found the hard way, 2026-08-29: the first
-live test (from `Build_PC`, an untested assumption) threw a
-`NullReferenceException`. Reading `SpawnBlueprint`'s actual IL body
-showed why -- its first instructions call
-`WorldView.main.SetViewLocation(...)`, and that singleton is only
-populated in `World_PC`. The mod enforces this now (`reason=
-not_in_world` if called from the wrong scene).
+**Two genuinely different mechanisms, not two ways of doing the same
+thing:**
 
-**CONFIRMED WORKING, 2026-08-29.** Retested from `World_PC` after the
-scene fix: `sfsprobe_load_blueprint(name="single_capsule")` returned
-`success: true`, rocket count went 1->2, part count went 8->9, and
-Christian visually confirmed a real capsule spawned next to the
-existing rocket in-game. The whole pipeline works end to end -- write a
-plain JSON file, no editor interaction, spawn through the game's own
-code.
+- **`target='build'` (default) — `loadblueprintbuild`.** The real
+  mechanism behind the game's own "Load Blueprint" button
+  (`BuildState.LoadBlueprint`). **Replaces** the current editor design
+  (calls `BuildState.Clear()` first). Requires `Build_PC`. No
+  `WorldView` dependency at all — confirmed by reading the actual IL
+  body. **Not yet live-tested.**
+- **`target='world'` — `loadblueprint`.** Spawns an *additional* live
+  physics rocket into an active flight (`RocketManager.SpawnBlueprint`),
+  alongside whatever's already there. Requires `World_PC` (needs a live
+  `WorldView.main` singleton — found the hard way after a real crash,
+  see `mod_changelog.md` v0.32.0). **Confirmed working, 2026-08-29:** a
+  single-part blueprint spawned a real, visually-confirmed part.
 
-**Still open:** only a single-part blueprint has been tested. Multi-part
-designs (joint generation via `GenerateJoints`, whether parts actually
-connect into something flyable) and the documented possible DLC/
-ownership gate (`OnPartNotOwned`/`OwnershipState` -- `Capsule` is
-presumably a free/base part, so this test doesn't rule that out for
-locked parts) remain unverified.
+**Still open for both:** only a single-part blueprint has been tested.
+Multi-part designs (joint generation via `GenerateJoints`, whether parts
+actually connect into something flyable) and the documented possible
+DLC/ownership gate (`OnPartNotOwned`/`OwnershipState` — `Capsule` is
+presumably a free/base part, so this doesn't rule it out for locked
+parts) remain unverified.

@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.32.0";
+        public const string VersionString = "0.33.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (loadblueprint scene gate corrected to World_PC, not Build_PC -- see IL evidence in the case comment; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (loadblueprintbuild command: real Load-Blueprint-button mechanism via BuildState.LoadBlueprint, requires Build_PC not World_PC, replaces the current editor design; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -883,6 +883,135 @@ namespace SFSProbe
                     }
 
                     ProbeMod.Result("loadblueprint: OK path=" + path);
+                    break;
+                }
+
+                case "loadblueprintbuild":
+                {
+                    // Loads a blueprint into the BUILD/EDITOR context,
+                    // REPLACING the current design -- this is the actual
+                    // mechanism behind the game's own "Load Blueprint" button,
+                    // confirmed by reading BuildState.LoadBlueprint's real IL
+                    // body (2026-08-29). Distinct from 'loadblueprint' above
+                    // (RocketManager.SpawnBlueprint, spawns an ADDITIONAL live
+                    // physics rocket into an active World_PC flight) -- this
+                    // one operates entirely within BuildState/BuildMenus/
+                    // BuildOrientation/BuildGrid (all editor-scoped types),
+                    // calls BuildState.Clear() first (hence "replaces"), and
+                    // has NO WorldView dependency at all -- correctly requires
+                    // Build_PC, not World_PC, the opposite of 'loadblueprint'.
+                    //
+                    // LoadBlueprint(Blueprint, I_MsgLogger, bool autoCenterParts,
+                    // bool applyUndo, Vector2 offset, Action onLoaded) -- public
+                    // instance method @94166. Passes autoCenterParts=true,
+                    // applyUndo=true (matches normal UI load behavior, integrates
+                    // with editor undo history), offset=Vector2.zero, onLoaded=null.
+                    string[] parts4 = line.Split(new char[] { ' ' }, 2);
+                    string pathBuild = parts4.Length > 1 ? parts4[1].Trim() : null;
+
+                    if (string.IsNullOrEmpty(pathBuild))
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=no_path");
+                        break;
+                    }
+
+                    string sceneBuild = SceneManager.GetActiveScene().name;
+                    if (sceneBuild != "Build_PC")
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=not_in_build scene=" + sceneBuild);
+                        break;
+                    }
+
+                    if (!File.Exists(pathBuild))
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=file_not_found path=" + pathBuild);
+                        break;
+                    }
+
+                    string jsonBuild;
+                    try { jsonBuild = File.ReadAllText(pathBuild); }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=read_error " + e.Message);
+                        break;
+                    }
+
+                    Type blueprintTypeBuild = FindType("SFS.Builds.Blueprint");
+                    Type jsonWrapperTypeBuild = FindType("SFS.Parsers.Json.JsonWrapper");
+                    Type buildStateType = FindType("SFS.Builds.BuildState");
+                    Type msgLoggerType = FindType("SFS.I_MsgLogger");
+                    if (blueprintTypeBuild == null || jsonWrapperTypeBuild == null ||
+                        buildStateType == null || msgLoggerType == null)
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=type_resolution blueprint=" +
+                            (blueprintTypeBuild != null) + " jsonWrapper=" + (jsonWrapperTypeBuild != null) +
+                            " buildState=" + (buildStateType != null) + " msgLogger=" + (msgLoggerType != null));
+                        break;
+                    }
+
+                    MethodInfo fromJsonGenericBuild = jsonWrapperTypeBuild.GetMethod("FromJson",
+                        BindingFlags.Public | BindingFlags.Static);
+                    if (fromJsonGenericBuild == null)
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=fromjson_method_not_found");
+                        break;
+                    }
+                    MethodInfo fromJsonBuild = fromJsonGenericBuild.MakeGenericMethod(blueprintTypeBuild);
+
+                    object blueprintBuild;
+                    try { blueprintBuild = fromJsonBuild.Invoke(null, new object[] { jsonBuild }); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=deserialize_error " + msg);
+                        break;
+                    }
+                    if (blueprintBuild == null)
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=deserialize_null");
+                        break;
+                    }
+
+                    object buildState = FindComponent("SFS.Builds.BuildState");
+                    if (buildState == null)
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=buildstate_not_found");
+                        break;
+                    }
+
+                    // Real I_MsgLogger implementation, same one the normal UI
+                    // uses -- matches what a human clicking "Load" would supply.
+                    // Not strictly confirmed required (LoadBlueprint's own body
+                    // only passes logger through, never calls .Log() directly
+                    // itself), but safer than guessing null is tolerated deeper
+                    // in the private SpawnBlueprint call it feeds into.
+                    object logger = FindComponent("SFS.UI.MsgDrawer");
+
+                    MethodInfo loadMethod = buildStateType.GetMethod("LoadBlueprint",
+                        BindingFlags.Public | BindingFlags.Instance, null,
+                        new Type[] { blueprintTypeBuild, msgLoggerType, typeof(bool), typeof(bool),
+                                     typeof(Vector2), typeof(Action) },
+                        null);
+                    if (loadMethod == null)
+                    {
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=load_method_not_found");
+                        break;
+                    }
+
+                    try
+                    {
+                        loadMethod.Invoke(buildState, new object[] {
+                            blueprintBuild, logger, true, true, Vector2.zero, null
+                        });
+                    }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=load_exception " + msg);
+                        break;
+                    }
+
+                    ProbeMod.Result("loadblueprintbuild: OK path=" + pathBuild);
                     break;
                 }
 

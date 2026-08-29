@@ -107,19 +107,22 @@ falls back to the full flight range -- worth double-checking
 - **`sfsprobe_checklist_status`** -- parses `docs/high_level_checklist.md`
   and reports confirmed vs open items per section.
 
-**Blueprint loading (Stage 12, CONFIRMED WORKING 2026-08-29):**
-- **`sfsprobe_load_blueprint`** -- spawns a rocket design directly,
-  bypassing the editor UI entirely. Resolves by `name` (looked up in
-  `blueprints/research/<name>/Blueprint.txt`) or an explicit `path`,
-  sends the mod's `loadblueprint` command (v0.32.0+), and maps its
-  distinct `reason=` failure tokens to proper `error_code` values:
-  `NOT_IN_WORLD` (wrong scene -- must be `World_PC`, a loaded flight,
-  NOT the editor), `FILE_NOT_FOUND`, `FILE_ERROR`,
-  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`. Live-tested
-  end to end: a single-part blueprint spawned a real, visually-confirmed
-  part in-game (rocket count 1->2, part count 8->9). Multi-part
-  blueprints (joint generation/connectivity) and a documented possible
-  DLC/ownership gate for locked parts remain untested.
+**Blueprint loading (Stage 12):**
+- **`sfsprobe_load_blueprint`** -- loads a rocket design directly,
+  bypassing the editor UI's file picker. Resolves by `name` (looked up
+  in `blueprints/research/<name>/Blueprint.txt`) or an explicit `path`.
+  Two modes via `target`: **`'build'` (default)** -- the real "Load
+  Blueprint" button mechanism (`BuildState.LoadBlueprint`), REPLACES
+  the current editor design, requires `Build_PC`, **not yet
+  live-tested**; **`'world'`** -- spawns an ADDITIONAL rocket into an
+  active flight (`RocketManager.SpawnBlueprint`), requires `World_PC`,
+  **confirmed working live** (single-part blueprint spawned a real,
+  visually-confirmed part, 2026-08-29). Maps the mod's distinct
+  `reason=` failure tokens to proper `error_code` values: `NOT_IN_BUILD`
+  / `NOT_IN_WORLD`, `FILE_NOT_FOUND`, `FILE_ERROR`,
+  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`. Multi-part
+  blueprints and a documented possible DLC/ownership gate remain
+  untested for both targets.
 
 ## Known protocol gotcha (handled by `sfsprobe_send_batch`, worth knowing generally)
 

@@ -11,6 +11,32 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.33.0 — 2026-08-29 (later same day)
+
+- **Added `loadblueprintbuild <path>`** — the real mechanism behind the
+  game's own "Load Blueprint" button. Calls `BuildState.LoadBlueprint
+  (Blueprint, I_MsgLogger, bool autoCenterParts, bool applyUndo, Vector2
+  offset, Action onLoaded)`, a **public instance** method confirmed via
+  reading its actual IL body (2026-08-29) — it calls `BuildState.Clear()`
+  first (hence **replaces** the current design, not adds to it), centers
+  parts/camera, sets orientation, loads staging, all within
+  `BuildState`/`BuildMenus`/`BuildOrientation`/`BuildGrid` (editor-scoped
+  types). **No `WorldView` dependency at all** — correctly requires
+  `Build_PC`, the opposite of `loadblueprint` (v0.30–v0.32, which spawns
+  an *additional* rocket into a live `World_PC` flight via
+  `RocketManager.SpawnBlueprint`). Both commands now coexist — they do
+  genuinely different things (replace the design being edited vs. add a
+  rocket to a running flight), not a replacement of one by the other.
+
+  Same distinct-failure-reason discipline as `loadblueprint`:
+  `not_in_build`, `buildstate_not_found`, `load_method_not_found`,
+  `load_exception`, plus the shared `no_path`/`file_not_found`/
+  `read_error`/`type_resolution`/`fromjson_method_not_found`/
+  `deserialize_error`/`deserialize_null`.
+
+  Built and installed clean, first try. **Not yet live-tested** — next
+  step is confirming it actually replaces the current design in-game.
+
 ## v0.32.0 — 2026-08-29 (later same day)
 
 - **Fixed the `loadblueprint` scene gate: World_PC, not Build_PC.**

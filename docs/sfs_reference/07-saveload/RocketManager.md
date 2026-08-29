@@ -164,6 +164,43 @@ string json = (string)InvokeStatic(jsonWrapper, "ToJson",
 > **[UNTESTED-LIVE]** — the `RocketSave(Rocket)` constructor body was not
 > read, so it may have side effects or assume editor/flight context.
 
+## Related: `SFS.Builds.BuildState.LoadBlueprint` -- the actual "Load Blueprint" button
+
+**Found 2026-08-29**, prompted by a direct question about why
+`RocketManager.SpawnBlueprint` needs `World_PC` when the game's editor
+clearly has its own "Load" UI that doesn't. It does — and it's a
+different method on a different class, not documented here in full
+(that's `BuildState`'s own future entry, not yet written), but the
+signature and the part relevant to spawning are confirmed:
+
+```csharp
+// SFS.Builds.BuildState, public instance method, IL @94166
+instance void LoadBlueprint(Blueprint blueprint, I_MsgLogger logger,
+    bool autoCenterParts, bool applyUndo,
+    [opt] Vector2 offset, [opt] Action onLoaded)
+```
+
+**Behavior (confirmed from the real IL body):** calls `BuildState.Clear
+(applyUndo)` **first** — this is what makes it "replace" rather than
+"add". Then calls the private `BuildState.SpawnBlueprint(Blueprint,
+bool, I_MsgLogger)` to create the parts, centers them (either via
+`GridSize.GetOwnedGridSize`/`Part_Utility.CenterParts`, or an explicit
+offset against `blueprint.center`), calls `BuildState`'s **own**
+`CenterCameraOnParts` (not `WorldView.main` — no world dependency at
+all), sets `BuildOrientation.main.SetOrientation`, and loads staging via
+`BuildMenus.staging.Load`. Optionally invokes an `onLoaded` callback.
+
+**This is the better fit for a design-iteration workflow** than
+`RocketManager.SpawnBlueprint` above: it's the real editor mechanism,
+requires `Build_PC` (not `World_PC`), and replaces rather than adds.
+Implemented as the mod's `loadblueprintbuild` command (v0.33.0) — built
+and installed, **not yet live-tested**. `RocketManager.SpawnBlueprint`
+(above) remains useful for a different case: adding an *additional*
+rocket to an already-running flight, which `BuildState.LoadBlueprint`
+cannot do (it's editor-only).
+
+---
+
 ## Status summary
 
 | Item | Status |

@@ -1884,6 +1884,7 @@ async def sfsprobe_run_and_analyze(params: RunAndAnalyzeInput) -> str:
 _BLUEPRINT_FAILURE_CODES = {
     "no_path": "INVALID_PARAM",
     "not_in_world": "NOT_IN_WORLD",
+    "not_in_build": "NOT_IN_BUILD",
     "file_not_found": "FILE_NOT_FOUND",
     "read_error": "FILE_ERROR",
     "type_resolution": "TYPE_RESOLUTION_FAILED",
@@ -1892,6 +1893,9 @@ _BLUEPRINT_FAILURE_CODES = {
     "deserialize_null": "PARSE_ERROR",
     "spawn_method_not_found": "TYPE_RESOLUTION_FAILED",
     "spawn_exception": "SPAWN_FAILED",
+    "buildstate_not_found": "TYPE_RESOLUTION_FAILED",
+    "load_method_not_found": "TYPE_RESOLUTION_FAILED",
+    "load_exception": "SPAWN_FAILED",
 }
 
 
@@ -1911,6 +1915,17 @@ def _resolve_blueprint_path(name: Optional[str], path: Optional[str]) -> Path:
     return p
 
 
+class LoadBlueprintTarget(str, Enum):
+    BUILD = "build"    # BuildState.LoadBlueprint -- loads into the editor,
+                        # REPLACING the current design. Requires Build_PC.
+                        # This is the real mechanism behind the game's own
+                        # "Load Blueprint" button.
+    WORLD = "world"     # RocketManager.SpawnBlueprint -- spawns an ADDITIONAL
+                        # live physics rocket into an active flight. Requires
+                        # World_PC. Useful for adding a rocket to a running
+                        # flight, not for iterating on a design.
+
+
 class LoadBlueprintInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1923,6 +1938,15 @@ class LoadBlueprintInput(BaseModel):
         default=None,
         description="Explicit path to a Blueprint.txt-format file, if not using 'name'. "
                      "Can point anywhere, including blueprints/live/ once that's in use.",
+    )
+    target: LoadBlueprintTarget = Field(
+        default=LoadBlueprintTarget.BUILD,
+        description="'build' (default): load into the editor, replacing the "
+                     "current design -- the real 'Load Blueprint' button "
+                     "mechanism, requires the Build_PC scene. 'world': spawn "
+                     "an ADDITIONAL rocket into an active flight, requires "
+                     "World_PC -- for adding to a running flight, not for "
+                     "design iteration.",
     )
     timeout_s: float = Field(default=10.0, ge=1.0, le=60.0,
                               description="Max seconds to wait for the command to complete.")
@@ -1943,51 +1967,61 @@ async def sfsprobe_load_blueprint(params: LoadBlueprintInput) -> str:
     editor UI at all. Reads a Blueprint.txt-format JSON file (either
     blueprints/research/<name>/Blueprint.txt, or an explicit path),
     deserializes it via the game's own JsonWrapper.FromJson<Blueprint>,
-    and calls the confirmed public-static RocketManager.SpawnBlueprint --
-    all through the mod's 'loadblueprint' command (v0.30.0+).
+    then dispatches to one of two real game mechanisms depending on
+    `target`:
 
-    GENUINELY UNTESTED-LIVE as of first build (2026-08-29) --
-    SpawnBlueprint's own body was never read during the source-code
-    documentation effort, and there's a documented possible DLC/
-    ownership gate that could silently reject some parts. Treat early
-    calls as an experiment.
+    - **target='build' (default):** `BuildState.LoadBlueprint` -- the
+      actual mechanism behind the game's own "Load Blueprint" button.
+      REPLACES the current editor design (calls BuildState.Clear() first).
+      Requires the Build_PC scene. Confirmed 2026-08-29 by reading the
+      real IL body: no dependency on WorldView/a live flight at all.
+    - **target='world':** `RocketManager.SpawnBlueprint` -- spawns an
+      ADDITIONAL live physics rocket into an active flight, alongside
+      whatever's already there. Requires World_PC (needs a live
+      `WorldView.main`, found the hard way after a real crash on
+      2026-08-29 -- see mod_changelog.md v0.32.0). Live-tested working:
+      a single-part blueprint spawned a real, visually-confirmed part.
 
-    Distinct error codes so a caller can tell WHY it failed, not just
-    that it did: NOT_IN_WORLD (wrong scene -- must be in a loaded
-    flight/world, NOT the editor; corrected 2026-08-29 after the first
-    live test showed SpawnBlueprint needs a live WorldView.main, which
-    only exists in World_PC), FILE_NOT_FOUND, FILE_ERROR (couldn't read), 
-    TYPE_RESOLUTION_FAILED (a reflection lookup failed -- likely means
-    the game's internals changed), PARSE_ERROR (bad/unparseable JSON),
-    SPAWN_FAILED (SpawnBlueprint itself threw -- the file was fine, the
-    game rejected the design; check the error message for why).
+    Both targets: v0.33.0+. Distinct error codes so a caller can tell WHY
+    it failed, not just that it did: NOT_IN_BUILD / NOT_IN_WORLD (wrong
+    scene for the chosen target), FILE_NOT_FOUND, FILE_ERROR (couldn't
+    read), TYPE_RESOLUTION_FAILED (a reflection lookup failed -- likely
+    means the game's internals changed), PARSE_ERROR (bad/unparseable
+    JSON), SPAWN_FAILED (the game itself threw during spawn/load -- the
+    file was fine, check the error message for why).
+
+    Multi-part blueprints (joint generation/connectivity) and a
+    documented possible DLC/ownership gate for locked parts remain
+    untested for both targets -- only a single free part has been
+    confirmed end to end so far.
 
     Args:
-        params (LoadBlueprintInput): name, path, timeout_s
+        params (LoadBlueprintInput): name, path, target, timeout_s
 
     Returns:
-        str: JSON with keys: success (bool), path (the file used), and
-        either 'response' (raw OK text) or 'error_code'/'error'/
-        'failure_reason' (the raw reason= token from the mod, in case the
-        mapped error_code loses detail worth seeing).
+        str: JSON with keys: success (bool), path (the file used),
+        target (the mode used), and either 'response' (raw OK text) or
+        'error_code'/'error'/'failure_reason' (the raw reason= token from
+        the mod, in case the mapped error_code loses detail worth seeing).
     """
     try:
         blueprint_path = _resolve_blueprint_path(params.name, params.path)
     except (FileNotFoundError, ValueError) as e:
         return _error_for_exception(e)
 
+    command_word = "loadblueprintbuild" if params.target == LoadBlueprintTarget.BUILD else "loadblueprint"
     try:
         response, elapsed = await asyncio.to_thread(
-            send_command, f"loadblueprint {blueprint_path}", params.timeout_s, DEFAULT_POLL_INTERVAL_S
+            send_command, f"{command_word} {blueprint_path}", params.timeout_s, DEFAULT_POLL_INTERVAL_S
         )
     except ProbeTimeoutError as e:
         return _error_for_exception(e, elapsed_seconds=round(params.timeout_s, 3))
     except FileNotFoundError as e:
         return _error_for_exception(e)
 
-    if "loadblueprint: OK" in response:
+    if f"{command_word}: OK" in response:
         return json.dumps({
-            "success": True, "path": str(blueprint_path),
+            "success": True, "path": str(blueprint_path), "target": params.target.value,
             "response": response, "elapsed_seconds": round(elapsed, 3),
         }, indent=2)
 
@@ -1995,7 +2029,7 @@ async def sfsprobe_load_blueprint(params: LoadBlueprintInput) -> str:
     reason = reason_match.group(1) if reason_match else None
     error_code = _BLUEPRINT_FAILURE_CODES.get(reason, "UNKNOWN_ERROR")
     return json.dumps({
-        "success": False, "path": str(blueprint_path),
+        "success": False, "path": str(blueprint_path), "target": params.target.value,
         "error_code": error_code, "failure_reason": reason,
         "error": response, "elapsed_seconds": round(elapsed, 3),
     }, indent=2)
