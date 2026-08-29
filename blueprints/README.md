@@ -54,11 +54,17 @@ showed why -- its first instructions call
 populated in `World_PC`. The mod enforces this now (`reason=
 not_in_world` if called from the wrong scene).
 
-**Still genuinely untested PAST the scene fix, as of 2026-08-29** --
-`SpawnBlueprint`'s full body has now been read for the scene-check
-purpose, but the rest of its logic (part-ownership handling,
-`PartsLoader.CreateParts`, joint generation) hasn't been traced
-line-by-line, and there's a documented possible DLC/ownership gate
-(`OnPartNotOwned`/`OwnershipState`) that could still silently reject
-some parts. Treat spawn *results* (not just scene-check passing) as
-an experiment until a part actually appears in-game.
+**CONFIRMED WORKING, 2026-08-29.** Retested from `World_PC` after the
+scene fix: `sfsprobe_load_blueprint(name="single_capsule")` returned
+`success: true`, rocket count went 1->2, part count went 8->9, and
+Christian visually confirmed a real capsule spawned next to the
+existing rocket in-game. The whole pipeline works end to end -- write a
+plain JSON file, no editor interaction, spawn through the game's own
+code.
+
+**Still open:** only a single-part blueprint has been tested. Multi-part
+designs (joint generation via `GenerateJoints`, whether parts actually
+connect into something flyable) and the documented possible DLC/
+ownership gate (`OnPartNotOwned`/`OwnershipState` -- `Capsule` is
+presumably a free/base part, so this test doesn't rule that out for
+locked parts) remain unverified.

@@ -131,7 +131,18 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       still not made.
 - [ ] **Mission spec schema** — designer → flight-agent handoff format
 - [ ] **Editor automation vs. file-writing** — does the agent play the
-      in-game editor, or write blueprint files directly
+      in-game editor, or write blueprint files directly. **Substantially
+      de-risked, 2026-08-29** (not yet fully decided, since multi-part is
+      untested): the file-writing route is now **live-confirmed working**
+      for a single-part design — `RocketManager.SpawnBlueprint(Blueprint)`
+      spawns a real part with zero editor interaction, called via
+      reflection from a plain JSON file. Required finding, the hard way,
+      that the call must happen from `World_PC` (a loaded flight), not
+      `Build_PC` — see `docs/sfs_reference/07-saveload/RocketManager.md`.
+      Still open: whether `GenerateJoints` actually connects a multi-part
+      design into something flyable, and whether the documented
+      `OnPartNotOwned`/`OwnershipState` DLC gate blocks any non-free
+      parts (untested by the free-part `Capsule` case).
 - [ ] **Exact state-message contents** — what the flight agent actually
       sees each tick
 - [ ] **Phase detection ownership** — probably Python (cheap, easy to

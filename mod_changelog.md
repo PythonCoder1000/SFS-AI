@@ -35,6 +35,15 @@ fact from session notes rather than logged at the time.
   — the fix came from reading the IL after a real failure, not from
   guessing harder.
 
+  **Retested and CONFIRMED WORKING from `World_PC`, same day:**
+  `loadblueprint` against a single-part test blueprint returned OK,
+  rocket count went 1->2, part count went 8->9, and the spawned capsule
+  was visually confirmed in-game next to the existing rocket. The whole
+  pipeline is real, not just theoretically documented — write a plain
+  JSON file, no editor interaction, spawn through the game's own code.
+  Multi-part blueprints (joint generation, connectivity) and the
+  possible DLC/ownership gate remain untested.
+
 ## v0.31.0 — 2026-08-29
 
 - **`ping` now reports `gameVersion` and `modVersion`** alongside

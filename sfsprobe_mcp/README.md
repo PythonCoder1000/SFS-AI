@@ -107,18 +107,19 @@ falls back to the full flight range -- worth double-checking
 - **`sfsprobe_checklist_status`** -- parses `docs/high_level_checklist.md`
   and reports confirmed vs open items per section.
 
-**Blueprint loading (Stage 12, genuinely untested-live):**
+**Blueprint loading (Stage 12, CONFIRMED WORKING 2026-08-29):**
 - **`sfsprobe_load_blueprint`** -- spawns a rocket design directly,
   bypassing the editor UI entirely. Resolves by `name` (looked up in
   `blueprints/research/<name>/Blueprint.txt`) or an explicit `path`,
-  sends the mod's `loadblueprint` command (v0.30.0+), and maps its
+  sends the mod's `loadblueprint` command (v0.32.0+), and maps its
   distinct `reason=` failure tokens to proper `error_code` values:
-  `NOT_IN_DESIGN` (wrong scene), `FILE_NOT_FOUND`, `FILE_ERROR`,
-  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`. **Genuinely
-  untested-live** -- `RocketManager.SpawnBlueprint`'s own body was never
-  read during the documentation effort, and there's a documented
-  possible DLC/ownership gate that could silently reject some parts.
-  Treat early calls as an experiment, not an assumed-working feature.
+  `NOT_IN_WORLD` (wrong scene -- must be `World_PC`, a loaded flight,
+  NOT the editor), `FILE_NOT_FOUND`, `FILE_ERROR`,
+  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`. Live-tested
+  end to end: a single-part blueprint spawned a real, visually-confirmed
+  part in-game (rocket count 1->2, part count 8->9). Multi-part
+  blueprints (joint generation/connectivity) and a documented possible
+  DLC/ownership gate for locked parts remain untested.
 
 ## Known protocol gotcha (handled by `sfsprobe_send_batch`, worth knowing generally)
 

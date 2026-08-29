@@ -8,6 +8,13 @@ without the editor**, which is a save-format question.
 **Migrated** from `docs/sfs_source_reference.md` §D5.4–D5.5
 (2026-08-28).
 
+**CORRECTION / LIVE CONFIRMATION (2026-08-29):** `SpawnBlueprint`'s
+body was partially read (not full-line-by-line, but enough to explain a
+real crash) and the whole no-editor spawn route was live-tested
+successfully. See the updated sections below — this is not a silent
+overwrite of the original `[OPEN]`/`[UNTESTED-LIVE]` marks, both are
+kept below with what's now known.
+
 Schemas: [`save-records.md`](save-records.md).
 
 ---
@@ -26,7 +33,7 @@ Schemas: [`save-records.md`](save-records.md).
 
 | Signature | IL | Access | Status |
 |---|---|---|---|
-| `static void SpawnBlueprint(Blueprint blueprint)` | @190336 | **public static** | [CONFIRMED] signature · **[OPEN] body** |
+| `static void SpawnBlueprint(Blueprint blueprint)` | @190336 | **public static** | [CONFIRMED] signature · **[PARTIAL] body** — first 5 instructions read (2026-08-29), rest still [OPEN] |
 | `static List<PartJoint> GenerateJoints(Part[] parts)` | @190532 | **public static** | [CONFIRMED] signature |
 | `static void LoadRocket(RocketSave rocketSave, out bool hasNonOwnedParts)` | @191085 | public static | [CONFIRMED] signature |
 | `static Rocket CreateRocket_Child(JointGroup, Rocket parent, Vector2 offset)` | @191198 | public static | [CONFIRMED] signature |
@@ -35,6 +42,28 @@ Schemas: [`save-records.md`](save-records.md).
 | `static Rocket[] SpawnRockets(List<JointGroup> groups)` | @190939 | private static | [CONFIRMED] signature |
 | `static Location GetSpawnLocation(JointGroup group)` | @191007 | private static | [CONFIRMED] signature |
 | `static Rocket CreateRocket(JointGroup, string name, bool throttleOn, float throttlePercent, bool RCS, float rotation, float angularVelocity, Func<Rocket,Location> location, bool physicsMode)` | @191274 | private static | [CONFIRMED] signature |
+
+#### SpawnBlueprint(Blueprint blueprint) -> void
+
+- **Access:** public static · IL @190336
+- **Behavior (partial, confirmed 2026-08-29):** the FIRST FIVE
+  instructions call `WorldView.main.SetViewLocation(SpaceCenterData.
+  LaunchPadLocation)` — moving the camera to the launch pad, before
+  touching a single part. `WorldView.main` is a static singleton
+  populated only in the `World_PC` scene (a loaded flight/world), not
+  `Build_PC` (the editor). Calling this from `Build_PC` throws
+  `NullReferenceException` immediately. **This was found by reading the
+  IL after a real crash**, not by inspection alone — the original
+  scene-gate guess ("should be in the design screen") was wrong, and
+  the correct requirement is the opposite.
+- **Rest of the body (blueprint rotation normalization, the
+  `PartsLoader.CreateParts` call and its `Transform`/sorting-layer
+  arguments, `GenerateJoints`, rocket construction) is still [OPEN]** —
+  read only far enough to explain the scene requirement, not
+  line-by-line.
+- **Status:** [CONFIRMED] signature and scene requirement · [PARTIAL]
+  body · **live-tested successfully** from `World_PC` (see "The
+  finding" section below).
 
 #### GenerateJoints(Part[] parts) -> List&lt;PartJoint&gt;
 
@@ -92,17 +121,25 @@ routes**, in increasing order of coupling to the UI:
    [`save-records.md`](save-records.md).
 2. **Construct a `Blueprint` in memory** by reflection and call
    `RocketManager.SpawnBlueprint` — no file, no editor, no menu.
-   **[UNTESTED-LIVE]**.
+   **[CONFIRMED WORKING, 2026-08-29]** — live-tested via the
+   `sfsprobe` mod's `loadblueprint` command: a single-part blueprint
+   (`Capsule`) spawned successfully when called from `World_PC`
+   (rocket count 1->2, part count 8->9, visually confirmed in-game).
+   Must be called from `World_PC`, not `Build_PC` (see the method entry
+   above). Multi-part blueprints (joint generation/connectivity via
+   `GenerateJoints`) and the possible DLC/ownership gate below remain
+   untested.
 3. **Drive the editor UI** ([`../16-builds/`](../16-builds/)).
 
-**Route 2 is the one the IL most directly supports**, and it is worth a
-live test before the design decision is made. Its risks are real but
-narrow:
+**Route 2 is confirmed working for the single-part case.** Remaining
+risks, now narrower than originally scoped:
 
-- `SpawnBlueprint`'s body was **not** read — **[OPEN]**.
+- The bulk of `SpawnBlueprint`'s body (past the scene-requiring opening)
+  was **not** read — **[OPEN]**.
 - Part `name` keys must match `PartsLoader.parts`.
 - `OnPartNotOwned` / `OwnershipState` suggest a **DLC/ownership gate** on
-  some parts that a generated design could trip — **[OPEN]**.
+  some parts that a generated design could trip — **[OPEN]**. Not ruled
+  out by this test: `Capsule` is presumably a free/base part.
 
 ## Reflection recipe — dump the live rocket as a `RocketSave`
 
@@ -132,10 +169,14 @@ string json = (string)InvokeStatic(jsonWrapper, "ToJson",
 | Item | Status |
 |---|---|
 | `RocketManager.SpawnBlueprint` is public static, takes a plain object | [CONFIRMED] — enables the no-editor route |
+| `SpawnBlueprint` requires `World_PC` scene (`WorldView.main` dependency) | [CONFIRMED] 2026-08-29 — found via a real crash + IL read |
 | `GenerateJoints` derives connectivity from geometry | [CONFIRMED] — blueprints need no joints |
 | `PartsLoader.parts` is the catalog, keyed by name | [CONFIRMED] |
 | `CreateParts` signature, including the ownership out-parameter | [CONFIRMED] |
-| `SpawnBlueprint` / `CreateParts` / `GenerateJoints` bodies | [OPEN] |
-| Ownership / DLC gating (`OnPartNotOwned`, `OwnershipState`) | [OPEN] |
+| Single-part blueprint spawns successfully via `RocketManager.SpawnBlueprint` | [CONFIRMED WORKING] 2026-08-29, live-tested |
+| `SpawnBlueprint` body past the scene-check opening | [OPEN] |
+| `CreateParts` / `GenerateJoints` bodies | [OPEN] |
+| Ownership / DLC gating (`OnPartNotOwned`, `OwnershipState`) | [OPEN] — not exercised by the free-part test |
 | `MergeRockets` / `DestroyRocket` / `CreateRocket_Child` bodies | [OPEN] |
+| Multi-part blueprint spawning (joint generation/connectivity) | [UNTESTED-LIVE] |
 | Round-tripping a generated blueprint in the live game | [UNTESTED-LIVE] |
