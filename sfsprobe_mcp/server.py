@@ -1883,7 +1883,7 @@ async def sfsprobe_run_and_analyze(params: RunAndAnalyzeInput) -> str:
 # generic failure.
 _BLUEPRINT_FAILURE_CODES = {
     "no_path": "INVALID_PARAM",
-    "not_in_design": "NOT_IN_DESIGN",
+    "not_in_world": "NOT_IN_WORLD",
     "file_not_found": "FILE_NOT_FOUND",
     "read_error": "FILE_ERROR",
     "type_resolution": "TYPE_RESOLUTION_FAILED",
@@ -1953,8 +1953,10 @@ async def sfsprobe_load_blueprint(params: LoadBlueprintInput) -> str:
     calls as an experiment.
 
     Distinct error codes so a caller can tell WHY it failed, not just
-    that it did: NOT_IN_DESIGN (wrong scene -- must be in the build/
-    design screen), FILE_NOT_FOUND, FILE_ERROR (couldn't read), 
+    that it did: NOT_IN_WORLD (wrong scene -- must be in a loaded
+    flight/world, NOT the editor; corrected 2026-08-29 after the first
+    live test showed SpawnBlueprint needs a live WorldView.main, which
+    only exists in World_PC), FILE_NOT_FOUND, FILE_ERROR (couldn't read), 
     TYPE_RESOLUTION_FAILED (a reflection lookup failed -- likely means
     the game's internals changed), PARSE_ERROR (bad/unparseable JSON),
     SPAWN_FAILED (SpawnBlueprint itself threw -- the file was fine, the

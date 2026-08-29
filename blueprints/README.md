@@ -45,9 +45,20 @@ own `JsonWrapper.FromJson<Blueprint>`, and calls
 `RocketManager.SpawnBlueprint` through reflection. No editor UI
 interaction needed.
 
-**This is genuinely untested-live territory as of 2026-08-29** --
-`SpawnBlueprint`'s own body was never read during the documentation
-effort, and there's a documented possible DLC/ownership gate
-(`OnPartNotOwned`/`OwnershipState`) that could silently reject some
-parts. Treat the first real spawn attempts as experiments, not as an
-assumed-working feature.
+**Must be called from `World_PC` (a loaded flight/world), not
+`Build_PC` (the editor).** Found the hard way, 2026-08-29: the first
+live test (from `Build_PC`, an untested assumption) threw a
+`NullReferenceException`. Reading `SpawnBlueprint`'s actual IL body
+showed why -- its first instructions call
+`WorldView.main.SetViewLocation(...)`, and that singleton is only
+populated in `World_PC`. The mod enforces this now (`reason=
+not_in_world` if called from the wrong scene).
+
+**Still genuinely untested PAST the scene fix, as of 2026-08-29** --
+`SpawnBlueprint`'s full body has now been read for the scene-check
+purpose, but the rest of its logic (part-ownership handling,
+`PartsLoader.CreateParts`, joint generation) hasn't been traced
+line-by-line, and there's a documented possible DLC/ownership gate
+(`OnPartNotOwned`/`OwnershipState`) that could still silently reject
+some parts. Treat spawn *results* (not just scene-check passing) as
+an experiment until a part actually appears in-game.

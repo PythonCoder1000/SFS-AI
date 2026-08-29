@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.31.0";
+        public const string VersionString = "0.32.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (ping now reports gameVersion + modVersion, so sfsprobe_ping/sfsprobe_status can show them without a separate command; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (loadblueprint scene gate corrected to World_PC, not Build_PC -- see IL evidence in the case comment; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -785,6 +785,20 @@ namespace SFSProbe
                     // reject some parts. Treat the first real calls as an
                     // experiment, not an assumed-working feature.
                     //
+                    // SCENE REQUIREMENT CORRECTED (2026-08-29, first live test):
+                    // originally gated on Build_PC (an untested assumption --
+                    // "should be in the design screen"). First live call from
+                    // Build_PC threw NullReferenceException; reading
+                    // SpawnBlueprint's actual IL body showed why -- its very
+                    // FIRST instructions are
+                    // WorldView.main.SetViewLocation(SpaceCenterData.
+                    // LaunchPadLocation), dereferencing the static WorldView.main
+                    // singleton before touching a single part. That singleton is
+                    // populated in World_PC (a loaded flight/world), not Build_PC
+                    // (the editor) -- so the gate needed to be the opposite of
+                    // what was first guessed. Confirmed by retesting from
+                    // World_PC.
+                    //
                     // Path can contain spaces (this project's own folder is
                     // literally named "SFS AI") -- split into exactly 2 pieces,
                     // same pattern as the "telemetry" case above, NOT the
@@ -799,9 +813,9 @@ namespace SFSProbe
                     }
 
                     string scene = SceneManager.GetActiveScene().name;
-                    if (scene != "Build_PC")
+                    if (scene != "World_PC")
                     {
-                        ProbeMod.Result("loadblueprint: FAILED reason=not_in_design scene=" + scene);
+                        ProbeMod.Result("loadblueprint: FAILED reason=not_in_world scene=" + scene);
                         break;
                     }
 

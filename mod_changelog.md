@@ -11,6 +11,30 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.32.0 — 2026-08-29 (later same day)
+
+- **Fixed the `loadblueprint` scene gate: World_PC, not Build_PC.**
+  First live test (against `single_capsule`, from `Build_PC` as
+  originally gated) threw `spawn_exception: Object reference not set
+  to an instance of an object.` Read `RocketManager.SpawnBlueprint`'s
+  actual IL body (never read before this — `[OPEN]` in the source
+  reference) to find out why: its first five instructions call
+  `WorldView.main.SetViewLocation(SpaceCenterData.LaunchPadLocation)`
+  — dereferencing the static `WorldView.main` singleton before touching
+  a single part. That singleton is populated in `World_PC` (a loaded
+  flight/world), not `Build_PC` (the editor) — the exact opposite of
+  the original untested assumption ("should be in the design screen").
+  Confirmed live: the same call from `World_PC` no longer hits
+  `not_in_world` and gets past the scene check (see
+  `python_changelog.md`/`docs/sfs_source_reference.md` for the fuller
+  spawn-result outcome).
+
+  `reason=not_in_design` renamed to `reason=not_in_world` to match.
+  This is a real example of the project's own "verify before building"
+  rule catching an actual wrong assumption, not just a hypothetical one
+  — the fix came from reading the IL after a real failure, not from
+  guessing harder.
+
 ## v0.31.0 — 2026-08-29
 
 - **`ping` now reports `gameVersion` and `modVersion`** alongside
