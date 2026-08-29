@@ -111,18 +111,24 @@ falls back to the full flight range -- worth double-checking
 - **`sfsprobe_load_blueprint`** -- loads a rocket design directly,
   bypassing the editor UI's file picker. Resolves by `name` (looked up
   in `blueprints/research/<name>/Blueprint.txt`) or an explicit `path`.
-  Two modes via `target`: **`'build'` (default)** -- the real "Load
-  Blueprint" button mechanism (`BuildState.LoadBlueprint`), REPLACES
-  the current editor design, requires `Build_PC`, **not yet
-  live-tested**; **`'world'`** -- spawns an ADDITIONAL rocket into an
-  active flight (`RocketManager.SpawnBlueprint`), requires `World_PC`,
-  **confirmed working live** (single-part blueprint spawned a real,
-  visually-confirmed part, 2026-08-29). Maps the mod's distinct
-  `reason=` failure tokens to proper `error_code` values: `NOT_IN_BUILD`
-  / `NOT_IN_WORLD`, `FILE_NOT_FOUND`, `FILE_ERROR`,
-  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`. Multi-part
-  blueprints and a documented possible DLC/ownership gate remain
-  untested for both targets.
+  Two modes via `target`: **`'build'` (default, SAFE, routinely
+  repeatable)** -- the real "Load Blueprint" button mechanism
+  (`BuildState.LoadBlueprint`), REPLACES the current editor design,
+  requires `Build_PC`, **not yet live-tested**; **`'world'` (DO NOT USE
+  DURING A LIVE FLIGHT)** -- spawns an additional rocket into an active
+  flight (`RocketManager.SpawnBlueprint`), requires `World_PC`.
+  **Confirmed working live** (single-part blueprint spawned a real,
+  visually-confirmed part, 2026-08-29) -- but that only proves the
+  reflection mechanism works, not that using it mid-flight is safe or
+  intended. Its first action moves the camera to the launch pad, the
+  signature of a one-time internal Launch-transition primitive, not a
+  general spawn tool; materializes a fully-fueled part outside any
+  normal game state, functionally cheating. Reserve for one-off
+  research only. Maps the mod's distinct `reason=` failure tokens to
+  proper `error_code` values: `NOT_IN_BUILD` / `NOT_IN_WORLD`,
+  `FILE_NOT_FOUND`, `FILE_ERROR`, `TYPE_RESOLUTION_FAILED`,
+  `PARSE_ERROR`, `SPAWN_FAILED`. Multi-part blueprints and a documented
+  possible DLC/ownership gate remain untested for both targets.
 
 ## Known protocol gotcha (handled by `sfsprobe_send_batch`, worth knowing generally)
 

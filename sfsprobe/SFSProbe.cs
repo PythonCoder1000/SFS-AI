@@ -778,12 +778,22 @@ namespace SFSProbe
                     // (docs/sfs_source_reference.md D5.1/D5.4/D5.5), matches the
                     // real on-disk format found in an actual saved blueprint.
                     //
-                    // GENUINELY UNTESTED-LIVE as of first write (2026-08-29) --
-                    // SpawnBlueprint's own body was never read (unknown side
-                    // effects), and OnPartNotOwned/OwnershipState in the docs
-                    // suggest a possible DLC/ownership gate that could silently
-                    // reject some parts. Treat the first real calls as an
-                    // experiment, not an assumed-working feature.
+                    // *** DO NOT CALL THIS DURING A LIVE FLIGHT AS ROUTINE USE. ***
+                    // Confirmed 2026-08-29: SpawnBlueprint's FIRST action is
+                    // WorldView.main.SetViewLocation(LaunchPadLocation) -- moving
+                    // the camera to the pad. That is the signature of a ONE-TIME
+                    // internal Build-to-World launch-transition primitive (the
+                    // actual "Launch" button's mechanism), not a general spawn
+                    // tool the game itself ever calls mid-flight or repeatedly.
+                    // Calling it during an active flight materializes a fully-
+                    // fueled part with none of a real launch's cost/sequence/
+                    // achievement tracking -- functionally cheating, and outside
+                    // any state the game was designed to handle repeatedly. The
+                    // one successful live test (2026-08-28) proved the reflection
+                    // mechanism works; it is NOT a green light for routine use.
+                    // For loading a design into the editor (a legitimate,
+                    // routinely-repeatable operation), use "loadblueprintbuild"
+                    // below instead -- that's the real "Load Blueprint" button.
                     //
                     // SCENE REQUIREMENT CORRECTED (2026-08-29, first live test):
                     // originally gated on Build_PC (an untested assumption --
@@ -797,7 +807,8 @@ namespace SFSProbe
                     // populated in World_PC (a loaded flight/world), not Build_PC
                     // (the editor) -- so the gate needed to be the opposite of
                     // what was first guessed. Confirmed by retesting from
-                    // World_PC.
+                    // World_PC -- the mechanism itself genuinely works, it's the
+                    // wisdom of using it live that's now in question (see above).
                     //
                     // Path can contain spaces (this project's own folder is
                     // literally named "SFS AI") -- split into exactly 2 pieces,

@@ -1919,11 +1919,28 @@ class LoadBlueprintTarget(str, Enum):
     BUILD = "build"    # BuildState.LoadBlueprint -- loads into the editor,
                         # REPLACING the current design. Requires Build_PC.
                         # This is the real mechanism behind the game's own
-                        # "Load Blueprint" button.
+                        # "Load Blueprint" button -- a legitimate, routinely-
+                        # repeatable operation. SAFE for normal use.
     WORLD = "world"     # RocketManager.SpawnBlueprint -- spawns an ADDITIONAL
                         # live physics rocket into an active flight. Requires
-                        # World_PC. Useful for adding a rocket to a running
-                        # flight, not for iterating on a design.
+                        # World_PC.
+                        #
+                        # ** DO NOT USE THIS DURING A LIVE FLIGHT. **
+                        # Confirmed 2026-08-29: the method's first action is
+                        # WorldView.main.SetViewLocation(LaunchPadLocation) --
+                        # moving the camera to the pad. That's the signature of
+                        # a ONE-TIME Build-to-World launch-transition primitive
+                        # (the internal "Launch" button mechanism), not a
+                        # general-purpose spawn tool the game itself ever calls
+                        # mid-flight or repeatedly. Calling it during an active
+                        # flight materializes a fully-fueled part with none of
+                        # a real launch's cost/sequence/achievement tracking --
+                        # functionally cheating, and outside any state the game
+                        # was designed to handle repeatedly. The one successful
+                        # live test (2026-08-28) proved the reflection mechanism
+                        # works; it is NOT a green light for routine use. Keep
+                        # this option available for future one-off research
+                        # only, never as a normal operation.
 
 
 class LoadBlueprintInput(BaseModel):
@@ -1941,12 +1958,16 @@ class LoadBlueprintInput(BaseModel):
     )
     target: LoadBlueprintTarget = Field(
         default=LoadBlueprintTarget.BUILD,
-        description="'build' (default): load into the editor, replacing the "
-                     "current design -- the real 'Load Blueprint' button "
-                     "mechanism, requires the Build_PC scene. 'world': spawn "
-                     "an ADDITIONAL rocket into an active flight, requires "
-                     "World_PC -- for adding to a running flight, not for "
-                     "design iteration.",
+        description="'build' (default, SAFE): load into the editor, "
+                     "replacing the current design -- the real 'Load "
+                     "Blueprint' button mechanism, requires Build_PC, "
+                     "routinely repeatable. 'world' (DO NOT USE DURING A "
+                     "LIVE FLIGHT -- likely a one-time internal Launch-"
+                     "transition primitive, not a real spawn tool; "
+                     "materializes a fully-fueled part outside any normal "
+                     "game state, functionally cheating): spawns an "
+                     "additional rocket into an active flight, requires "
+                     "World_PC. Reserve for one-off research only.",
     )
     timeout_s: float = Field(default=10.0, ge=1.0, le=60.0,
                               description="Max seconds to wait for the command to complete.")
@@ -1970,17 +1991,25 @@ async def sfsprobe_load_blueprint(params: LoadBlueprintInput) -> str:
     then dispatches to one of two real game mechanisms depending on
     `target`:
 
-    - **target='build' (default):** `BuildState.LoadBlueprint` -- the
-      actual mechanism behind the game's own "Load Blueprint" button.
+    - **target='build' (default, SAFE):** `BuildState.LoadBlueprint` --
+      the actual mechanism behind the game's own "Load Blueprint" button.
       REPLACES the current editor design (calls BuildState.Clear() first).
       Requires the Build_PC scene. Confirmed 2026-08-29 by reading the
-      real IL body: no dependency on WorldView/a live flight at all.
-    - **target='world':** `RocketManager.SpawnBlueprint` -- spawns an
-      ADDITIONAL live physics rocket into an active flight, alongside
-      whatever's already there. Requires World_PC (needs a live
-      `WorldView.main`, found the hard way after a real crash on
-      2026-08-29 -- see mod_changelog.md v0.32.0). Live-tested working:
-      a single-part blueprint spawned a real, visually-confirmed part.
+      real IL body: no dependency on WorldView/a live flight at all. A
+      legitimate, routinely-repeatable operation -- this is what the UI
+      itself does every time a player clicks "Load".
+    - **target='world' -- DO NOT USE DURING A LIVE FLIGHT:**
+      `RocketManager.SpawnBlueprint`. Its first action
+      (`WorldView.main.SetViewLocation(LaunchPadLocation)`) is the
+      signature of a ONE-TIME internal Build-to-World launch-transition
+      primitive, not a general spawn tool the game itself ever calls
+      mid-flight or repeatedly. Calling it during an active flight
+      materializes a fully-fueled part with none of a real launch's
+      cost/sequence/achievement tracking -- functionally cheating, and
+      outside any state the game was designed to handle repeatedly. The
+      one successful live test (2026-08-28) proved the reflection
+      mechanism works; it is NOT a green light for routine use. Reserve
+      for one-off future research only.
 
     Both targets: v0.33.0+. Distinct error codes so a caller can tell WHY
     it failed, not just that it did: NOT_IN_BUILD / NOT_IN_WORLD (wrong

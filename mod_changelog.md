@@ -37,6 +37,17 @@ fact from session notes rather than logged at the time.
   Built and installed clean, first try. **Not yet live-tested** — next
   step is confirming it actually replaces the current design in-game.
 
+  **IMPORTANT SAFETY NOTE, added after a live-test debrief (2026-08-29):**
+  `loadblueprint` (this command, `RocketManager.SpawnBlueprint`) should
+  **NOT** be used routinely during a live flight, even though it's been
+  confirmed to work. Its first action moves the camera to the launch pad
+  -- the signature of a one-time internal Build-to-World launch-
+  transition primitive, not a general spawn tool. Calling it mid-flight
+  materializes a fully-fueled part with none of a real launch's cost/
+  sequence/achievement tracking -- functionally cheating. Use
+  `loadblueprintbuild` (below) for any routine design-loading need
+  instead — that one IS the real, repeatable "Load Blueprint" mechanism.
+
 ## v0.32.0 — 2026-08-29 (later same day)
 
 - **Fixed the `loadblueprint` scene gate: World_PC, not Build_PC.**
