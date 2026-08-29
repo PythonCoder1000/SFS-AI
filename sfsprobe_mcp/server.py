@@ -69,6 +69,8 @@ DRAGAREA_JSON_FILE = MOD_DIR / "sfs_probe_dragarea.json"
 SNAPSHOT_JSON_FILE = MOD_DIR / "sfs_probe_flight.json"
 ARCHIVE_DIR = MOD_DIR / "archive"
 FLIGHTS_LOG_FILE = _PROJECT_ROOT / "flights_log.jsonl"
+BLUEPRINTS_RESEARCH_DIR = _PROJECT_ROOT / "blueprints" / "research"
+BLUEPRINTS_LIVE_DIR = _PROJECT_ROOT / "blueprints" / "live"
 
 DEFAULT_TIMEOUT_S = 5.0
 DEFAULT_POLL_INTERVAL_S = 0.15
@@ -1852,6 +1854,135 @@ async def sfsprobe_run_and_analyze(params: RunAndAnalyzeInput) -> str:
         "script_log": script_result, "archived_file": str(newest),
         "flight_summary": summary, "drag_validation_summary": validation["summary"],
         "tagged": bool(params.tag),
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# STAGE 12 -- blueprint loading (bypasses the editor UI entirely)
+# ===========================================================================
+
+# Maps the mod's 'loadblueprint: FAILED reason=X' text to a distinct
+# error_code, exactly as requested: a caller needs to be able to tell
+# "wasn't loaded because the game isn't in design mode" from "wasn't
+# loaded because the file/deserialize/spawn step failed" -- not just one
+# generic failure.
+_BLUEPRINT_FAILURE_CODES = {
+    "no_path": "INVALID_PARAM",
+    "not_in_design": "NOT_IN_DESIGN",
+    "file_not_found": "FILE_NOT_FOUND",
+    "read_error": "FILE_ERROR",
+    "type_resolution": "TYPE_RESOLUTION_FAILED",
+    "fromjson_method_not_found": "TYPE_RESOLUTION_FAILED",
+    "deserialize_error": "PARSE_ERROR",
+    "deserialize_null": "PARSE_ERROR",
+    "spawn_method_not_found": "TYPE_RESOLUTION_FAILED",
+    "spawn_exception": "SPAWN_FAILED",
+}
+
+
+def _resolve_blueprint_path(name: Optional[str], path: Optional[str]) -> Path:
+    if path:
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"blueprint file not found: {p}")
+        return p
+    if not name:
+        raise ValueError("either 'name' (looked up in blueprints/research/) or an explicit 'path' must be given")
+    p = BLUEPRINTS_RESEARCH_DIR / name / "Blueprint.txt"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"no blueprint named {name!r} found in {BLUEPRINTS_RESEARCH_DIR} (expected {p})"
+        )
+    return p
+
+
+class LoadBlueprintInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(
+        default=None,
+        description="Blueprint name -- looked up as blueprints/research/<name>/Blueprint.txt. "
+                     "Omit if passing an explicit 'path' instead.",
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description="Explicit path to a Blueprint.txt-format file, if not using 'name'. "
+                     "Can point anywhere, including blueprints/live/ once that's in use.",
+    )
+    timeout_s: float = Field(default=10.0, ge=1.0, le=60.0,
+                              description="Max seconds to wait for the command to complete.")
+
+
+@mcp.tool(
+    name="sfsprobe_load_blueprint",
+    annotations={
+        "title": "Load a rocket blueprint into the game (bypasses the editor UI)",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def sfsprobe_load_blueprint(params: LoadBlueprintInput) -> str:
+    """Spawn a rocket design directly, without going through the game's
+    editor UI at all. Reads a Blueprint.txt-format JSON file (either
+    blueprints/research/<name>/Blueprint.txt, or an explicit path),
+    deserializes it via the game's own JsonWrapper.FromJson<Blueprint>,
+    and calls the confirmed public-static RocketManager.SpawnBlueprint --
+    all through the mod's 'loadblueprint' command (v0.30.0+).
+
+    GENUINELY UNTESTED-LIVE as of first build (2026-08-29) --
+    SpawnBlueprint's own body was never read during the source-code
+    documentation effort, and there's a documented possible DLC/
+    ownership gate that could silently reject some parts. Treat early
+    calls as an experiment.
+
+    Distinct error codes so a caller can tell WHY it failed, not just
+    that it did: NOT_IN_DESIGN (wrong scene -- must be in the build/
+    design screen), FILE_NOT_FOUND, FILE_ERROR (couldn't read), 
+    TYPE_RESOLUTION_FAILED (a reflection lookup failed -- likely means
+    the game's internals changed), PARSE_ERROR (bad/unparseable JSON),
+    SPAWN_FAILED (SpawnBlueprint itself threw -- the file was fine, the
+    game rejected the design; check the error message for why).
+
+    Args:
+        params (LoadBlueprintInput): name, path, timeout_s
+
+    Returns:
+        str: JSON with keys: success (bool), path (the file used), and
+        either 'response' (raw OK text) or 'error_code'/'error'/
+        'failure_reason' (the raw reason= token from the mod, in case the
+        mapped error_code loses detail worth seeing).
+    """
+    try:
+        blueprint_path = _resolve_blueprint_path(params.name, params.path)
+    except (FileNotFoundError, ValueError) as e:
+        return _error_for_exception(e)
+
+    try:
+        response, elapsed = await asyncio.to_thread(
+            send_command, f"loadblueprint {blueprint_path}", params.timeout_s, DEFAULT_POLL_INTERVAL_S
+        )
+    except ProbeTimeoutError as e:
+        return _error_for_exception(e, elapsed_seconds=round(params.timeout_s, 3))
+    except FileNotFoundError as e:
+        return _error_for_exception(e)
+
+    if "loadblueprint: OK" in response:
+        return json.dumps({
+            "success": True, "path": str(blueprint_path),
+            "response": response, "elapsed_seconds": round(elapsed, 3),
+        }, indent=2)
+
+    reason_match = re.search(r"reason=(\S+)", response)
+    reason = reason_match.group(1) if reason_match else None
+    error_code = _BLUEPRINT_FAILURE_CODES.get(reason, "UNKNOWN_ERROR")
+    return json.dumps({
+        "success": False, "path": str(blueprint_path),
+        "error_code": error_code, "failure_reason": reason,
+        "error": response, "elapsed_seconds": round(elapsed, 3),
     }, indent=2)
 
 

@@ -9,6 +9,45 @@ fact from session notes rather than logged at the time.
 
 ---
 
+---
+
+## v0.30.0 — 2026-08-29
+
+- Added **`loadblueprint <path>`** — spawns a rocket design directly,
+  bypassing the editor UI entirely. Reads `Blueprint.txt`-format JSON
+  from an ARBITRARY file path (does NOT require the file to live inside
+  the game's own `Saving/Blueprints/` folder — reads it directly with
+  plain `File.ReadAllText`), deserializes via the game's own
+  `JsonWrapper.FromJson<Blueprint>` (generic, resolved via
+  `MakeGenericMethod`), then calls the confirmed public-static
+  `RocketManager.SpawnBlueprint(Blueprint)`. Schema and call chain
+  confirmed via IL reading during the SFS Documentation effort
+  (`docs/sfs_source_reference.md` §D5.1/D5.4/D5.5), cross-checked
+  against a real saved blueprint file found on disk
+  (`Saving/Blueprints/AllParts/Blueprint.txt`) — the six-field schema
+  matches exactly.
+
+  Path parsing gotcha handled: this project's own folder is literally
+  named "SFS AI" (contains a space), so the command splits into exactly
+  2 pieces (command word + everything else) rather than using the
+  shared single-word `arg` every other case relies on — same pattern
+  already used by the `telemetry` case for field specs.
+
+  Every failure path reports a **distinct `reason=` token** (`no_path`,
+  `not_in_design`, `file_not_found`, `read_error`, `type_resolution`,
+  `fromjson_method_not_found`, `deserialize_error`, `deserialize_null`,
+  `spawn_method_not_found`, `spawn_exception`) so a caller can tell
+  "wrong scene" from "bad file" from "the game itself rejected the
+  design" — not just one generic failure.
+
+  **GENUINELY UNTESTED-LIVE as of this build.** `SpawnBlueprint`'s own
+  body was never read during the documentation effort (marked
+  `[OPEN]`), and there's a documented possible DLC/ownership gate
+  (`OnPartNotOwned`/`OwnershipState`) that could silently reject some
+  parts. Built and installed clean, first try — but the actual spawn
+  call has not yet been exercised against a running game. Treat the
+  first real test as an experiment, not an assumed-working feature.
+
 ## v0.29.0 — 2026-08-28
 
 - Added **scoped telemetry** (real "probe" behavior, not a rebuild-every-

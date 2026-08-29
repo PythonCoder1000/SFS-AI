@@ -107,6 +107,19 @@ falls back to the full flight range -- worth double-checking
 - **`sfsprobe_checklist_status`** -- parses `docs/high_level_checklist.md`
   and reports confirmed vs open items per section.
 
+**Blueprint loading (Stage 12, genuinely untested-live):**
+- **`sfsprobe_load_blueprint`** -- spawns a rocket design directly,
+  bypassing the editor UI entirely. Resolves by `name` (looked up in
+  `blueprints/research/<name>/Blueprint.txt`) or an explicit `path`,
+  sends the mod's `loadblueprint` command (v0.30.0+), and maps its
+  distinct `reason=` failure tokens to proper `error_code` values:
+  `NOT_IN_DESIGN` (wrong scene), `FILE_NOT_FOUND`, `FILE_ERROR`,
+  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`. **Genuinely
+  untested-live** -- `RocketManager.SpawnBlueprint`'s own body was never
+  read during the documentation effort, and there's a documented
+  possible DLC/ownership gate that could silently reject some parts.
+  Treat early calls as an experiment, not an assumed-working feature.
+
 ## Known protocol gotcha (handled by `sfsprobe_send_batch`, worth knowing generally)
 
 `world` and `menu` are the only two commands that write NO line to

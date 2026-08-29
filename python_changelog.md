@@ -6,6 +6,33 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-29 — blueprints/ folder + sfsprobe_load_blueprint tool
+
+- **Created `blueprints/`** at the project root, split into `research/`
+  (usable now — hand-crafted/exploratory designs, including the first
+  test blueprint `single_capsule`) and `live/` (not used yet — reserved
+  for once the design agent is built and connected, kept separate so
+  it's always clear which designs came from a human/manual process vs.
+  the agent itself).
+- **`sfsprobe_load_blueprint`** added to `sfsprobe_mcp` (Stage 12) —
+  wraps the new mod command (`loadblueprint`, v0.30.0). Resolves a
+  blueprint by `name` (looked up in `blueprints/research/`) or an
+  explicit `path`, sends the command, and maps the mod's distinct
+  `reason=` failure tokens to proper `error_code` values
+  (`NOT_IN_DESIGN`, `FILE_NOT_FOUND`, `FILE_ERROR`,
+  `TYPE_RESOLUTION_FAILED`, `PARSE_ERROR`, `SPAWN_FAILED`) — exactly the
+  distinguishable-failure-reasons behavior asked for, not one generic
+  error.
+- Path-resolution logic (name lookup, missing-blueprint case,
+  missing-both-name-and-path case) smoke-tested directly — all correct.
+  **The actual spawn call itself has not been tested live yet** —
+  needs a game reload (to pick up mod v0.30.0) and a Claude Desktop
+  restart (to pick up the new MCP tool). Genuinely untested-live territory
+  per the mod changelog's own caveat — treat the first real call as an
+  experiment.
+
+---
+
 ## 2026-08-28 (later same day) — sfs_telemetry.py + 24 new sfsprobe_mcp tools
 
 - **Created `python/sfs_telemetry.py`** — pulls `analyze_dragarea.py`'s

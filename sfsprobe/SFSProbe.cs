@@ -29,7 +29,7 @@ namespace SFSProbe
         public override string DisplayName => "SFS Probe (remote)";
         public override string Author => "christian";
         public override string MinimumGameVersionNecessary => "1.6.00.00";
-        public override string ModVersion => "0.29.0";
+        public override string ModVersion => "0.30.0";
         public override string Description => "Remote-controlled data probe. Poll command.txt.";
 
         public static string OutDir;
@@ -45,7 +45,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v0.29.0 loaded (scoped telemetry: 'telemetry on field1,field2,computed:name' records only requested fields, no rebuild needed to add a plain reflection path -- see ResolvePath/AppendComputedField; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v0.30.0 loaded (loadblueprint command: reads a Blueprint.txt from any file path, spawns via RocketManager.SpawnBlueprint through reflection -- UNTESTED-LIVE, first real test still pending; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -753,6 +753,113 @@ namespace SFSProbe
                     dsb.Append("}");
                     Write("sfs_probe_dragarea.json", dsb, "dragarea dump");
                     ProbeMod.Result("dragarea: all=" + allCount + " exposed=" + exposedCount + " -> sfs_probe_dragarea.json");
+                    break;
+                }
+
+                case "loadblueprint":
+                {
+                    // Loads a rocket design bypassing the editor UI entirely.
+                    // Reads Blueprint.txt-format JSON from an ARBITRARY file path
+                    // (does NOT require the file to live inside the game's own
+                    // Saving/Blueprints/ folder -- reads it directly with plain
+                    // File I/O), deserializes via the game's own
+                    // JsonWrapper.FromJson<Blueprint> (generic, needs
+                    // MakeGenericMethod), then calls the confirmed public-static
+                    // RocketManager.SpawnBlueprint. Confirmed via IL reading
+                    // (docs/sfs_source_reference.md D5.1/D5.4/D5.5), matches the
+                    // real on-disk format found in an actual saved blueprint.
+                    //
+                    // GENUINELY UNTESTED-LIVE as of first write (2026-08-29) --
+                    // SpawnBlueprint's own body was never read (unknown side
+                    // effects), and OnPartNotOwned/OwnershipState in the docs
+                    // suggest a possible DLC/ownership gate that could silently
+                    // reject some parts. Treat the first real calls as an
+                    // experiment, not an assumed-working feature.
+                    //
+                    // Path can contain spaces (this project's own folder is
+                    // literally named "SFS AI") -- split into exactly 2 pieces,
+                    // same pattern as the "telemetry" case above, NOT the
+                    // single-word `arg` every other case uses.
+                    string[] parts2 = line.Split(new char[] { ' ' }, 2);
+                    string path = parts2.Length > 1 ? parts2[1].Trim() : null;
+
+                    if (string.IsNullOrEmpty(path))
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=no_path");
+                        break;
+                    }
+
+                    string scene = SceneManager.GetActiveScene().name;
+                    if (scene != "Build_PC")
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=not_in_design scene=" + scene);
+                        break;
+                    }
+
+                    if (!File.Exists(path))
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=file_not_found path=" + path);
+                        break;
+                    }
+
+                    string json;
+                    try { json = File.ReadAllText(path); }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=read_error " + e.Message);
+                        break;
+                    }
+
+                    Type blueprintType = FindType("SFS.Builds.Blueprint");
+                    Type jsonWrapperType = FindType("SFS.Parsers.Json.JsonWrapper");
+                    Type rocketManagerType = FindType("SFS.World.RocketManager");
+                    if (blueprintType == null || jsonWrapperType == null || rocketManagerType == null)
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=type_resolution blueprint=" + (blueprintType != null) +
+                                         " jsonWrapper=" + (jsonWrapperType != null) + " rocketManager=" + (rocketManagerType != null));
+                        break;
+                    }
+
+                    MethodInfo fromJsonGeneric = jsonWrapperType.GetMethod("FromJson",
+                        BindingFlags.Public | BindingFlags.Static);
+                    if (fromJsonGeneric == null)
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=fromjson_method_not_found");
+                        break;
+                    }
+                    MethodInfo fromJson = fromJsonGeneric.MakeGenericMethod(blueprintType);
+
+                    object blueprint;
+                    try { blueprint = fromJson.Invoke(null, new object[] { json }); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("loadblueprint: FAILED reason=deserialize_error " + msg);
+                        break;
+                    }
+                    if (blueprint == null)
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=deserialize_null");
+                        break;
+                    }
+
+                    MethodInfo spawnMethod = rocketManagerType.GetMethod("SpawnBlueprint",
+                        BindingFlags.Public | BindingFlags.Static, null, new Type[] { blueprintType }, null);
+                    if (spawnMethod == null)
+                    {
+                        ProbeMod.Result("loadblueprint: FAILED reason=spawn_method_not_found");
+                        break;
+                    }
+
+                    try { spawnMethod.Invoke(null, new object[] { blueprint }); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("loadblueprint: FAILED reason=spawn_exception " + msg);
+                        break;
+                    }
+
+                    ProbeMod.Result("loadblueprint: OK path=" + path);
                     break;
                 }
 
