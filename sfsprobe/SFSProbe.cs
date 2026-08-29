@@ -25,11 +25,18 @@ namespace SFSProbe
     // empirical fit from telemetry remains the only route to that number.
     public class ProbeMod : ModLoader.Mod
     {
+        // Single source of truth for the mod's own version -- was previously
+        // duplicated as a literal string in both ModVersion and the load-time
+        // Log() message, a real (if harmless) inconsistency risk. Now also
+        // exposed live via the 'ping' command so sfsprobe_status can report
+        // it without a separate round trip.
+        public const string VersionString = "0.31.0";
+
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
         public override string Author => "christian";
         public override string MinimumGameVersionNecessary => "1.6.00.00";
-        public override string ModVersion => "0.30.0";
+        public override string ModVersion => VersionString;
         public override string Description => "Remote-controlled data probe. Poll command.txt.";
 
         public static string OutDir;
@@ -45,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v0.30.0 loaded (loadblueprint command: reads a Blueprint.txt from any file path, spawns via RocketManager.SpawnBlueprint through reflection -- UNTESTED-LIVE, first real test still pending; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (ping now reports gameVersion + modVersion, so sfsprobe_ping/sfsprobe_status can show them without a separate command; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -361,7 +368,9 @@ namespace SFSProbe
                 case "ping":
                     ProbeMod.Result("pong  scene=" + SceneManager.GetActiveScene().name +
                                     "  rockets=" + RocketCount() +
-                                    "  fixedDelta=" + Time.fixedDeltaTime.ToString("R"));
+                                    "  fixedDelta=" + Time.fixedDeltaTime.ToString("R") +
+                                    "  gameVersion=" + Application.version +
+                                    "  modVersion=" + ProbeMod.VersionString);
                     break;
 
                 case "snapshot": DumpFlight("cmd"); break;

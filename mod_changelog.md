@@ -11,6 +11,25 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.31.0 — 2026-08-29
+
+- **`ping` now reports `gameVersion` and `modVersion`** alongside
+  `scene`/`rockets`/`fixedDelta` — e.g.
+  `pong scene=Build_PC rockets=-1 fixedDelta=0.02 gameVersion=1.6.00.16
+  modVersion=0.31.0`. Small addition, but closes a real gap: there was
+  previously no way to check either version without eyeballing
+  `probe.log`'s load-time message by hand.
+- **De-duplicated the version string.** `ModVersion` and the load-time
+  `Log()` message each hardcoded the version separately before — a
+  real (if harmless) inconsistency risk. Now both read from one
+  `ProbeMod.VersionString` const, the single source of truth, also used
+  directly by the new `ping` response.
+- On the `sfsprobe_mcp` side: `sfsprobe_ping` now returns `game_version`/
+  `mod_version` fields, and `sfsprobe_status` pulls `mod_version` out of
+  its own internal ping call and surfaces it too — matching the actual
+  ask ("ping shows game version, status shows mod version") without a
+  second round trip either tool didn't already need.
+
 ## v0.30.0 — 2026-08-29
 
 - Added **`loadblueprint <path>`** — spawns a rocket design directly,

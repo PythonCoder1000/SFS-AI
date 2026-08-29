@@ -485,16 +485,19 @@ class PingInput(BaseModel):
 async def sfsprobe_ping(params: PingInput) -> str:
     """Check whether the mod is alive and get the current scene/rocket count.
 
-    Parses the mod's 'pong  scene=X  rockets=N  fixedDelta=Y' response into
-    structured fields rather than leaving the caller to parse text.
+    Parses the mod's 'pong  scene=X  rockets=N  fixedDelta=Y  gameVersion=Z
+    modVersion=W' response into structured fields rather than leaving the
+    caller to parse text.
 
     Args:
         params (PingInput): timeout_s
 
     Returns:
         str: JSON with keys: scene (str), rockets (int, -1 if unavailable),
-        fixed_delta (float), elapsed_seconds (float), raw (the unparsed
-        response text, in case parsing missed something).
+        fixed_delta (float), game_version (str, the SFS build, e.g.
+        '1.6.00.16'), mod_version (str, sfsprobe's own version, e.g.
+        '0.31.0'), elapsed_seconds (float), raw (the unparsed response
+        text, in case parsing missed something).
     """
     try:
         response, elapsed = await asyncio.to_thread(
@@ -505,7 +508,7 @@ async def sfsprobe_ping(params: PingInput) -> str:
     except FileNotFoundError as e:
         return _error_for_exception(e)
 
-    scene = rockets = fixed_delta = None
+    scene = rockets = fixed_delta = game_version = mod_version = None
     for token in response.split():
         if token.startswith("scene="):
             scene = token.split("=", 1)[1]
@@ -519,11 +522,17 @@ async def sfsprobe_ping(params: PingInput) -> str:
                 fixed_delta = float(token.split("=", 1)[1])
             except ValueError:
                 pass
+        elif token.startswith("gameVersion="):
+            game_version = token.split("=", 1)[1]
+        elif token.startswith("modVersion="):
+            mod_version = token.split("=", 1)[1]
 
     return json.dumps({
         "scene": scene,
         "rockets": rockets,
         "fixed_delta": fixed_delta,
+        "game_version": game_version,
+        "mod_version": mod_version,
         "elapsed_seconds": round(elapsed, 3),
         "raw": response,
     }, indent=2)
@@ -751,8 +760,9 @@ async def sfsprobe_status(params: StatusInput) -> str:
         str: JSON with keys: mod_dir_exists (bool), mod_dir (str),
         probe_log_age_seconds (float or null), probe_log_likely_stale
         (bool), ping_succeeded (bool), scene/rockets (from the ping, if it
-        succeeded), elapsed_seconds, verdict (one-line human-readable
-        summary of the most likely explanation).
+        succeeded), mod_version (str, sfsprobe's own version, e.g.
+        '0.31.0' -- null if ping didn't succeed), elapsed_seconds, verdict
+        (one-line human-readable summary of the most likely explanation).
     """
     start = time.monotonic()
     mod_dir_exists = MOD_DIR.is_dir()
@@ -764,7 +774,7 @@ async def sfsprobe_status(params: StatusInput) -> str:
         log_stale = log_age > STALE_LOG_THRESHOLD_S
 
     ping_ok = False
-    scene = rockets = None
+    scene = rockets = mod_version = None
     if mod_dir_exists:
         try:
             response, _ = await asyncio.to_thread(
@@ -779,13 +789,15 @@ async def sfsprobe_status(params: StatusInput) -> str:
                         rockets = int(token.split("=", 1)[1])
                     except ValueError:
                         pass
+                elif token.startswith("modVersion="):
+                    mod_version = token.split("=", 1)[1]
         except (ProbeTimeoutError, FileNotFoundError):
             ping_ok = False
 
     if not mod_dir_exists:
         verdict = "Mod folder doesn't exist -- SFS may not be installed at the expected path, or SFSPROBE_MOD_DIR is wrong."
     elif ping_ok:
-        verdict = f"Alive and responding. scene={scene}, rockets={rockets}."
+        verdict = f"Alive and responding. scene={scene}, rockets={rockets}, mod_version={mod_version}."
     elif not log_stale:
         verdict = "probe.log was written recently but ping didn't respond -- game may be mid-load, or a real bug. Try again shortly."
     else:
@@ -799,6 +811,7 @@ async def sfsprobe_status(params: StatusInput) -> str:
         "ping_succeeded": ping_ok,
         "scene": scene,
         "rockets": rockets,
+        "mod_version": mod_version,
         "elapsed_seconds": round(time.monotonic() - start, 3),
         "verdict": verdict,
     }, indent=2)
