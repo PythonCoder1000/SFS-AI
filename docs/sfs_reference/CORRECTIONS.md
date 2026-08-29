@@ -49,3 +49,9 @@ claim, from the code side where the earlier work was empirical:
 §B5.3). Neither needed changing.
 
 ---
+
+## Corrections made during Phase 1 Step 2
+
+| Earlier claim | Correction | Where |
+|---|---|---|
+| "~26 vendored third-party types are excluded" (`INVENTORY.md` "Out-of-scope candidates", `sfs_reference_plan.md`, `manifest.json` `excluded_types: 26`) | **33.** The 26 counted only *top-level* vendored types. The SDWebImage port also contributes **7 nested** types (`SDAnimatedImage/State`, `/LoadingIndicatorType`, `/OnImageSizeReadyAction`, `/OnDecodingErrorAction`, `/OnLoadingErrorAction`, `SDWebImage/LoadingIndicatorType`, `/OnImageSizeReadyAction`, `/OnLoadingErrorAction`, `SDWebImageDownloaderError/ErrorType`), which the inventory counts as real types. In-scope total is therefore **936, not 943**, and the Step 2 remainder is **842, not 849**. Corrected in `manifest.json`; `INDEX.md` regenerated. | Step 2 start |

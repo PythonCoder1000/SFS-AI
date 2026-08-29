@@ -17,15 +17,15 @@ editing it.
 | | Count |
 |---|---:|
 | Real types in the assembly | 969 |
-| Excluded (vendored third-party) | 26 |
-| **In scope** | **943** |
-| Documented | 94 |
-| — at FULL depth | 93 |
-| — at LIGHT depth | 1 |
-| **Remaining** | **849** |
-| Coverage | 10.0% |
+| Excluded (vendored third-party) | 33 |
+| **In scope** | **936** |
+| Documented | 113 |
+| — at FULL depth | 107 |
+| — at LIGHT depth | 6 |
+| **Remaining** | **823** |
+| Coverage | 12.1% |
 
-**Phase:** Phase 1, Step 1 complete — migration done, Step 2 (net-new coverage) not started
+**Phase:** Phase 1, Step 2 in progress — net-new coverage
 
 ## Standalone files
 
@@ -123,8 +123,27 @@ Planets, SOI, atmosphere, terrain, interplanetary
 
 | Type | Namespace | Kind | File | Summary | Status | Depth |
 |---|---|---|---|---|---|---|
+| `Atmosphere_Physics` | `SFS.World.PlanetModules` | class | [Atmosphere_Physics.md](06-soi-terrain/Atmosphere_Physics.md) | The nine atmosphere physics constants; height and curve are difficulty-mutated in place, and parachuteMultiplier is shared with balloons | CONFIRMED | FULL |
 | `Difficulty` | `SFS.WorldBase` | class | [Difficulty.md](06-soi-terrain/Difficulty.md) | The eleven difficulty constant tables, decoded from .data blobs; scales planets, ISP, mass and heating | CONFIRMED | FULL |
 | `Planet` | `SFS.WorldBase` | class | [Planet.md](06-soi-terrain/Planet.md) | Body constants and queries: mass is mu not kg, per-angle terrain is real, and an SOI crossing forces the craft onto rails | CONFIRMED | FULL |
+| `FlatZone` | `SFS.World.PlanetModules` | class | [TerrainModule.md](06-soi-terrain/TerrainModule.md) | Flattened launch/landing region - four fields whose semantics are decided inside TerrainSampler | PARTIAL | FULL |
+| `HeightMap` | `SFS.World.PlanetModules` | class | [TerrainModule.md](06-soi-terrain/TerrainModule.md) | 1-D float lookup with linear interpolation; Evaluate WRAPS rather than clamps and EvaluateDoubleOut is not actually double-precision | CONFIRMED | FULL |
+| `RockData` | `SFS.World.PlanetModules` | class | [TerrainModule.md](06-soi-terrain/TerrainModule.md) | Cosmetic surface-scatter settings, consumed only by DynamicChunk.GenerateRocks | CONFIRMED | LIGHT |
+| `TerrainModule` | `SFS.World.PlanetModules` | class | [TerrainModule.md](06-soi-terrain/TerrainModule.md) | The terrain geometry source for both the visual and collider paths; LOD ratios are 2.55 (mesh) and 2.05 (load distance), and formulas are difficulty-dependent | CONFIRMED | FULL |
+| `TerrainTexture` | `SFS.World.PlanetModules` | class | [TerrainModule.md](06-soi-terrain/TerrainModule.md) | Rendering-only texture settings; field layout confirmed, no simulation relevance | CONFIRMED | LIGHT |
+| `BasicModule` | `SFS.World.PlanetModules` | class | [planet-data-modules.md](06-soi-terrain/planet-data-modules.md) | Radius and gravity - the most-read data block; velocityArrowsHeight defaults to NaN and gravity reaches wheel friction and EVA, not just orbits | CONFIRMED | FULL |
+| `FrontCloudsModule` | `SFS.World.PlanetModules` | class | [planet-data-modules.md](06-soi-terrain/planet-data-modules.md) | Purely visual front cloud layer; positionZ defaults to -5000 and is difficulty-scaled along with height | CONFIRMED | LIGHT |
+| `OrbitModule` | `SFS.World.PlanetModules` | class | [planet-data-modules.md](06-soi-terrain/planet-data-modules.md) | The planet own orbit and SOI multiplier; parent is a code-name string and everything but parent/sma is read once in SetupInteractions | CONFIRMED | FULL |
+| `RingsModule` | `SFS.World.PlanetModules` | class | [planet-data-modules.md](06-soi-terrain/planet-data-modules.md) | Purely visual rings - no collider, no drag, no gravity; all three geometry fields are difficulty-scaled in place | CONFIRMED | LIGHT |
+| `WaterMask` | `SFS.World.PlanetModules` | class | [planet-data-modules.md](06-soi-terrain/planet-data-modules.md) | Three floats (must/cannot/global) read only by CreateWaterMaterial; blend semantics live in a shader outside the assembly | CONFIRMED | LIGHT |
+| `WaterModule` | `SFS.World.PlanetModules` | class | [planet-data-modules.md](06-soi-terrain/planet-data-modules.md) | 22 fields of which only lowerTerrain, oceanDepth and wavesSize affect simulation; wavesSize crosses into buoyancy | CONFIRMED | FULL |
+| `Chunk` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | The visual mesh pair; terrainTransform doubles as the liveness flag. Mesh-building ctor not read in full | PARTIAL | FULL |
+| `Chunk` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | One PolygonCollider2D chunk; exists even when terrain.collider is false, in which case it has no collider at all | CONFIRMED | FULL |
+| `DynamicChunk` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | One LOD node; its constructor registers and enables itself, and otherHalf is deliberately asymmetric | CONFIRMED | FULL |
+| `DynamicTerrain` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | The visual LOD tree - cosmetic only, shares no geometry with the collider system; distanceMoved is a path-length odometer | CONFIRMED | FULL |
+| `TerrainColliderManager` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | Singleton owning every terrain collider, reference-counted by owning module and keyed by a bare int chunk index | CONFIRMED | FULL |
+| `TerrainColliderModule` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | Per-craft collider requester; driven by the position observable, not Update, and the chunk index has no planet identity | CONFIRMED | FULL |
+| `TerrainPoints` | `SFS.World.Terrain` | class | [terrain-chunks.md](06-soi-terrain/terrain-chunks.md) | Two-array carrier returned by TerrainModule.GetTerrainPoints - the one type both the visual and collider paths share | CONFIRMED | FULL |
 
 ### `07-saveload/`
 
