@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.35.0";
+        public const string VersionString = "0.35.1";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (dumpblueprint: reads the CURRENT editor design via BuildState.GetBlueprint(bool); getparts: full parts-catalog index with REAL parametric variable names/values, command-gated so a normal reload stays fast, NOT part of the automatic on-load menu dump; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (dumpblueprint: reads the CURRENT editor design via BuildState.GetBlueprint(bool); getparts: full parts-catalog index with REAL parametric variable names/values PLUS partVariants (a separate catalog missed in the first getparts pass -- found via a real user headcount mismatch), command-gated so a normal reload stays fast; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1116,6 +1116,17 @@ namespace SFSProbe
                     // configurable variables (height/radius/etc, whatever they're
                     // actually called), not a guess.
                     //
+                    // ALSO dumps PartsLoader.partVariants (v0.35.1) -- a SEPARATE
+                    // Dictionary<string,VariantRef>, confirmed via IL, that
+                    // "getparts"'s first version never read at all. Found because
+                    // a live in-game count (57+, manually counted, not even
+                    // through all tabs) didn't match the 56 total from 'parts'
+                    // alone -- the build menu almost certainly shows variants as
+                    // their own selectable tiles too. VariantRef's exact field
+                    // schema wasn't independently confirmed via IL before this was
+                    // written, so its fields are read generically (whatever
+                    // they're actually called), same as VariableSave above.
+                    //
                     // DELIBERATELY NOT part of the automatic on-load 'menu' dump
                     // (DumpMenu, unchanged, still runs on every scene load) --
                     // this is heavier and command-gated on purpose, so a normal
@@ -1151,10 +1162,29 @@ namespace SFSProbe
                         items.Add(vsb.ToString());
                     }
 
+                    object variantsObj = Get(FindComponent("SFS.Parts.PartsLoader"), "partVariants");
+                    var venum = variantsObj as System.Collections.IEnumerable;
+                    var variantItems = new List<string>();
+                    int variantTotal = 0;
+                    if (venum != null)
+                    {
+                        foreach (object kv in venum)
+                        {
+                            object variant = Get(kv, "Value");
+                            if (variant == null) continue;
+                            variantTotal++;
+                            string vkey = "?";
+                            try { vkey = (string)Get(kv, "Key"); } catch { }
+                            variantItems.Add("{\"key\":" + Q(vkey) + ",\"data\":" + DumpObjectFieldsGeneric(variant) + "}");
+                        }
+                    }
+
                     var outSb = new StringBuilder();
-                    outSb.Append("{\"parts\":[").Append(string.Join(",", items.ToArray())).Append("],\"total\":").Append(total).Append("}");
-                    Write("sfs_probe_parts_index.json", outSb, "getparts total=" + total);
-                    ProbeMod.Result("getparts: " + total + " parts -> sfs_probe_parts_index.json");
+                    outSb.Append("{\"parts\":[").Append(string.Join(",", items.ToArray())).Append("],\"partsTotal\":").Append(total);
+                    outSb.Append(",\"variants\":[").Append(string.Join(",", variantItems.ToArray())).Append("],\"variantsTotal\":").Append(variantTotal);
+                    outSb.Append("}");
+                    Write("sfs_probe_parts_index.json", outSb, "getparts parts=" + total + " variants=" + variantTotal);
+                    ProbeMod.Result("getparts: " + total + " parts, " + variantTotal + " variants -> sfs_probe_parts_index.json");
                     break;
                 }
 
@@ -1703,7 +1733,7 @@ namespace SFSProbe
                             foreach (object save in senum)
                             {
                                 if (save == null) continue;
-                                entries.Add(DumpVariableSaveGeneric(save));
+                                entries.Add(DumpObjectFieldsGeneric(save));
                             }
                         }
                         groupJson = entries.Count > 0
@@ -1718,12 +1748,12 @@ namespace SFSProbe
             catch (Exception e) { return "\"error:" + e.Message.Replace("\"", "'") + "\""; }
         }
 
-        // Generic, name-agnostic field dump for one VariableSave-like object --
-        // every public field, whatever it's actually called. Used instead of
-        // the standard Dump() here specifically because these objects sit deep
-        // enough (part -> variablesModule -> doubleVariables -> saves[] ->
-        // VariableSave -> fields) that Dump()'s depth-3 cutoff would hide them.
-        static string DumpVariableSaveGeneric(object o)
+        // Generic, name-agnostic public-field dump for ANY object -- used
+        // wherever the exact schema wasn't independently confirmed via IL
+        // before this was written (VariableSave for parametric variables,
+        // VariantRef for part variants), so field names are read whatever
+        // they actually are rather than guessed and silently missed.
+        static string DumpObjectFieldsGeneric(object o)
         {
             try
             {

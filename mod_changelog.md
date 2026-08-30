@@ -9,6 +9,29 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.35.1 — 2026-08-29 (later same day)
+
+- **Fixed `getparts` missing `PartsLoader.partVariants` entirely.**
+  Christian manually counted 57+ parts in the build menu without even
+  reaching halfway through the tabs — directly contradicting v0.35.0's
+  reported total of 56. My first explanation (DLC/expansion ownership
+  limiting the catalog) was wrong and got corrected by the headcount,
+  not confirmed by it — real IL reading found the actual cause:
+  `PartsLoader` has a SECOND, separate `Dictionary<string, VariantRef>`
+  field (`partVariants`, confirmed via IL, distinct from the `parts`
+  dictionary `getparts` already read), and the build menu very likely
+  shows variants as their own selectable tiles alongside base parts.
+  `getparts` now reads both and reports `partsTotal`/`variantsTotal`
+  separately. `VariantRef`'s exact field schema wasn't independently
+  confirmed via IL before this was written, so its fields are read
+  generically (whatever they're actually called) via the same pattern
+  already used for `VariableSave` — that shared helper is renamed
+  `DumpObjectFieldsGeneric` since it's no longer variable-specific.
+
+  Built and installed clean. Not yet live-tested — next reload settles
+  whether `partsTotal + variantsTotal` actually accounts for the real
+  in-game count.
+
 ## v0.35.0 — 2026-08-29 (later same day)
 
 - **Added `dumpblueprint`** — reads the CURRENT editor design as a real
