@@ -9,6 +9,44 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.37.0 — 2026-08-30 (later same day)
+
+**Root-caused a bug that had been open since before v0.34** — the
+`AmbiguousMatchException` on `EngineModule` reads, previously seen only
+once (deep in a 73k-sample flight, deferred by explicit instruction) but
+today trivially reproduced on EVERY engine, first tick, right on the pad,
+while prepping a multi-engine validation flight.
+
+- **Root cause found:** `Float_Reference : Double_Reference` redeclares
+  its own `float Value` property, which **hides** (via `new`, not
+  `override`) the inherited `double Value` from `ReferenceVariable<double>`
+  further up the hierarchy — confirmed by cross-referencing
+  `docs/sfs_reference/00-infrastructure/variables-wrapper-family.md`
+  against the engine appendix's existing note. `GetWrapped2`'s old plain
+  `t.GetProperty("Value", flags)` walks the WHOLE type hierarchy and
+  throws the instant it finds two same-named, differently-typed
+  properties that aren't a normal override pair. `EngineModule
+  .throttle_Out` is a `Float_Reference`, so this fired on every single
+  engine read, silently aborting the whole per-engine try block (which
+  is why `thrustDirX`/`thrustDirY`/`gimbalOn`/`throttleOut` never
+  populated — candidate 3 from the old three-way open question, now
+  settled).
+- **Fixed in both `GetWrapped2` and `SetWrapped`** (the write side had
+  the identical latent bug, hadn't been hit yet, fixed preemptively): now
+  walk from the most-derived runtime type upward, taking the first
+  **`DeclaredOnly`** `Value` property found at each level. A single type
+  can't declare the same property twice, so this can never be ambiguous
+  — and the most-derived declaration is exactly what a real `.Value`
+  call site binds to anyway, so this is a correct fix, not a workaround.
+- **This is a foundational helper** used by nearly every command in the
+  probe (throttle, torque, mass, RCS, engines, ...), so this fix's real
+  reach is broader than just the engine array — anywhere a
+  `Float_Reference` was silently failing before now works.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load, same as the last two versions.
+
+---
+
 ## v0.36.1 — 2026-08-30 (later same day)
 
 - **New `atmophysics` command.** Reads `planet.data.atmospherePhysics`

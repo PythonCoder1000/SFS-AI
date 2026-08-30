@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.36.1";
+        public const string VersionString = "0.37.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (new atmophysics command: reads planet.data.atmospherePhysics.minHeatingVelocityMultiplier/shockwaveIntensity live, the last piece needed for the reentry-temperature formula; aeroformula command + GetHeatState fix from v0.36.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (ROOT-CAUSED the long-standing EngineModule AmbiguousMatchException: GetWrapped2/SetWrapped now walk the type hierarchy taking the first DECLARED-ONLY Value property, instead of a plain GetProperty that throws when a subclass like Float_Reference hides a base class's same-named Value property via `new`; atmophysics/aeroformula commands from v0.36.x; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1915,10 +1915,46 @@ namespace SFSProbe
         static object GetWrapped2(object w)
         {
             if (w == null) return null;
-            Type t = w.GetType();
-            var p = t.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (p != null) { try { return p.GetValue(w, null); } catch { } }
-            var f = t.GetField("value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            // FIXED (2026-08-30): root-caused the long-standing
+            // AmbiguousMatchException on EngineModule reads (previously seen
+            // once, deep in a 73k-sample flight; now trivially reproducible on
+            // ANY engine, first tick, right on the pad). Root cause: some
+            // wrapper types HIDE (via `new`, not `override`) a base class's
+            // same-named "Value" property with a DIFFERENT return type --
+            // confirmed for Float_Reference : Double_Reference, which
+            // redeclares its own float Value hiding ReferenceVariable<double>
+            // .Value (see docs/sfs_reference/00-infrastructure/
+            // variables-wrapper-family.md). The old plain
+            // t.GetProperty("Value", flags) walks the WHOLE type hierarchy and
+            // throws AmbiguousMatchException the instant it finds two
+            // same-named properties that aren't a normal override pair --
+            // throttle_Out is a Float_Reference, so this fired on every
+            // single engine read, every tick, silently aborting the entire
+            // per-engine block (the whole thing lives in one try/catch).
+            //
+            // Fixed by walking from the most-derived runtime type UPWARD,
+            // taking the first DECLARED-ONLY "Value" property found at each
+            // level. DeclaredOnly can never be ambiguous (a single type can't
+            // declare the same property signature twice), and the
+            // most-derived declaration is exactly what a real `.Value` call
+            // site binds to anyway -- this isn't a workaround, it's the
+            // correct resolution.
+            for (Type cur = w.GetType(); cur != null; cur = cur.BaseType)
+            {
+                var pDeclared = cur.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic |
+                                                 BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                if (pDeclared != null)
+                {
+                    try { return pDeclared.GetValue(w, null); }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Log("[GetWrapped2] declared Value getter threw on " +
+                                     cur.FullName + ": " + e.Message);
+                        return null;
+                    }
+                }
+            }
+            var f = w.GetType().GetField("value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (f != null) { try { return f.GetValue(w); } catch { } }
             return w;
         }
@@ -2267,13 +2303,28 @@ namespace SFSProbe
         {
             object w = Get(owner, member);
             if (w == null) return false;
-            Type t = w.GetType();
-            var p = t.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (p != null && p.CanWrite)
+            // Same DeclaredOnly-walk fix as GetWrapped2 above, applied to the
+            // write side for consistency -- hasn't been observed to throw yet
+            // (no current command writes to a Float_Reference-typed field),
+            // but it's the identical latent AmbiguousMatchException risk, so
+            // fixed preemptively rather than waiting for a second silent
+            // failure to surface it.
+            for (Type cur = w.GetType(); cur != null; cur = cur.BaseType)
             {
-                try { p.SetValue(w, Convert.ChangeType(val, p.PropertyType), null); return true; } catch { }
+                var pDeclared = cur.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic |
+                                                 BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                if (pDeclared != null && pDeclared.CanWrite)
+                {
+                    try { pDeclared.SetValue(w, Convert.ChangeType(val, pDeclared.PropertyType), null); return true; }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Log("[SetWrapped] declared Value setter threw on " +
+                                     cur.FullName + ": " + e.Message);
+                        return false;
+                    }
+                }
             }
-            var f = t.GetField("value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var f = w.GetType().GetField("value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (f != null)
             {
                 try { f.SetValue(w, Convert.ChangeType(val, f.FieldType)); return true; } catch { }

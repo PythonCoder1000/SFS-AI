@@ -143,8 +143,23 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       hierarchy). The OLD pre-v0.34 code's bare `catch { }` was almost
       certainly swallowing this exact exception the whole time — this
       is the fix working exactly as designed, surfacing a bug that was
-      always there rather than hiding it. **Not yet root-caused or
-      fixed, deferred by explicit instruction.**
+      always there rather than hiding it.
+- [x] **ROOT-CAUSED AND FIXED 2026-08-30 (v0.37.0).** `Float_Reference
+      : Double_Reference` hides its base's `Value` property via `new`
+      (redeclares its own `float Value`, different return type, same
+      name as the inherited `double Value`); `GetWrapped2`'s old plain
+      whole-hierarchy `GetProperty("Value")` lookup throws the instant
+      it sees two same-named properties that aren't a normal override
+      pair. `EngineModule.throttle_Out` is a `Float_Reference`, so this
+      fired on every engine read, aborting the whole per-engine block —
+      this was candidate 3 of the old three-way open question for why
+      `thrustDirX`/etc. never populated, now settled as the real cause.
+      Fixed by walking the type hierarchy taking the first
+      `DeclaredOnly` `Value` property at each level (can never be
+      ambiguous). Same fix applied to `SetWrapped` preemptively. This is
+      a foundational helper used by nearly every command in the probe,
+      so the real reach is broader than just engines. **Not yet
+      re-tested live** — needs a fresh game load.
 
 ## Tooling bugs — confirmed broken, unfixed
 
