@@ -69,9 +69,40 @@ thing:**
   launch's cost/sequence/achievement tracking -- functionally cheating.
   Reserve for one-off future research only.
 
-**Still open for both:** only a single-part blueprint has been tested.
-Multi-part designs (joint generation via `GenerateJoints`, whether parts
-actually connect into something flyable) and the documented possible
-DLC/ownership gate (`OnPartNotOwned`/`OwnershipState` — `Capsule` is
-presumably a free/base part, so this doesn't rule it out for locked
-parts) remain unverified.
+**Still open for both:** Multi-part designs (joint generation via
+`GenerateJoints`, whether parts actually connect into something flyable)
+and the documented possible DLC/ownership gate
+(`OnPartNotOwned`/`OwnershipState` — `Capsule` is presumably a
+free/base part, so this doesn't rule it out for locked parts) remain
+unverified.
+
+## Real multi-part attempt: `default_rocket` (2026-08-29) -- a real, informative failure
+
+First 4-part blueprint attempt (`Engine Hawk`/`Fuel Tank`/`Capsule`/
+`Parachute`, stacked vertically). Real part names were confirmed live
+(queried via the `menu` command's catalog dump -- all 4 matched real
+`PartsLoader.parts` entries). Positions were NOT confirmed real geometry
+-- estimated from each part's `centerOfMass` field, since actual
+bounding-box geometry (`surfaceGeometry`) only populates once
+`Part.InitializePart()` runs, and that's only safe on already-placed
+instances, not bare catalog prefabs (documented hang risk elsewhere in
+this project).
+
+**Result: spawned, but wrong.** `Engine Hawk` and `Capsule` (fixed-size
+parts) looked correct. `Fuel Tank` spawned abnormally tiny -- almost
+certainly because the blueprint never supplied `NUMBER_VARIABLES`
+(parametric height/radius etc.), so the part defaulted to something
+near-zero rather than a reasonable size. `Parachute` ended up visually
+inside the `Capsule`, consistent with the `centerOfMass`-based spacing
+being wrong for at least one of those two parts' real extents.
+
+**Response: built real tooling instead of guessing harder.** Two new
+mod commands (v0.35.0, see `mod_changelog.md`): `getparts` (a full
+parts-catalog index -- names, mass, centerOfMass, and REAL parametric
+variable names/values, fixing a real data-loss bug where the generic
+dumper only showed variable TYPE names, not their actual contents) and
+`dumpblueprint` (reads the current editor's actual as-placed state back
+out as real data). Neither has been live-tested yet -- next step is
+running both against this exact broken `default_rocket` to see the real
+variable schema and the real as-placed positions, then fixing this
+blueprint file with grounded data instead of another guess.

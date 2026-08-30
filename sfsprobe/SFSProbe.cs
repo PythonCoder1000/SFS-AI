@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.34.0";
+        public const string VersionString = "0.35.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (per-engine telemetry array: replaces the old first-active-engine-only getter, which was structurally wrong for multi-engine rockets since there's no thrust summation; adds BoosterModule support and real exception logging instead of a bare swallow-catch; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (dumpblueprint: reads the CURRENT editor design via BuildState.GetBlueprint(bool); getparts: full parts-catalog index with REAL parametric variable names/values, command-gated so a normal reload stays fast, NOT part of the automatic on-load menu dump; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1026,6 +1026,138 @@ namespace SFSProbe
                     break;
                 }
 
+                case "dumpblueprint":
+                {
+                    // Reads the CURRENT editor design as a real Blueprint object
+                    // via BuildState.main.GetBlueprint(bool) -- the game's own
+                    // "get current design as data" method, confirmed via IL (real
+                    // call sites @91631/94065/94082, same file the LoadBlueprint
+                    // body was read from). Serializes via the same
+                    // JsonWrapper.ToJson used elsewhere. This is how a real,
+                    // verified parts-properties table gets built instead of
+                    // guessed: place a part in the editor, dump the resulting
+                    // blueprint, read its REAL NUMBER_VARIABLES/position -- not
+                    // what was asked for, but what the game actually produced.
+                    Type buildStateType = FindType("SFS.Builds.BuildState");
+                    if (buildStateType == null)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=type_resolution");
+                        break;
+                    }
+                    object buildStateMain = Get(buildStateType, "main");
+                    if (buildStateMain == null)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=no_buildstate_main");
+                        break;
+                    }
+                    MethodInfo getBp = buildStateType.GetMethod("GetBlueprint",
+                        BindingFlags.Public | BindingFlags.Instance, null, new Type[] { typeof(bool) }, null);
+                    if (getBp == null)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=getblueprint_not_found");
+                        break;
+                    }
+                    object bp;
+                    try { bp = getBp.Invoke(buildStateMain, new object[] { true }); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("dumpblueprint: FAILED reason=getblueprint_exception " + msg);
+                        break;
+                    }
+                    if (bp == null)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=blueprint_null");
+                        break;
+                    }
+
+                    Type jsonWrapperType = FindType("SFS.Parsers.Json.JsonWrapper");
+                    if (jsonWrapperType == null)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=jsonwrapper_type_not_found");
+                        break;
+                    }
+                    MethodInfo toJson = jsonWrapperType.GetMethod("ToJson",
+                        BindingFlags.Public | BindingFlags.Static, null,
+                        new Type[] { typeof(object), typeof(bool) }, null);
+                    if (toJson == null)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=tojson_method_not_found");
+                        break;
+                    }
+                    string json;
+                    try { json = (string)toJson.Invoke(null, new object[] { bp, true }); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("dumpblueprint: FAILED reason=tojson_exception " + msg);
+                        break;
+                    }
+
+                    try { File.WriteAllText(Path.Combine(ProbeMod.OutDir ?? ".", "sfs_probe_current_blueprint.json"), json); }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Result("dumpblueprint: FAILED reason=write_error " + e.Message);
+                        break;
+                    }
+                    ProbeMod.Result("dumpblueprint: OK bytes=" + json.Length + " -> sfs_probe_current_blueprint.json");
+                    break;
+                }
+
+                case "getparts":
+                {
+                    // Full parts-catalog index: real name + mass + centerOfMass +
+                    // REAL parametric variable names/values, properly extracted
+                    // past the generic Dump()'s depth-3 cutoff (which only shows
+                    // the bare type name "VariableSave" for each entry, not its
+                    // actual contents -- the same class of problem already fixed
+                    // once for surfaceGeometry). This is what a real "why did the
+                    // Fuel Tank spawn tiny" answer needs: the tank's real
+                    // configurable variables (height/radius/etc, whatever they're
+                    // actually called), not a guess.
+                    //
+                    // DELIBERATELY NOT part of the automatic on-load 'menu' dump
+                    // (DumpMenu, unchanged, still runs on every scene load) --
+                    // this is heavier and command-gated on purpose, so a normal
+                    // game launch/reload stays fast. Only runs when explicitly
+                    // requested.
+                    object partsObj = Get(FindComponent("SFS.Parts.PartsLoader"), "parts");
+                    var pen = partsObj as System.Collections.IEnumerable;
+                    if (pen == null) { ProbeMod.Result("getparts: FAILED reason=no_parts_catalog"); break; }
+
+                    var items = new List<string>();
+                    int total = 0;
+                    foreach (object kv in pen)
+                    {
+                        object part = Get(kv, "Value");   // Dictionary<string,Part> -- unwrap KeyValuePair
+                        if (part == null) continue;
+                        total++;
+
+                        string pname = "?";
+                        try { pname = (string)Get(Get(part, "orientation"), "name"); } catch { }
+
+                        float mass = ToF(GetWrapped2(Get(part, "mass")));
+                        object com = Get(part, "centerOfMass");
+                        float comX = ToF(GetWrapped2(Get(com, "x")));
+                        float comY = ToF(GetWrapped2(Get(com, "y")));
+
+                        var vsb = new StringBuilder();
+                        vsb.Append("{\"name\":").Append(Q(pname));
+                        vsb.Append(",\"mass\":").Append(Num(mass));
+                        vsb.Append(",\"centerOfMassX\":").Append(Num(comX));
+                        vsb.Append(",\"centerOfMassY\":").Append(Num(comY));
+                        vsb.Append(",\"variables\":").Append(DumpVariablesModule(part));
+                        vsb.Append("}");
+                        items.Add(vsb.ToString());
+                    }
+
+                    var outSb = new StringBuilder();
+                    outSb.Append("{\"parts\":[").Append(string.Join(",", items.ToArray())).Append("],\"total\":").Append(total).Append("}");
+                    Write("sfs_probe_parts_index.json", outSb, "getparts total=" + total);
+                    ProbeMod.Result("getparts: " + total + " parts -> sfs_probe_parts_index.json");
+                    break;
+                }
+
                 case "cheat":
                 {
                     object ss = FindComponent("SFS.World.SandboxSettings");
@@ -1532,6 +1664,80 @@ namespace SFSProbe
                 items.Add(baseDump);
             }
             return "[\n    " + string.Join(",\n    ", items.ToArray()) + "\n  ]";
+        }
+
+        // Extracts a part's REAL parametric variable definitions -- name and
+        // value for every entry in doubleVariables/boolVariables/
+        // stringVariables.saves -- past the generic Dump()'s depth-3 cutoff,
+        // which only shows the bare type name "VariableSave" for these, not
+        // their actual contents (confirmed empirically on "Fuel Tank": 7
+        // doubleVariables entries all rendered as just the string
+        // "VariableSave", 2026-08-29). Field names on VariableSave-like
+        // objects are read GENERICALLY (whatever public fields exist) since
+        // the exact schema was never independently confirmed via IL before
+        // this was written -- safer than guessing specific field names and
+        // silently getting nothing back. If a group's "saves" doesn't
+        // enumerate cleanly (boolVariables showed a different shape than
+        // doubleVariables/stringVariables in one early manual dump -- {
+        // "Capacity":0,"Count":0} rather than a real array, suggesting a
+        // different underlying container), falls back to a plain deeper
+        // Dump() of the raw group so nothing is silently lost either way.
+        static string DumpVariablesModule(object part)
+        {
+            try
+            {
+                object vm = Get(part, "variablesModule");
+                if (vm == null) return "null";
+                var groups = new List<string>();
+                foreach (string groupName in new string[] { "doubleVariables", "boolVariables", "stringVariables" })
+                {
+                    string groupJson;
+                    try
+                    {
+                        object group = Get(vm, groupName);
+                        object saves = Get(group, "saves");
+                        var entries = new List<string>();
+                        var senum = saves as System.Collections.IEnumerable;
+                        if (senum != null)
+                        {
+                            foreach (object save in senum)
+                            {
+                                if (save == null) continue;
+                                entries.Add(DumpVariableSaveGeneric(save));
+                            }
+                        }
+                        groupJson = entries.Count > 0
+                            ? "[" + string.Join(",", entries.ToArray()) + "]"
+                            : Dump(saves, 1);   // fallback: whatever the raw shape actually is
+                    }
+                    catch (Exception e) { groupJson = "\"error:" + e.Message.Replace("\"", "'") + "\""; }
+                    groups.Add("\"" + groupName + "\":" + groupJson);
+                }
+                return "{" + string.Join(",", groups.ToArray()) + "}";
+            }
+            catch (Exception e) { return "\"error:" + e.Message.Replace("\"", "'") + "\""; }
+        }
+
+        // Generic, name-agnostic field dump for one VariableSave-like object --
+        // every public field, whatever it's actually called. Used instead of
+        // the standard Dump() here specifically because these objects sit deep
+        // enough (part -> variablesModule -> doubleVariables -> saves[] ->
+        // VariableSave -> fields) that Dump()'s depth-3 cutoff would hide them.
+        static string DumpVariableSaveGeneric(object o)
+        {
+            try
+            {
+                var parts = new List<string>();
+                foreach (var f in o.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    object v;
+                    try { v = f.GetValue(o); } catch { continue; }
+                    parts.Add(Q(f.Name) + ":" + Dump(v, 2));
+                }
+                if (parts.Count == 0) return Q(o.GetType().Name);
+                return "{" + string.Join(",", parts.ToArray()) + "}";
+            }
+            catch (Exception e) { return "\"error:" + e.Message.Replace("\"", "'") + "\""; }
         }
 
         static string DumpPartGeometry(object part, bool forceInit)

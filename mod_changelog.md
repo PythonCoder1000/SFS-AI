@@ -9,6 +9,48 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.35.0 — 2026-08-29 (later same day)
+
+- **Added `dumpblueprint`** — reads the CURRENT editor design as a real
+  `Blueprint` object via `BuildState.main.GetBlueprint(bool)` (confirmed
+  via real IL call sites, the same file `LoadBlueprint`'s body was read
+  from), serializes it with the same `JsonWrapper.ToJson` used
+  elsewhere. This is the reverse of `loadblueprintbuild` — "what does
+  the editor actually contain right now" as real data, not a guess.
+  Read-only, no state mutation.
+
+- **Added `getparts`** — full parts-catalog index: real name (from
+  `orientation.name`) + mass + centerOfMass + REAL parametric variable
+  names/values for every part in `PartsLoader.parts`. Fixes a real data
+  loss: the generic `Dump()` reflection walker's depth-3 cutoff was
+  rendering every parametric variable (`doubleVariables`/
+  `boolVariables`/`stringVariables`, e.g. `Fuel Tank`'s 7 double
+  variables) as just the bare string `"VariableSave"` — the type name,
+  not the actual name/value data. New `DumpVariablesModule`/
+  `DumpVariableSaveGeneric` helpers walk past that cutoff explicitly
+  (same fix pattern already applied once for `surfaceGeometry`), reading
+  each `VariableSave`-like object's fields generically (whatever they're
+  actually called) rather than guessing specific field names.
+
+  **Deliberately command-gated, not part of the automatic on-load `menu`
+  dump** (`DumpMenu`, unchanged, still runs on every scene load) — this
+  is heavier and was explicitly requested to stay opt-in so a normal
+  game reload doesn't slow down. Only runs when `getparts` is sent.
+
+  Motivated by a real failure: a hand-built 4-part test blueprint
+  (`default_rocket` — Engine Hawk/Fuel Tank/Capsule/Parachute, positions
+  estimated from `centerOfMass` since real geometry isn't safely
+  readable from unplaced catalog prefabs) spawned with the Fuel Tank
+  abnormally tiny and the Parachute overlapping the Capsule — because
+  the blueprint never supplied real `NUMBER_VARIABLES` for parametric
+  parts, and no tool existed yet to find out what those variables even
+  are. `getparts` (names + real variables) plus `dumpblueprint` (real
+  as-placed state of whatever's currently in the editor) together are
+  meant to close that gap without needing IL research per part.
+
+  Built and installed clean, first try. **Neither command live-tested
+  yet.**
+
 ## v0.34.0 — 2026-08-29 (later same day)
 
 - **Replaced `GetEngineDirection` (first-active-engine-only) with
