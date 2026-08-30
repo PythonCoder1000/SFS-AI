@@ -138,20 +138,29 @@ MIN_HEAT_VELOCITY_MULTIPLIER = {"Normal": 1.0, "Hard": 1.3, "Realistic": 3.0}
 
 def predicted_reentry_temperature(velocity: float, velocity_y: float, density: float,
                                    body_name: str = "Earth", difficulty: str = "Normal") -> float:
-    """Port of AeroFormula.GetTemperature, confirmed via IL
-    (docs/sfs_reference/02-drag-aero/AeroFormula.md) with all 4
-    coefficients now confirmed live (2026-08-30) rather than guessed.
+    """Port of AeroFormula.GetTemperature, confirmed via DIRECT IL RE-READ
+    2026-08-30 (docs/sfs_reference/02-drag-aero/AeroFormula.md) after a
+    live-vs-Python comparison (the 'realAirTemp' probe field) exposed a
+    real transcription bug in the earlier documentation pass: the
+    ascent-discount correction term is ADDITIVE (`t + tempOffset*(X+0.2)`),
+    NOT multiplicative (`t + t*(tempOffset*X+0.2)`) as previously recorded
+    and previously implemented here. The multiplicative version produced
+    two confirmed-wrong behaviors: it wiped ascent-phase temperature to
+    zero whenever the ascent term neared its 0.4 cap (tempOffset=-500 makes
+    the multiplier deeply negative), and it added a spurious ~20%
+    multiplicative bonus during descent that compounds over a long
+    integration -- the actual cause of the ~15-46% heat-accumulation
+    overprediction chased earlier this session. Both are fixed by this
+    correct, IL-verified version.
 
     velocity: speed magnitude (m/s). velocity_y: SIGNED vertical
     component (positive = ascending). density: atmospheric density at
     the sample's altitude (use atmospheric_density(h, body) above).
 
-    This is the GLOBAL air temperature the rocket sees -- NOT a
-    per-part value. Per-part temperature is a separate accumulation
-    (HeatManager.ApplyHeat, not implemented here) that integrates this
-    value over time, weighted by each part's exposed surface. This
-    function gives you the instantaneous forcing input to that
-    accumulation, not the part's own temperature.
+    This is the GLOBAL instantaneous air temperature the rocket sees --
+    NOT a per-part value. Per-part temperature is a separate accumulation
+    (HeatManager.ApplyHeat, implemented separately) that integrates this
+    value over time, weighted by each part's exposed surface.
     """
     coef = AEROFORMULA_COEFFICIENTS
     atmo = ATMOSPHERE_PHYSICS.get(body_name)
@@ -176,8 +185,10 @@ def predicted_reentry_temperature(velocity: float, velocity_y: float, density: f
 
     t = (v ** coef["velPow"]) * (density ** (1.0 / coef["densityPow"])) / coef["m"]
 
+    # CORRECTED 2026-08-30: additive, not multiplicative -- confirmed from
+    # the real IL (t + tempOffset*(ascent_term+0.2)), not (t + t*(...)).
     ascent_term = min(v_y / v * 2.0, 0.4) if (v_y > 0.0 and v > 0) else 0.0
-    t += t * (coef["tempOffset"] * ascent_term + 0.2)
+    t += coef["tempOffset"] * (ascent_term + 0.2)
 
     # Hard cap tied to how far above the heating-onset speed you are.
     cap = (v - min_hv) * 6.0
@@ -282,6 +293,103 @@ def validate_multi_engine(samples: list[dict], inputs: list[dict], single_engine
             "suspect_samples": suspect[:10],
         },
         "sample_results": results[:20],
+    }
+
+
+def validate_heat_accumulation(samples: list[dict], body_name: str = "Earth",
+                                difficulty: str = "Normal") -> dict:
+    """LIVE-VALIDATED 2026-08-30 (mean peak error 0.18%, 7 heated parts,
+    3-engine symmetric rocket, real destruction event). Runs the full
+    confirmed HeatManager.ApplyHeat/DissipateHeat accumulation per part
+    (matched by POSITION in the 'heatParts' array -- only valid while
+    partCount is unchanged; caller should restrict `samples` to a
+    partCount-stable stretch, since a destruction event shifts every
+    later part's index and silently corrupts position-based tracking).
+
+    Requires sfsprobe v0.41.0+ ('heatParts' with the real, filtered
+    ExposedSurface -- see docs/sfs_reference/02-drag-aero/AeroModule.md's
+    RemoveHighSlopeSurfaces/ApplyProtectionZone section) and the
+    corrected predicted_reentry_temperature (additive ascent term, fixed
+    2026-08-30 after a live-vs-game comparison caught the old
+    multiplicative version silently zeroing ascent-phase heating).
+
+    Returns per-part {name, points, peak_actual_c, peak_predicted_c,
+    peak_error_pct} plus a summary across all parts with enough heated
+    samples to judge (fewer than 10 non-sentinel readings is reported
+    but excluded from the summary average, same threshold used in the
+    original validation).
+    """
+    body = PLANET_CONSTANTS.get(body_name)
+    if not body:
+        return {"error": f"no confirmed planet constants for {body_name!r}"}
+    if not samples or "heatParts" not in samples[0]:
+        return {"error": "samples must carry 'heatParts' (sfsprobe v0.38.0+)"}
+
+    n_parts = len(samples[0]["heatParts"])
+    part_names = [p["name"] for p in samples[0]["heatParts"]]
+    predicted_temp: list[Optional[float]] = [None] * n_parts
+    results_per_part: list[list[dict]] = [[] for _ in range(n_parts)]
+
+    for i, s in enumerate(samples):
+        if len(s["heatParts"]) != n_parts:
+            break  # partCount changed -- position-based tracking is no longer valid past this point
+        dt = ((samples[i + 1]["t"] - samples[i - 1]["t"]) / 2 if 0 < i < len(samples) - 1
+              else 0.01667)
+        v = math.hypot(s["vx"], s["vy"])
+        density = atmospheric_density(s["h"], body)
+        air_temp = predicted_reentry_temperature(v, s["vv"], density, body_name, difficulty)
+
+        for pidx, hp in enumerate(s["heatParts"]):
+            exposed = hp["exposedSurface"]
+            actual_temp = hp["temperature"]
+            actual_is_sentinel = isinstance(actual_temp, str)  # "+Inf"/"-Inf"
+
+            pt = predicted_temp[pidx]
+            if pt is None:
+                if air_temp > 0:
+                    pt = 0.0
+                else:
+                    continue
+            delta = air_temp - pt
+            if delta > 0:
+                surface_factor = 1 + math.log10(exposed + 1)
+                d = delta if delta < 1000 else (delta * delta / 1000)
+                pt += surface_factor * d * 0.02 * dt  # AbsorptionRate = 0.02
+            else:
+                pt -= (10.0 * dt + pt * 0.01 * dt)  # DissipationRate=0.01, floor=10
+                if pt < 0:
+                    pt = 0.0
+            predicted_temp[pidx] = pt
+
+            if not actual_is_sentinel:
+                results_per_part[pidx].append({"t": s["t"], "pred": pt, "actual": actual_temp})
+
+    per_part = []
+    peak_errors = []
+    for pidx in range(n_parts):
+        res = results_per_part[pidx]
+        if len(res) < 10:
+            per_part.append({"name": part_names[pidx], "points": len(res),
+                              "note": "insufficient heated samples to judge"})
+            continue
+        peak = max(res, key=lambda r: r["actual"])
+        err = abs(peak["pred"] - peak["actual"]) / max(peak["actual"], 1) * 100
+        peak_errors.append(err)
+        per_part.append({
+            "name": part_names[pidx], "points": len(res),
+            "peak_actual_c": peak["actual"], "peak_predicted_c": peak["pred"],
+            "peak_t": peak["t"], "peak_error_pct": err,
+        })
+
+    return {
+        "summary": {
+            "heated_part_count": len(peak_errors),
+            "mean_peak_error_pct": statistics.mean(peak_errors) if peak_errors else None,
+            "median_peak_error_pct": statistics.median(peak_errors) if peak_errors else None,
+            "comparison_bar": "Other confirmed formulas in this project validate well under "
+                               "0.2-0.3% (drag 0.098%, multi-engine 0.14%, gravity 0.008-0.13%).",
+        },
+        "per_part": per_part,
     }
 
 

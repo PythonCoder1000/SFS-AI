@@ -6,6 +6,53 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-30 (later same day) — heat formula bug found and fixed via direct live comparison; HEAT FULLY CLOSED
+
+- **Root-caused and fixed a real transcription bug** in
+  `predicted_reentry_temperature`'s ascent-correction term. An earlier
+  documentation pass recorded it as multiplicative
+  (`t += t * (tempOffset·X + 0.2)`); the real IL (re-read directly from
+  `scratch/full_il.txt`, not re-derived from the old doc) is additive:
+  `t += tempOffset · (X + 0.2)`. With `tempOffset=-500` confirmed live,
+  the wrong multiplicative version drove `t` deeply negative whenever
+  the ascent term neared its `0.4` cap, silently collapsing the whole
+  formula to `0` during real ascent-phase heating — which is exactly
+  the symptom that led to catching this: a live-vs-Python comparison
+  (`realAirTemp`, a new sfsprobe v0.43.0 telemetry field calling
+  `AeroModule.GetTemperatureAndShockwave` directly) showed the real
+  game reporting up to 1439°C air temperature during ascent while the
+  Python formula returned exactly 0.00 at the same instants.
+- **Verified against the game's own live computation, not just
+  self-consistency:** 2,989 real samples across a full ascent-to-
+  reentry flight, comparing `predicted_reentry_temperature`'s output
+  directly against `AeroModule.GetTemperatureAndShockwave`'s real
+  return value at the same tick. **Median error 0.0000%, mean 0.0001%,
+  max 0.0047%** — effectively exact, floating-point-level agreement.
+- **This also fully explains the ~50% heat-accumulation overprediction**
+  chased earlier the same session (which the `ExposedSurface`-filtering
+  fix, v0.41.0, only partially closed to ~46.6%): the wrong
+  multiplicative version added a spurious ~20% bonus to `t` every
+  single tick during descent, and that error compounds across the
+  ~1000+ ticks of a real reentry integration far more than a one-off
+  formula error would suggest.
+- **Re-ran the full per-part `ApplyHeat`/`DissipateHeat` accumulation
+  model** (same one built earlier this session, now using both the
+  corrected formula and the correctly-filtered `ExposedSurface`) against
+  a real destruction event (3 Hawk Engines, symmetric, all crossing the
+  confirmed 412°C threshold together): **mean peak-temperature error
+  0.18%** across all 7 heated parts (0.09–0.30% individually) — tighter
+  than or matching every other confirmed formula in this project
+  (drag: 0.098%, gravity: 0.008–0.13%, multi-engine: 0.14%).
+- **Heat is now fully closed**: formula confirmed exact against the
+  game's own live output, full accumulation model validated against a
+  real destruction event, coefficients read live, `ExposedSurface`
+  correctly filtered through the real `RemoveHighSlopeSurfaces`/
+  `ApplyProtectionZone`. No remaining open items in the heat model
+  itself — only RCS and terrain remain unvalidated among the original
+  four "confirmed from code, untested live" physics items.
+
+---
+
 ## 2026-08-30 (later same day) — multi-engine LIVE-VALIDATED
 
 - **Real flight test of the "no summation, N independent forces" model**

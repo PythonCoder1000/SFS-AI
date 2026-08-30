@@ -432,7 +432,7 @@ AeroFormula.GetTemperature(velocity, velocity_Y, density, minHeatVelocity):
   v /= hvm; vY /= hvm; minHV /= hvm          (hvm = HeatVelocityMultiplier)
   if (vY > 0) v -= min(vY·2.5, v·0.5)
   t  = (v^velPow · density^(1/densityPow)) / m
-  t += t · (tempOffset · (vY > 0 ? min(vY/v·2, 0.4) : 0) + 0.2)
+  t += tempOffset · ((vY > 0 ? min(vY/v·2, 0.4) : 0) + 0.2)   [ADDITIVE -- see correction below]
   cap = (v − minHeatVelocity)·6;  if (t > cap) t = cap
   if (t > 2000) t = 2000 + (t − 2000)/1.5
   return max(t, 0)
@@ -440,6 +440,33 @@ AeroFormula.GetTemperature(velocity, velocity_Y, density, minHeatVelocity):
 
 `heatVelocityMultiplier` by difficulty is `[1.0, 1.3, 4.5]`;
 `minHeatVelocityMultiplier` is `[1.0, 1.3, 3.0]`.
+
+> **CORRECTION (2026-08-30, direct IL re-read) — the ascent-correction
+> term is ADDITIVE, not multiplicative.** An earlier documentation pass
+> transcribed this step as `t += t * (tempOffset·X + 0.2)` — the whole
+> correction scaled by `t` itself. The real IL (confirmed by directly
+> re-reading `AeroFormula.GetTemperature`'s bytecode, triggered by a
+> live-vs-Python comparison that caught the formula returning exactly
+> 0 during real ascent-phase heating) is:
+> ```
+> t = t + tempOffset · (ascent_term + 0.2)
+> ```
+> an ADDITIVE correction, with `0.2` grouped inside the `tempOffset`
+> multiplication rather than outside it. With `tempOffset=-500`
+> confirmed live, the old (wrong) multiplicative version drove `t`
+> deeply negative whenever the ascent term neared its `0.4` cap,
+> collapsing to `0` after the final clamp — exactly the bug that
+> exposed this. The correct additive version was verified against the
+> game's own live `AeroModule.GetTemperatureAndShockwave` output across
+> 2,989 real samples spanning a full ascent-to-reentry flight:
+> **median error 0.0000%, mean 0.0001%, max 0.0047%** — effectively
+> exact agreement. `python/sfs_telemetry.py`'s
+> `predicted_reentry_temperature` has been corrected accordingly. This
+> also fully explains the ~50% heat-accumulation overprediction chased
+> earlier the same session: the old multiplicative version added a
+> spurious ~20% bonus every tick during descent, which compounds over
+> a long integration far more than a one-off formula error would
+> suggest.
 
 **RESOLVED 2026-08-30 — the four `AeroFormula` coefficients are now
 CONFIRMED, not open.** Read live via the new `aeroformula` probe command

@@ -67,23 +67,26 @@ four. **None is validated live**, so each is checked as a *research*
 item and re-opened as a *validation* item — a confirmed code reading is
 not a validated physics model. Detail in `sfs_physics_reference.md` §5.
 
-- [x] **Heat/destruction formula** — chain read end to end AND all 4
-      serialized coefficients confirmed live (2026-08-30):
-      `velPow=1.85`, `densityPow=2.2`, `tempOffset=-500`, `m=1.47`.
-      Default part breaks at **412.0 °C**. Full formula implemented in
-      `python/sfs_telemetry.py` (`predicted_reentry_temperature`),
-      sanity-checked against a real reentry flight (predicted air temp
-      ramps sharply exactly where that flight's parts actually broke
-      off). **Still open:** the part-level heat accumulation
-      (`ApplyHeat`/`DissipateHeat` integration over time) isn't
-      implemented yet, and a fresh validation flight is needed (the old
-      archived flight predates the `GetHeatState` read fix).
-- [ ] **Heat: the four `AeroFormula` coefficients** — **CONFIRMED LIVE
+- [x] **Heat/destruction formula** — chain read end to end, all 4
+      coefficients confirmed live, AND live-validated against the
+      game's own real computation. `velPow=1.85`, `densityPow=2.2`,
+      `tempOffset=-500`, `m=1.47`. Default part breaks at **412.0 °C**.
+      **A real transcription bug was found and fixed 2026-08-30**: the
+      ascent-correction term is additive (`t + tempOffset·(X+0.2)`),
+      not multiplicative as an earlier pass recorded — caught by
+      comparing the Python formula directly against the game's live
+      `AeroModule.GetTemperatureAndShockwave` output (2,989 samples,
+      median error 0.0000% after the fix). The full per-part heat
+      accumulation model (`ApplyHeat`/`DissipateHeat`, implemented in
+      `python/sfs_telemetry.py`) is now validated against a real
+      destruction event: **mean peak-temperature error 0.18%** across
+      7 heated parts — tighter than or matching every other confirmed
+      formula in this project. **Heat is fully closed.**
+- [x] **Heat: the four `AeroFormula` coefficients** — **CONFIRMED LIVE
       2026-08-30**: `velPow=1.85`, `densityPow=2.2`, `tempOffset=-500`,
-      `m=1.47`, via the new `aeroformula` probe command. No longer open
-      as a research item — kept here only until the part-level
-      accumulation + fresh validation flight (tracked above) closes it
-      out entirely.
+      `m=1.47`, via the `aeroformula` probe command. Formula structure
+      independently confirmed correct via direct live-vs-real-game
+      comparison (see above) — fully closed, not just read.
 - [x] **Multi-engine rockets** — resolved by discovering there is
       **nothing to model**: no summation exists. Each engine calls
       `AddForceAtPosition` independently; off-axis torque is emergent.
@@ -128,11 +131,11 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       `Planet.GetTerrainHeightAtAngle`, plus a batch
       `GetTerrainHeightAtAngles`. `maxTerrainHeight` is only a
       fast-reject radius. Available all along.
-- [ ] **Live validation of RCS, terrain, and the heat accumulation
-      model** — multi-engine is now validated live (above). Heat's
-      instantaneous-temperature formula is sanity-checked but not fully
-      validated (accumulation model + fresh flight still needed, see
-      §5.1). RCS and terrain remain untested against real flight data.
+- [ ] **Live validation of RCS and terrain.** Heat and multi-engine
+      are now both validated live (heat: 0.18% mean peak error, formula
+      independently confirmed against the game's own real computation;
+      multi-engine: 0.14% median error). RCS and terrain remain
+      untested against real flight data.
 
 ## Tooling bugs — fixed 2026-08-29 (v0.34.0)
 
