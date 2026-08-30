@@ -1704,6 +1704,36 @@
       "depth": "FULL"
     },
     {
+      "fq": "SFS.World.SandboxSettings",
+      "name": "SandboxSettings",
+      "namespace": "SFS.World",
+      "kind": "class",
+      "nested": false,
+      "parent": null,
+      "il_line": 154215,
+      "methods": 28,
+      "fields": 25,
+      "file": "12-world-scene-timewarp/SandboxSettings.md",
+      "summary": "The eight cheat flags: every Toggle* is PRIVATE, requires a loaded world, and writes the settings file to disk on every call",
+      "status": "PARTIAL",
+      "depth": "FULL"
+    },
+    {
+      "fq": "SFS.World.SandboxSettings/Data",
+      "name": "Data",
+      "namespace": "SFS.World",
+      "kind": "class",
+      "nested": true,
+      "parent": "SFS.World.SandboxSettings",
+      "il_line": 155121,
+      "methods": 1,
+      "fields": 8,
+      "file": "12-world-scene-timewarp/SandboxSettings.md",
+      "summary": "The eight cheat booleans - world-scoped, swapped by WorldBaseManager.EnterWorld/ExitWorld; full map of which physics path each flag changes",
+      "status": "CONFIRMED",
+      "depth": "FULL"
+    },
+    {
       "fq": "SFS.World.WorldTime",
       "name": "WorldTime",
       "namespace": "SFS.World",
@@ -1895,6 +1925,21 @@
       "fields": 8,
       "file": "14-misc-part-modules/WheelModule.md",
       "summary": "Steered by the raw undamped turn axis, never by SAS; idle clamps are +/-0.05 powered and +/-0.25 free-rolling",
+      "status": "PARTIAL",
+      "depth": "FULL"
+    },
+    {
+      "fq": "SFS.Builds.BuildState",
+      "name": "BuildState",
+      "namespace": "SFS.Builds",
+      "kind": "class",
+      "nested": false,
+      "parent": null,
+      "il_line": 94034,
+      "methods": 12,
+      "fields": 5,
+      "file": "16-builds/BuildState.md",
+      "summary": "The editor-side blueprint loader; LoadBlueprint requires Build_PC (the opposite of RocketManager.SpawnBlueprint) and Clear() runs before any validation",
       "status": "PARTIAL",
       "depth": "FULL"
     }

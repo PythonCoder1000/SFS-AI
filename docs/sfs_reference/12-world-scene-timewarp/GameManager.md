@@ -54,6 +54,15 @@ Signatures confirmed.
 #### RevertToLaunch(bool skipConfirmation) -> void
 
 - **Access:** public instance · IL @178885
+- **Preconditions:** A loaded world with a **revert point already saved** —
+  the body opens with `SavingCache.TryLoadRevertToLaunch(out WorldSave)` and
+  reads `WorldTime.main.worldTime`, so `WorldTime.main` must be populated.
+  With `skipConfirmation: false` it additionally needs the menu stack
+  (`MenuGenerator.OpenConfirmation`) and `FileLocations` one-time-
+  notification state, which is UI-scoped; **`skipConfirmation: true` is the
+  headless path and is what a mod command must pass.** What happens when
+  `TryLoadRevertToLaunch` returns false is **not established** —
+  `SavingCache` is `[OPEN]`. Flagged, not yet resolved.
 - **Behavior:** reads a revert point through
   `SavingCache.TryLoadRevertToLaunch(out WorldSave)`, compares
   `WorldTime.main.worldTime` against `revertSave.state.worldTime`, and —

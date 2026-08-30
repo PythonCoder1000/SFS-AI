@@ -46,6 +46,17 @@ Schemas: [`save-records.md`](save-records.md).
 #### SpawnBlueprint(Blueprint blueprint) -> void
 
 - **Access:** public static · IL @190336
+- **Preconditions:** **`World_PC` scene — `WorldView.main` must be non-
+  null.** The first five instructions call
+  `WorldView.main.SetViewLocation(...)`, before any part is touched, so
+  calling this from `Build_PC` throws `NullReferenceException` immediately.
+  This was established by reading the IL **after a live crash**
+  (2026-08-29); the original guess was the opposite. `blueprint` must be
+  non-null with a non-null `parts` array. **The rest of the body is
+  `[OPEN]`, so further preconditions may exist** — in particular whatever
+  `PartsLoader.CreateParts` requires. Flagged, not yet resolved. Contrast
+  `SFS.Builds.BuildState.LoadBlueprint`, which requires `Build_PC` and no
+  `WorldView` at all ([`BuildState.md`](../16-builds/BuildState.md)).
 - **Behavior (partial, confirmed 2026-08-29):** the FIRST FIVE
   instructions call `WorldView.main.SetViewLocation(SpaceCenterData.
   LaunchPadLocation)` — moving the camera to the launch pad, before

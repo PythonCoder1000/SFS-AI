@@ -43,6 +43,24 @@ Backed by **Newtonsoft.Json**, an extern assembly reference of
 them by reflection needs `MakeGenericMethod`. **Writing is easier**:
 `SaveAsJson` and `ToJson` take `object` and are not generic.
 
+**Preconditions (added during Phase 1 Step 1.5).** This file documents
+`JsonWrapper` as a signature table rather than per-method `####` entries,
+so the template's per-method Preconditions field has nowhere to live. The
+one that matters to shipped mod code, for `FromJson<T>(string)`:
+
+- **None beyond valid arguments — no scene, no singleton, no loaded
+  world.** It is a pure Newtonsoft wrapper; `sfsprobe`'s `loadblueprint`
+  and `loadblueprintbuild` both call it before their scene gates would
+  matter.
+- **Its failure behaviour on malformed input is `[OPEN]`** — the body has
+  not been read, so whether it throws or returns `null` for a given input
+  is not established. `sfsprobe` handles both (`deserialize_error` from a
+  caught exception, `deserialize_null` from a null return), which is the
+  correct defensive posture given the body is unread.
+- **The rest of this table is signature-only.** Anything here that a
+  state-mutating command comes to depend on needs its body read first, per
+  the plan's HARD RULE.
+
 ### Supporting types
 
 All in `SFS.Parsers.Json`; own entries **[OPEN]** (Step 2).

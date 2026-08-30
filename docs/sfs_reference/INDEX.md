@@ -19,11 +19,11 @@ editing it.
 | Real types in the assembly | 969 |
 | Excluded (vendored third-party) | 33 |
 | **In scope** | **936** |
-| Documented | 113 |
-| — at FULL depth | 107 |
+| Documented | 116 |
+| — at FULL depth | 110 |
 | — at LIGHT depth | 6 |
-| **Remaining** | **823** |
-| Coverage | 12.1% |
+| **Remaining** | **820** |
+| Coverage | 12.4% |
 
 **Phase:** Phase 1, Step 2 in progress — net-new coverage
 
@@ -228,6 +228,8 @@ World time, floating origin, scenes, cameras
 | `GameManager` | `SFS.World` | class | [GameManager.md](12-world-scene-timewarp/GameManager.md) | World-scene singleton: rockets is the craft enumeration point and aeroData holds the reentry coefficients | PARTIAL | FULL |
 | `SceneHelper` | `ModLoader.Helpers` | static class | [GameManager.md](12-world-scene-timewarp/GameManager.md) | Ten static scene-load/unload delegates - the Harmony-free way to know the world is ready | CONFIRMED | FULL |
 | `SceneLoader` | `SFS` | class | [GameManager.md](12-world-scene-timewarp/GameManager.md) | Five scenes (Base, Home, Hub, Build, World); loading is async so a scene change does not finish in-frame | PARTIAL | FULL |
+| `Data` | `SFS.World` | class | [SandboxSettings.md](12-world-scene-timewarp/SandboxSettings.md) | The eight cheat booleans - world-scoped, swapped by WorldBaseManager.EnterWorld/ExitWorld; full map of which physics path each flag changes | CONFIRMED | FULL |
+| `SandboxSettings` | `SFS.World` | class | [SandboxSettings.md](12-world-scene-timewarp/SandboxSettings.md) | The eight cheat flags: every Toggle* is PRIVATE, requires a loaded world, and writes the settings file to disk on every call | PARTIAL | FULL |
 | `WorldTime` | `SFS.World` | class | [WorldTime.md](12-world-scene-timewarp/WorldTime.md) | The simulation clock and both timewarp ladders; SetState is public and validates nothing | CONFIRMED | FULL |
 | `WorldView` | `SFS.World` | class | [WorldView.md](12-world-scene-timewarp/WorldView.md) | Floating origin AND floating velocity frame - which is why rb2d.linearVelocity is not world velocity | CONFIRMED | FULL |
 
@@ -266,7 +268,9 @@ SFS.UI
 
 SFS.Builds — the in-game editor
 
-*Nothing migrated or written yet.*
+| Type | Namespace | Kind | File | Summary | Status | Depth |
+|---|---|---|---|---|---|---|
+| `BuildState` | `SFS.Builds` | class | [BuildState.md](16-builds/BuildState.md) | The editor-side blueprint loader; LoadBlueprint requires Build_PC (the opposite of RocketManager.SpawnBlueprint) and Clear() runs before any validation | PARTIAL | FULL |
 
 ### `17-modgui/`
 
