@@ -9,6 +9,94 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.35.4 — 2026-08-29 (later same day)
+
+- **Fixed 6 of 8 real bugs found by the Step 1.5 Mod-Integration Safety
+  Audit** (a separate Claude Code session, cross-referencing every
+  SFSProbe.cs command against documented method bodies). Full audit
+  table lives in that session's handoff; summary of what changed here:
+
+  **`cheat` (findings 1, 3, 4):**
+  - **Silent-failure bug, fixed.** Was resolving `SandboxSettings` via
+    `Resources.FindObjectsOfTypeAll(t)[0]`, which can return an inactive
+    object/prefab in unspecified order. If `[0]` wasn't the live
+    component, the toggle flipped a detached `Data` object -- but
+    `OnToggle()` saves the GLOBAL `Base.worldBase.settings`, not
+    `this.settings`, so the command still printed `"toggled X"` and
+    still wrote the settings file **while changing nothing**. Now uses
+    the confirmed public static `SandboxSettings.main` directly.
+  - **Crash-from-menu bug, fixed.** Had no scene gate; `OnToggle()`
+    dereferences `Base.worldBase.paths` unchecked, so calling this from
+    the main menu threw. Now checks `Base.worldBase` is non-null first,
+    reported as `reason=no_world_loaded` instead of an uncaught
+    exception.
+  - **`InfiniteOxygen`, documented not fixed.** There's a UI button for
+    it but no matching flag/method on `SandboxSettings` -- a real gap in
+    the game's own naming consistency, not something a probe-side fix
+    can paper over.
+  - **`arg` case-sensitivity, documented as correct, not a bug.** `arg`
+    becomes a real C# method name via reflection (`"Toggle" + arg`), and
+    .NET reflection lookup is case-sensitive -- lowercasing it (as `cmd`
+    is) would break every cheat name, not fewer.
+  - All failure paths now report distinct `reason=` tokens (`no_arg`,
+    `no_world_loaded`, `sandboxsettings_main_null`, `method_not_found`,
+    `toggle_exception`) instead of either silent fake-success or an
+    uncaught exception.
+
+  **`loadblueprintbuild` (findings 5, 6):**
+  - **Data-loss risk, mitigated.** `BuildState.LoadBlueprint`'s own body
+    calls `Clear(applyUndo)` BEFORE any part-spawning/validation --
+    meaning a failed load (most likely cause: a part name that doesn't
+    match the real catalog) already destroyed the current design by the
+    time `reason=load_exception` appeared, which read as "nothing
+    happened." Can't change that ordering (it's inside the game's own
+    method), but now pre-validates every part name against the live
+    `PartsLoader.parts` catalog BEFORE calling `LoadBlueprint` at all --
+    catches the single most likely cause (`reason=unknown_part_names`)
+    while the current design is still intact.
+  - The remaining `load_exception` message (for failure modes
+    pre-validation can't catch -- DLC/ownership rejection, a malformed
+    variable) now explicitly warns that the previous design may already
+    be gone, rather than implying nothing happened.
+
+  **Not fixed (2 of 8 findings, correctly out of scope):** `autostop`
+  was flagged as state-mutating in the plan but the audit found it's
+  actually read-only (only stops the mod's own recording) -- a plan
+  correction, not a code bug. `achievements`'s `GetCompleteChallenges`
+  has no doc entry yet but is read-only, so it's noted, not blocking.
+
+  Built and installed clean. `sfsprobe_load_blueprint`'s error-code
+  mapping updated to include `unknown_part_names` -> `INVALID_PARAM`.
+  Not yet live-tested.
+
+## v0.35.3 — 2026-08-29 (later same day)
+
+- **`getparts` now also reads `MagnetModule.points`** -- real local
+  attachment-point offsets (`x`, `y`, `occupied`). This is the actual
+  mechanism behind SFS's snap system, confirmed via IL: `SFS.Builds.
+  HoldGrid` + `MagnetModule.GetAllSnapOffsets`/`GetSnapPointsWorld` --
+  **not a coordinate grid at all**. Parts snap to each other via real
+  geometric attachment points that the game's own interactive placement
+  UI matches through `GetAllSnapOffsets`; direct blueprint injection
+  (`loadblueprint`/`loadblueprintbuild`) bypasses that step entirely,
+  which is why hand-picked positions can land a part somewhere a human
+  dragging with the mouse never could. `Point.position` is a simple
+  field (not mesh geometry), hypothesized safe to read straight from
+  the catalog like the variable data was. **Built, installed clean --
+  NOT YET LIVE-TESTED.** A reload+test was requested but the session
+  moved on to other work before it happened; do not treat this as
+  confirmed until a real `getparts` run shows non-empty magnet data.
+
+## v0.35.2 — 2026-08-29 (later same day)
+
+- **Widened `DumpObjectFieldsGeneric`** (the shared generic reflection
+  dumper used for `VariableSave`/`VariantRef`) to read non-public fields
+  (Unity's common `[SerializeField] private` pattern, same reasoning the
+  main `Get()` helper already applies) and public "simple" properties,
+  not just public fields -- closes a real gap where meaningful data on
+  an object like `VariantRef` could sit behind either and silently come
+  back empty.
+
 ## v0.35.1 — 2026-08-29 (later same day)
 
 - **Fixed `getparts` missing `PartsLoader.partVariants` entirely.**

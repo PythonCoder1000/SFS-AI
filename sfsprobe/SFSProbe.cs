@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.35.1";
+        public const string VersionString = "0.35.4";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (dumpblueprint: reads the CURRENT editor design via BuildState.GetBlueprint(bool); getparts: full parts-catalog index with REAL parametric variable names/values PLUS partVariants (a separate catalog missed in the first getparts pass -- found via a real user headcount mismatch), command-gated so a normal reload stays fast; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (Step 1.5 audit fixes: cheat now uses SandboxSettings.main not FindObjectsOfTypeAll[0] -- was silently succeeding while changing nothing -- plus a world-loaded gate; loadblueprintbuild now pre-validates part names against the real catalog before BuildState.Clear() can destroy the current design; getparts/MagnetModule as in v0.35.3; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -983,6 +983,49 @@ namespace SFSProbe
                         break;
                     }
 
+                    // PRE-VALIDATION (2026-08-29, Step 1.5 audit finding 5/6):
+                    // BuildState.LoadBlueprint's own body calls Clear(applyUndo)
+                    // FIRST, before any part-spawning/validation happens -- so if
+                    // spawning throws afterward, the CURRENT DESIGN IS ALREADY
+                    // GONE by the time we'd see reason=load_exception. Can't
+                    // change that ordering (it's inside the game's own method),
+                    // but the single most likely cause -- a part name that
+                    // doesn't match the real catalog -- is checkable BEFORE
+                    // calling LoadBlueprint at all, while the current design is
+                    // still intact. PartSave.name confirmed via IL as the real
+                    // field (JSON-aliased to "n").
+                    object partsField = Get(blueprintBuild, "parts");
+                    var partsEnumForValidation = partsField as System.Collections.IEnumerable;
+                    if (partsEnumForValidation != null)
+                    {
+                        object catalogObj = Get(FindComponent("SFS.Parts.PartsLoader"), "parts");
+                        var catalogEn = catalogObj as System.Collections.IEnumerable;
+                        var catalogNames = new HashSet<string>();
+                        if (catalogEn != null)
+                            foreach (object kv in catalogEn)
+                            {
+                                string k = Get(kv, "Key") as string;
+                                if (k != null) catalogNames.Add(k);
+                            }
+                        if (catalogNames.Count > 0)
+                        {
+                            var badNames = new List<string>();
+                            foreach (object ps in partsEnumForValidation)
+                            {
+                                string pn = Get(ps, "name") as string;
+                                if (pn != null && !catalogNames.Contains(pn) && !badNames.Contains(pn))
+                                    badNames.Add(pn);
+                            }
+                            if (badNames.Count > 0)
+                            {
+                                ProbeMod.Result("loadblueprintbuild: FAILED reason=unknown_part_names parts=" +
+                                                 string.Join(",", badNames.ToArray()) +
+                                                 " (current design NOT modified -- caught before Clear())");
+                                break;
+                            }
+                        }
+                    }
+
                     object buildState = FindComponent("SFS.Builds.BuildState");
                     if (buildState == null)
                     {
@@ -1018,7 +1061,15 @@ namespace SFSProbe
                     catch (Exception e)
                     {
                         string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
-                        ProbeMod.Result("loadblueprintbuild: FAILED reason=load_exception " + msg);
+                        // Part-name pre-validation above catches the most likely
+                        // cause, but LoadBlueprint's own body still calls Clear()
+                        // BEFORE any other failure mode here could be detected
+                        // (e.g. DLC/ownership rejection, a malformed variable) --
+                        // so a load_exception past pre-validation may mean the
+                        // previous design IS gone, not that "nothing happened."
+                        ProbeMod.Result("loadblueprintbuild: FAILED reason=load_exception " + msg +
+                                         " (WARNING: BuildState.Clear() runs before this point in the game's " +
+                                         "own LoadBlueprint body -- the previous design may already be gone)");
                         break;
                     }
 
@@ -1158,6 +1209,7 @@ namespace SFSProbe
                         vsb.Append(",\"centerOfMassX\":").Append(Num(comX));
                         vsb.Append(",\"centerOfMassY\":").Append(Num(comY));
                         vsb.Append(",\"variables\":").Append(DumpVariablesModule(part));
+                        vsb.Append(",\"magnetPoints\":").Append(DumpMagnetPoints(part));
                         vsb.Append("}");
                         items.Add(vsb.ToString());
                     }
@@ -1190,9 +1242,78 @@ namespace SFSProbe
 
                 case "cheat":
                 {
-                    object ss = FindComponent("SFS.World.SandboxSettings");
-                    Invoke(ss, "Toggle" + arg, new object[0]);
-                    ProbeMod.Result("toggled " + arg);
+                    // FIXED (2026-08-29, Step 1.5 audit findings 1-4):
+                    //
+                    // Finding 1 -- was: FindComponent("SFS.World.SandboxSettings"),
+                    // which resolves via Resources.FindObjectsOfTypeAll(t)[0].
+                    // That call can return INACTIVE objects/prefabs in unspecified
+                    // order -- if [0] wasn't the live component, the toggle flipped
+                    // a detached Data object, but OnToggle() saves the GLOBAL
+                    // Base.worldBase.settings (not this.settings), so the command
+                    // still printed "toggled X" and still wrote the file while
+                    // changing NOTHING. Silent success, the worst kind of bug.
+                    // Fixed: use the confirmed public static SandboxSettings.main
+                    // directly (confirmed via IL, same pattern already used for
+                    // BuildState.main/MsgDrawer.main elsewhere in this file).
+                    //
+                    // Finding 3 -- was: no scene gate at all; OnToggle() dereferences
+                    // Base.worldBase.paths unchecked, so calling this from the main
+                    // menu (no world loaded) threw. Fixed: check Base.worldBase is
+                    // non-null first, reported as a distinct reason rather than an
+                    // uncaught exception bubbling up as a generic "ERROR '...'" line.
+                    //
+                    // Finding 4 -- NOT fixed, documented instead: "InfiniteOxygen"
+                    // can never work -- there's a UI button for it but no matching
+                    // flag or ToggleInfiniteOxygen method on SandboxSettings, so no
+                    // reflection call could ever succeed for that name regardless of
+                    // how it's resolved. This is a real gap in the GAME's own naming
+                    // consistency, not something a probe-side fix can paper over.
+                    //
+                    // arg is deliberately NOT lowercased the way cmd is (also
+                    // flagged in finding 4) -- this is correct behavior, not a bug:
+                    // arg becomes part of a real C# method name via reflection
+                    // ("Toggle" + arg), and .NET reflection method lookup is
+                    // case-sensitive. Lowercasing would make every cheat name fail,
+                    // not fewer. The real fix is knowing this: 'cheat InfiniteFuel'
+                    // works, 'cheat infinitefuel' will not, and that's expected.
+                    if (string.IsNullOrEmpty(arg))
+                    {
+                        ProbeMod.Result("cheat: FAILED reason=no_arg");
+                        break;
+                    }
+
+                    object worldBase = Get(FindType("SFS.Base"), "worldBase");
+                    if (worldBase == null)
+                    {
+                        ProbeMod.Result("cheat: FAILED reason=no_world_loaded");
+                        break;
+                    }
+
+                    object ss = Get(FindType("SFS.World.SandboxSettings"), "main");
+                    if (ss == null)
+                    {
+                        ProbeMod.Result("cheat: FAILED reason=sandboxsettings_main_null");
+                        break;
+                    }
+
+                    MethodInfo toggleMethod = ss.GetType().GetMethod("Toggle" + arg,
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (toggleMethod == null)
+                    {
+                        ProbeMod.Result("cheat: FAILED reason=method_not_found method=Toggle" + arg +
+                                         " (arg is case-sensitive, must match the real method name exactly)");
+                        break;
+                    }
+
+                    try { toggleMethod.Invoke(ss, new object[0]); }
+                    catch (Exception e)
+                    {
+                        string msg = e.InnerException != null ? e.InnerException.Message : e.Message;
+                        ProbeMod.Result("cheat: FAILED reason=toggle_exception " + msg);
+                        break;
+                    }
+
+                    ProbeMod.Result("cheat: OK toggled " + arg);
                     break;
                 }
 
@@ -1748,21 +1869,86 @@ namespace SFSProbe
             catch (Exception e) { return "\"error:" + e.Message.Replace("\"", "'") + "\""; }
         }
 
+        // Extracts a part's REAL magnet/attachment points -- the actual data
+        // behind SFS's snap system (SFS.Builds.HoldGrid + MagnetModule,
+        // confirmed via IL 2026-08-29). This is NOT a fixed coordinate grid;
+        // parts snap to each other via real geometric attachment points
+        // (MagnetModule.points, each a local-space Composed_Vector2 position),
+        // matched through MagnetModule.GetAllSnapOffsets -- the same method
+        // the game's own interactive placement UI calls. Direct blueprint
+        // injection (loadblueprintbuild/loadblueprint) bypasses that snap
+        // step entirely, which is why hand-picked positions can land a part
+        // somewhere a human dragging with the mouse never could.
+        //
+        // Point.position is a simple field, not mesh geometry -- unlike
+        // surfaceGeometry (gated behind Part.InitializePart(), unsafe on bare
+        // catalog prefabs), this is hypothesized to be safely readable
+        // straight from the catalog. Not yet confirmed live as of first
+        // write -- if empty/wrong on catalog parts, magnet data will need
+        // to come from already-placed instances instead, same as geometry.
+        static string DumpMagnetPoints(object part)
+        {
+            try
+            {
+                object magnet = null;
+                foreach (object mv in ModuleValues(part))
+                {
+                    if (mv.GetType().Name == "MagnetModule") { magnet = mv; break; }
+                }
+                if (magnet == null) return "null";
+                object pointsArr = Get(magnet, "points");
+                var pen = pointsArr as System.Collections.IEnumerable;
+                if (pen == null) return "[]";
+                var items = new List<string>();
+                foreach (object pt in pen)
+                {
+                    if (pt == null) continue;
+                    object posObj = Get(pt, "position");
+                    float px = ToF(GetWrapped2(Get(posObj, "x")));
+                    float py = ToF(GetWrapped2(Get(posObj, "y")));
+                    bool occupied = ToB(Get(pt, "occupied"));
+                    items.Add("{\"x\":" + Num(px) + ",\"y\":" + Num(py) + ",\"occupied\":" + (occupied ? "true" : "false") + "}");
+                }
+                return "[" + string.Join(",", items.ToArray()) + "]";
+            }
+            catch (Exception e) { return "\"error:" + e.Message.Replace("\"", "'") + "\""; }
+        }
+
         // Generic, name-agnostic public-field dump for ANY object -- used
         // wherever the exact schema wasn't independently confirmed via IL
         // before this was written (VariableSave for parametric variables,
         // VariantRef for part variants), so field names are read whatever
         // they actually are rather than guessed and silently missed.
+        //
+        // Reads BOTH fields (public AND non-public -- Unity code commonly
+        // uses [SerializeField] private, same reasoning the main Get()
+        // helper elsewhere in this file already applies) AND public
+        // properties with a "simple" return type (matching the main Dump()
+        // function's own property walk). Checking fields-only was a real
+        // gap -- if the meaningful data on an object like VariantRef lives
+        // behind a private field or a property instead of a public field,
+        // the fields-only version would have come back looking empty
+        // (falling through to just the bare type name) even though real
+        // data was sitting right there.
         static string DumpObjectFieldsGeneric(object o)
         {
             try
             {
                 var parts = new List<string>();
-                foreach (var f in o.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
+                foreach (var f in o.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                 {
+                    if (typeof(Delegate).IsAssignableFrom(f.FieldType)) continue;
                     object v;
                     try { v = f.GetValue(o); } catch { continue; }
                     parts.Add(Q(f.Name) + ":" + Dump(v, 2));
+                }
+                foreach (var p in o.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (p.GetIndexParameters().Length > 0) continue;
+                    if (!IsSimple(p.PropertyType)) continue;
+                    object v;
+                    try { v = p.GetValue(o, null); } catch { continue; }
+                    parts.Add(Q(p.Name) + ":" + Dump(v, 2));
                 }
                 if (parts.Count == 0) return Q(o.GetType().Name);
                 return "{" + string.Join(",", parts.ToArray()) + "}";

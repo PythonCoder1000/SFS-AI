@@ -1896,6 +1896,7 @@ _BLUEPRINT_FAILURE_CODES = {
     "buildstate_not_found": "TYPE_RESOLUTION_FAILED",
     "load_method_not_found": "TYPE_RESOLUTION_FAILED",
     "load_exception": "SPAWN_FAILED",
+    "unknown_part_names": "INVALID_PARAM",
 }
 
 
