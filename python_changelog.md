@@ -6,6 +6,37 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-29 — reference_audit.py (template compliance checker)
+
+- **New `python/reference_audit.py`.** Mechanically enforces the
+  `Preconditions` rule added to `docs/sfs_reference_plan.md` the same day:
+  every `#### ` method entry under a **FULL**-depth type must carry a
+  `- **Preconditions:**` bullet. An absent field looks identical to "not
+  checked yet", which is precisely the gap behind the `loadblueprint`
+  `World_PC`/`Build_PC` incident, so it is checked by a script rather than
+  by discipline.
+- Also reports FULL-depth types that document **no** method entries at all.
+  Not a failure — many types genuinely have none beyond a
+  compiler-generated constructor — but a FULL-depth type with no methods
+  written up is worth eyeballing.
+- Two modes, matching `reference_index.py`'s convention:
+
+  ```bash
+  python3 python/reference_audit.py            # full report
+  python3 python/reference_audit.py --check    # silent on pass, exit 1 on fail
+  ```
+
+- **First run found 166 of 216 FULL-depth method entries missing the
+  field** — every one of them in the 43 files produced by Phase 1 Step 1
+  (migration), which predates the rule. The four Step 2 files written on
+  2026-08-29 pass. Backfilling the migrated corpus is tracked in the
+  session handoff, not done here.
+- Skips the five standalone files (`INVENTORY.md`, `INDEX.md`,
+  `METHODOLOGY.md`, `REFLECTION_TOOLKIT.md`, `CORRECTIONS.md`), which
+  deliberately do not follow the per-class template.
+
+---
+
 ## 2026-08-29 — blueprints/ folder + sfsprobe_load_blueprint tool
 
 - **Created `blueprints/`** at the project root, split into `research/`

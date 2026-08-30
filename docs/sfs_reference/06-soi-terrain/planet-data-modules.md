@@ -56,6 +56,26 @@ The most-read data block in the game: planet radius and gravity. Reached as
   `../CORRECTIONS.md` that `Planet.mass` is μ, and
   [`Planet.md`](Planet.md).
 
+### Methods
+
+`BasicModule` declares no methods other than its constructor.
+
+#### .ctor()
+
+- **Access:** public instance
+- **Preconditions:** None beyond valid arguments — no scene, no singleton,
+  no loaded world.
+- **Behavior:** assigns the defaults tabulated above (`-1.0` sentinels for
+  `radius`, `gravity` and `timewarpHeight`; `NaN` for
+  `velocityArrowsHeight`; `true` for `significant` and `rotateCamera`) and
+  constructs both difficulty dictionaries non-null but empty.
+- **Gotcha (ordering, not a precondition of this call):** an instance built
+  this way has **not** been through `Difficulty.ScalePlanetData`. Assigning
+  one to `planet.data.basic` after planet load leaves `radius`, `gravity`
+  and `timewarpHeight` at authored scale while the rest of the world is
+  difficulty-scaled.
+- **Status:** CONFIRMED
+
 ### Who reads it
 
 | Field | Consumers |
@@ -106,6 +126,22 @@ Reached as `planet.data.orbit`.
   [`save-records.md`](../07-saveload/save-records.md)).
 - **`multiplierSOI` defaults to `1.0`, so SOI is always a computed quantity
   times this factor** — it is never authored directly.
+
+### Methods
+
+`OrbitModule` declares no methods other than its constructor.
+
+#### .ctor()
+
+- **Access:** public instance
+- **Preconditions:** None beyond valid arguments.
+- **Behavior:** sets `direction = 1` and `multiplierSOI = 1.0`, constructs
+  both difficulty dictionaries non-null but empty, and leaves `parent` null
+  and the three orbital elements at `0.0`.
+- **Gotcha (ordering):** `OrbitModule` is **read once**, in
+  `Planet.SetupInteractions`. Constructing or mutating one after planet load
+  changes nothing about the live solar system until the world reloads.
+- **Status:** CONFIRMED
 
 ### Who reads it
 
@@ -166,6 +202,23 @@ or `MapEnvironment.CreateTerrain`. **Status:** CONFIRMED (layout + defaults);
   `CreateWaterMaterial` and `Water_Rocket`'s wave-height helper. It is the
   one field here where a visual tweak is also a physics change. Note
   `Rocket.floating` means *in water* (see `../CORRECTIONS.md`).
+
+### Methods
+
+`WaterModule` declares no methods other than its constructor.
+
+#### .ctor()
+
+- **Access:** public instance
+- **Preconditions:** None beyond valid arguments.
+- **Behavior:** constructs both `WaterMask` instances non-null, and assigns
+  the rendering defaults listed above (`1.0f` for the three gradient width
+  multipliers, `0.75f` / `1.0f` / `0.95f` for the three opacities, `1200f`,
+  `500f` and `300f` for the three distance/depth values). The three fields
+  that matter to simulation — `lowerTerrain`, `oceanDepth`, `wavesSize` —
+  are **left at their zero defaults**, so a default-constructed
+  `WaterModule` describes a planet with no ocean basin and no waves.
+- **Status:** CONFIRMED
 
 ---
 

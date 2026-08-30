@@ -164,6 +164,18 @@ rather than silently dropping, since the standing decision was "no exclusions".
 Total candidate exclusion: ~26 types. Everything else — including all of
 `SFS.UI`, `SFS.Builds`, `SFS.UI.ModGUI` — is in scope.
 
+**CORRECTION (2026-08-29, Phase 1 Step 2).** The "~26" above counts only
+**top-level** vendored types. The SDWebImage port also contributes **7
+nested** types that this inventory counts as real: `SDAnimatedImage/State`,
+`/LoadingIndicatorType`, `/OnImageSizeReadyAction`, `/OnDecodingErrorAction`,
+`/OnLoadingErrorAction`, `SDWebImage/LoadingIndicatorType`,
+`/OnImageSizeReadyAction`, `/OnLoadingErrorAction`, and
+`SDWebImageDownloaderError/ErrorType`. **The real exclusion count is 33, and
+the in-scope total is 936, not 943.** `manifest.json` is corrected and
+`INDEX.md` is regenerated from it; the table above is left as originally
+written because it is the Step 0 artifact. Also logged in
+[`CORRECTIONS.md`](CORRECTIONS.md).
+
 ## Proposed category folders
 
 The brief's 18 folders were sized against the old doc's coverage, not against

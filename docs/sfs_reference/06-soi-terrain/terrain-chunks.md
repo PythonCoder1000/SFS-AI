@@ -53,6 +53,11 @@ range and hands it to the singleton `TerrainColliderManager`.
 #### Start() -> void
 
 - **Access:** private instance (Unity message)
+- **Preconditions:** World scene, and `player` and `loader` must both
+  already be assigned — they are public fields written by whatever creates
+  the component, and `Start` dereferences `player.location.position` and
+  `loader` with no null check. Unity invokes this once; never call it
+  manually, or the `UpdateChunks` subscription is added twice.
 - **Behavior:** Subscribes `UpdateChunks` to `player.location.position.OnChange`,
   and a `<Start>b__3_0(bool, bool)` thunk (which just calls `UpdateChunks`)
   to `loader.onLoadedChange_After`.
@@ -66,6 +71,13 @@ range and hands it to the singleton `TerrainColliderManager`.
 #### UpdateChunks() -> void
 
 - **Access:** private instance
+- **Preconditions:** World scene. `TerrainColliderManager.main` must be
+  populated — the method ends in an unconditional
+  `main.RemoveChunks`/`main.AddChunks` pair. `loader` and `player.location`
+  must be non-null, and `player.location.planet.Value` must be non-null on
+  every path that gets past the altitude test. No ordering requirement
+  relative to `Start` — the method is self-contained and `chunkIndexes` is
+  initialised in the constructor.
 - **Behavior:** the whole algorithm, in order:
   1. If **not** (`loader.Loaded` **and**
      `position.Mag_LessThan(planet.Radius + planet.maxTerrainHeight + player.GetSizeRadius())`)
@@ -105,6 +117,10 @@ range and hands it to the singleton `TerrainColliderManager`.
 #### Clear() -> void
 
 - **Access:** private instance
+- **Preconditions:** `TerrainColliderManager.main` must be populated **only
+  if** `chunkIndexes` is non-empty; the count check comes first, so on an
+  empty list this is safe to call with a null manager. `chunkIndexes` itself
+  is never null (constructor-initialised).
 - **Behavior:** If `chunkIndexes.Count == 0`, returns immediately.
   Otherwise `TerrainColliderManager.main.RemoveChunks(chunkIndexes, this)`
   then `chunkIndexes.Clear()`.
@@ -113,6 +129,10 @@ range and hands it to the singleton `TerrainColliderManager`.
 #### OnDestroy() -> void
 
 - **Access:** private instance (Unity message)
+- **Preconditions:** Same as `Clear()` — safe on an empty `chunkIndexes`
+  even with no live `TerrainColliderManager.main`. Unity invokes this; it is
+  the only thing that releases a destroyed craft's chunks, so a component
+  removed by any route that skips `OnDestroy` leaks them.
 - **Behavior:** calls `Clear()`. This is the only thing that releases a
   destroyed craft's collider chunks.
 - **Status:** CONFIRMED
@@ -145,12 +165,22 @@ by owning `TerrainColliderModule`, keyed by integer chunk index.
 #### Awake() -> void
 
 - **Access:** private instance
+- **Preconditions:** None beyond a valid instance. Unity invokes it. Note it
+  overwrites `main` unconditionally, so it must not run on a second instance
+  while the first is still in use.
 - **Behavior:** `main = this`. Nothing else. Last one loaded wins.
 - **Status:** CONFIRMED
 
 #### AddChunks(List&lt;int&gt; indexes, TerrainColliderModule owner) -> void
 
 - **Access:** public instance
+- **Preconditions:** World scene. `owner.player.location.planet.Value` must
+  be non-null and its `data.terrain` populated with **compiled samplers** —
+  the `Chunk` constructor calls `TerrainModule.GetTerrainPoints`, so
+  `TerrainModule.SetupSamplers` must already have succeeded for that planet.
+  `WorldView.main` must be non-null, because every new `Chunk` subscribes to
+  `WorldView.main.positionOffset.OnChange`. `hasColliders` must be assigned
+  (it is a public field, null on a `new`-constructed manager).
 - **Behavior:** For each index: if `chunks` does not already contain it,
   construct `new Chunk(chunkSize * index, chunkSize, planet, transform)`
   where `planet = owner.player.location.planet.Value` and
@@ -170,6 +200,10 @@ by owning `TerrainColliderModule`, keyed by integer chunk index.
 #### RemoveChunks(List&lt;int&gt; indexes, TerrainColliderModule owner) -> void
 
 - **Access:** public instance
+- **Preconditions:** `WorldView.main` must be non-null — `Chunk.Destroy()`
+  unsubscribes from `WorldView.main.positionOffset.OnChange`. `hasColliders`
+  must be assigned. No planet or sampler requirement: this path never builds
+  geometry.
 - **Behavior:** For each index: if `chunks` lacks it, `Debug.LogError("Couldn't remove chunk: " + index)` and continue. Otherwise remove `owner` from
   `chunks[index].owners`; if the owner list is now empty, call
   `chunks[index].Destroy()` and remove the dictionary entry.
@@ -183,6 +217,10 @@ by owning `TerrainColliderModule`, keyed by integer chunk index.
 - **Access:** **public static** — directly callable, no instance needed
 - **Returns:** the angular width of one collider chunk, in the same
   normalised `[0, 1)` = one full revolution units `UpdateChunks` uses.
+- **Preconditions:** **None beyond valid arguments — no instance, no scene,
+  no singleton.** This is the one method on this type safely callable
+  outside a loaded world. It needs only `planet.data.terrain` to be non-null
+  and `planet.GetMaxLOD()` to be callable.
 - **Behavior:**
   ```
   double s = planet.data.terrain.GetChunkSize_Angular(8, planet.GetMaxLOD());
@@ -221,6 +259,13 @@ One collider chunk: a `GameObject` named `"Collider"` carrying a single
 
 #### .ctor(float64 from, float64 size, Planet planet, Transform holder)
 
+- **Preconditions:** World scene. `WorldView.main` must be non-null — the
+  constructor unconditionally subscribes `Position` to
+  `WorldView.main.positionOffset` on its **last** statement, after the
+  geometry work, so a null there leaves a half-built chunk. `holder` must be
+  a live `Transform`. `planet.data` must be non-null. If `hasTerrain &&
+  terrain.collider`, `TerrainModule.SetupSamplers` must already have
+  succeeded for that planet.
 - **Behavior:** creates `new GameObject("Collider")`, parents it to `holder`
   with `worldPositionStays = false`, copies `holder`'s layer. Then, **only if
   `planet.data.hasTerrain && planet.data.terrain.collider`**:
@@ -239,11 +284,18 @@ One collider chunk: a `GameObject` named `"Collider"` carrying a single
 
 #### Position() -> void
 
+- **Preconditions:** `WorldView.main` must be non-null and `gameObject` must
+  not have been destroyed. Safe to call at any point between construction
+  and `Destroy()`.
 - **Behavior:** `gameObject.transform.position = WorldView.ToLocalPosition(position)`.
 - **Status:** CONFIRMED
 
 #### Destroy() -> void
 
+- **Preconditions:** `WorldView.main` must be non-null — it unsubscribes
+  from `WorldView.main.positionOffset.OnChange`. Calling it after
+  `WorldView.main` has been torn down leaks the subscription rather than
+  throwing, because the field read comes first.
 - **Behavior:** unsubscribes `Position` from `WorldView.main.positionOffset.OnChange`
   and destroys the `GameObject`.
 - **Status:** CONFIRMED
@@ -290,6 +342,15 @@ drag, or terrain-height queries.
 #### Create(Planet, Double3 position, Action&lt;DynamicChunk&gt; setupChunk, float32 verticeSizeMultiplier, float32 loadDistanceMultiplier, string layer, ValueTuple&lt;Material,Material&gt; material, bool useTerrainUV, Transform chunkPrefab, TerrainModule/RockData rockData, Transform rockPrefab) -> DynamicTerrain
 
 - **Access:** **public static** — the only construction path
+- **Preconditions:** A live Unity scene (it creates a `GameObject` and adds
+  a component). `planet.codeName` must be non-null and `planet.data.terrain`
+  must have **compiled samplers** — `Create` calls `Initialized`, which
+  immediately builds 8 chunks and then `LoadFully()`, so terrain sampling
+  happens synchronously inside this call. An unresolvable `layer` string
+  does **not** throw: `LayerMask.NameToLayer` returns `-1`. Whether the
+  visual `Chunk` constructor additionally requires `WorldView.main` is **not
+  established** — its body is `[OPEN]`; treat World scene as required until
+  confirmed.
 - **Behavior:** creates `new GameObject(planet.codeName + " Dynamic Terrain")`,
   `AddComponent<DynamicTerrain>()`, assigns every field, resolves `layer`
   through `LayerMask.NameToLayer`, then **divides `position.z` by 3** and calls
@@ -304,6 +365,13 @@ drag, or terrain-height queries.
 #### Initialized(Planet planet, Double3 position) -> void
 
 - **Access:** private instance
+- **Preconditions:** Every field on the owner must already be assigned —
+  `Create` sets all eleven before calling this, and `Initialized` reads
+  `planet`, `chunkPrefab`, `material`, `verticeSizeMultiplier` and `layer`
+  transitively through the chunk constructors. **Ordering requirement:** it
+  must run exactly once, after field assignment and before any other method
+  on the type; it is the only thing that populates `activeChunks`, which
+  `CalculateBest` requires to be non-empty.
 - **Behavior:** `position.z *= 0.5`; stores `planet` and `position`;
   sets `distanceMoved = 1.0`; constructs 8 root chunks
   `new DynamicChunk(this, null, i / 8.0, 0)` for `i` in `0..7`; calls `LoadFully()`.
@@ -312,6 +380,9 @@ drag, or terrain-height queries.
 #### LoadFully() -> void
 
 - **Access:** public instance
+- **Preconditions:** `Initialized` must have run — `LoadFully` reaches
+  `CalculateBest`, which indexes `activeChunks[0]` and throws on an empty
+  list. Not safe on a freshly `AddComponent`-ed instance.
 - **Behavior:** loops exactly **500** times; each iteration takes
   `GetBestSplit()` and, if `distanceMoved > chunk.updateSplit`, calls
   `TrySplit` then `CalculateBest()`.
@@ -324,6 +395,10 @@ drag, or terrain-height queries.
 #### Update() -> void
 
 - **Access:** private instance (Unity message)
+- **Preconditions:** Same as `LoadFully()` — `activeChunks` must be non-
+  empty. Unity invokes it, so in practice the requirement is that `Create`
+  completed; a `DynamicTerrain` component added without going through
+  `Create` will throw on its first frame.
 - **Behavior:** loops at most **20** times per frame. Each iteration:
   if `distanceMoved > GetBestSplit().updateSplit` → `TrySplit`, `CalculateBest`,
   continue; else if `distanceMoved > GetBestMerge().updateMerge` → `TryMerge`,
@@ -335,6 +410,9 @@ drag, or terrain-height queries.
 #### SetViewPosition(Double3 newPosition) -> void
 
 - **Access:** public instance
+- **Preconditions:** None beyond a valid instance. It touches only
+  `position` and `distanceMoved` and does not walk the chunk tree, so it is
+  safe before `Initialized`.
 - **Behavior:** `newPosition.z /= 3.0`;
   `distanceMoved += (position - newPosition).magnitude`; `position = newPosition`.
 - **Gotcha:** `distanceMoved` accumulates **path length**, not displacement.
@@ -346,6 +424,9 @@ drag, or terrain-height queries.
 #### SetLayer(string layer) -> void
 
 - **Access:** public instance
+- **Preconditions:** `activeChunks` must be non-null (constructor-
+  initialised, so this holds from allocation). An unknown layer name yields
+  `-1` rather than throwing.
 - **Behavior:** `this.layer = LayerMask.NameToLayer(layer)`, then
   `SetLayer(layer)` on every chunk in `activeChunks`.
 - **Gotcha:** only **active** chunks are updated. Chunks re-enabled later
@@ -356,6 +437,8 @@ drag, or terrain-height queries.
 #### GetBestSplit() -> DynamicChunk / GetBestMerge() -> DynamicChunk
 
 - **Access:** private instance
+- **Preconditions:** `activeChunks` must be non-empty — both may fall
+  through to `CalculateBest()`, which indexes `[0]`.
 - **Behavior:** returns the cached `bestSplit` / `bestMerge`, first calling
   `CalculateBest()` if the cache is null **or** the cached chunk's
   `chunk.terrainTransform` compares equal to `null` under
@@ -365,6 +448,11 @@ drag, or terrain-height queries.
 #### CalculateBest() -> void
 
 - **Access:** private instance
+- **Preconditions:** **`activeChunks` must be non-empty.** Both scans seed
+  from `activeChunks[0]` before looping, so an empty list throws
+  `ArgumentOutOfRangeException`. This is the strongest precondition in this
+  file, and it is satisfied in normal operation only because `Initialized`
+  creates 8 root chunks that can never merge away.
 - **Behavior:** `bestSplit` = the element of `activeChunks` with the smallest
   `updateSplit`, seeded from `activeChunks[0]`. `bestMerge` = likewise for
   `updateMerge`, but candidates must also satisfy `CanMerge()` — **again
@@ -380,6 +468,12 @@ drag, or terrain-height queries.
 
 #### OnDestroy() -> void
 
+- **Preconditions:** `allChunks` must be non-null (constructor-initialised).
+  **`RockSelector.main` must be non-null** — every `DestroyChunk()`
+  dereferences it. In a normal scene teardown the destruction order of
+  `RockSelector` versus the `DynamicTerrain` GameObject is not guaranteed by
+  anything read here, so this is a real ordering hazard, not a theoretical
+  one. [PARTIAL — teardown order not confirmed]
 - **Behavior:** `foreach (var c in allChunks.ToArray()) c.DestroyChunk();`
   The `ToArray()` copy is required because `DestroyChunk` mutates `allChunks`.
 - **Status:** CONFIRMED
@@ -417,6 +511,13 @@ or a disabled interior node whose two halves are visible.
 
 #### .ctor(DynamicTerrain owner, DynamicChunk parentChunk, float64 from, int32 LOD)
 
+- **Preconditions:** `owner` must be fully initialised — the constructor
+  reads `owner.planet`, `owner.chunkPrefab`, `owner.material`,
+  `owner.useTerrainUV`, `owner.verticeSizeMultiplier`, `owner.allChunks` and
+  (via `EnableChunk`) `owner.layer` and `owner.activeChunks`.
+  `owner.planet.data.terrain` must have compiled samplers.
+  **`RockSelector.main` must be non-null** — the constructor ends in
+  `EnableChunk()`, which dereferences it unconditionally.
 - **Behavior:** if `parentChunk == null`, `updateMerge = +∞`. Stores the four
   arguments. Then:
   ```
@@ -442,6 +543,10 @@ or a disabled interior node whose two halves are visible.
 - **Returns:** the LOD metric — distance from the view position to this
   chunk's arc, in metres, **minus** a proportional slice of the chunk's own
   half-size.
+- **Preconditions:** None beyond valid arguments. Pure math over
+  `topPosition`, `topSizeHalf` and `loader.position`; no singleton, no
+  scene. `loader` is expected to be this chunk's own `owner`, but nothing
+  enforces it.
 - **Behavior:**
   ```
   t = clamp(Math_Utility.GetClosestPointOnLine(Double2.zero, topPosition, (Double2)loader.position), 0, 1)
@@ -458,6 +563,10 @@ or a disabled interior node whose two halves are visible.
 #### TrySplit(DynamicTerrain loader) -> bool
 
 - **Access:** public instance
+- **Preconditions:** `owner.planet.data.terrain` must be non-null. If the
+  distance test passes it calls `Split`, which constructs two
+  `DynamicChunk`s — so on that path everything the `DynamicChunk`
+  constructor requires applies too, including `RockSelector.main`.
 - **Behavior:**
   ```
   d = GetDistanceToViewPosition(loader)
@@ -486,6 +595,11 @@ or a disabled interior node whose two halves are visible.
 #### TryMerge(DynamicTerrain loader) -> bool
 
 - **Access:** public instance
+- **Preconditions:** `parentChunk` must be non-null whenever `CanMerge()`
+  returns true. In practice this holds because `CanMerge()` is false for the
+  roots (they have no `otherHalf`), but **`CanMerge()` does not itself test
+  `parentChunk`** — a hand-constructed chunk with `otherHalf` set and
+  `parentChunk` null will NRE here.
 - **Behavior:**
   ```
   if (!CanMerge()) return false;
@@ -502,6 +616,8 @@ or a disabled interior node whose two halves are visible.
 
 #### CanMerge() -> bool
 
+- **Preconditions:** None beyond a valid instance. It null-checks everything
+  it dereferences.
 - **Behavior:** `otherHalf != null && otherHalf.chunk != null && otherHalf.chunk.terrainTransform.gameObject.activeSelf`.
 - **Consequence:** false for the 8 roots (no `otherHalf`), false for every
   second half (its `otherHalf` is never set), and false while the sibling is
@@ -512,6 +628,9 @@ or a disabled interior node whose two halves are visible.
 #### Split([out] DynamicChunk firstHalf, [out] DynamicChunk secondHalf) -> void
 
 - **Access:** public virtual
+- **Preconditions:** Everything the `DynamicChunk` constructor requires,
+  since it builds two — notably a fully-initialised `owner` and a non-null
+  `RockSelector.main`.
 - **Behavior:** `DisableChunk()`; then
   `firstHalf  = new DynamicChunk(owner, this, from, LOD + 1)` and
   `secondHalf = new DynamicChunk(owner, this, from + terrain.GetChunkSize_Angular(8, LOD + 1), LOD + 1)`;
@@ -522,11 +641,19 @@ or a disabled interior node whose two halves are visible.
 
 #### Merge() -> void
 
+- **Preconditions:** **`otherHalf` and `parentChunk` must both be non-null —
+  i.e. `CanMerge()` must be true.** `Merge` does not re-check; the guard
+  lives in `TryMerge`. Calling `Merge` directly on a root or on a second
+  half will NRE.
 - **Behavior:** `DestroyChunk(); otherHalf.DestroyChunk(); parentChunk.EnableChunk();`
 - **Status:** CONFIRMED
 
 #### EnableChunk() / DisableChunk() -> void
 
+- **Preconditions:** **`RockSelector.main` must be non-null** — both
+  dereference it unconditionally while walking `rocks`, even when `rocks` is
+  empty, because the field is read before the loop. `chunk.terrainTransform`
+  must not have been destroyed.
 - **Behavior:** add/remove `this` in `owner.activeChunks`, `SetActive(true/false)`
   on `chunk.terrainTransform.gameObject`, and add/remove every rock in `rocks`
   from `RockSelector.main.rockInstances`. `EnableChunk` also re-applies
@@ -536,6 +663,9 @@ or a disabled interior node whose two halves are visible.
 
 #### DestroyChunk() -> void
 
+- **Preconditions:** **`RockSelector.main` must be non-null.** `chunk` must
+  be non-null. Safe to call on a chunk that is not currently active — the
+  `activeChunks` removal is a no-op in that case.
 - **Behavior:** removes `this` from both `allChunks` and `activeChunks`;
   `Object.Destroy(chunk.terrainTransform.gameObject)`;
   `Object.DestroyImmediate` on `chunk.terrainMesh` **and** `chunk.waterMesh`;
@@ -546,6 +676,10 @@ or a disabled interior node whose two halves are visible.
 
 #### SetLayer(int32 layer) -> void
 
+- **Preconditions:** `chunk.terrainTransform` must be alive and
+  `owner.planet.data` must be non-null (the `hasWater` test). The water
+  branch beyond that test is `[OPEN]`; further preconditions may exist on
+  planets with water.
 - **Behavior:** sets the terrain object's layer; also handles the water
   transform when `planet.data.hasWater`.
 - **Status:** PARTIAL — water branch read only to the `hasWater` test.
@@ -577,6 +711,11 @@ its `PolygonCollider2D` points directly from `TerrainModule.GetTerrainPoints`.
 
 #### .ctor(Transform chunkPrefab, float64 from, float64 size, int32 pointCount, Planet planet, ValueTuple&lt;Material,Material&gt; material, bool useTerrainUV, Transform parent, bool offsetTerrain)
 
+- **Preconditions:** A live Unity scene; `chunkPrefab` must be non-null;
+  `planet.data.terrain` must have compiled samplers, since the body calls
+  `TerrainModule.GetTerrainPoints`. **Not fully established — the body is
+  `[OPEN]` (~590 lines of mesh construction) and may impose further
+  requirements. Flagged, not yet resolved.**
 - **Status:** **PARTIAL — body not read in full.** It is ~590 lines of IL
   (`@203721`–`@204310`) doing mesh construction: instantiating `chunkPrefab`,
   calling `TerrainModule.GetTerrainPoints`, and building the terrain and
@@ -586,11 +725,18 @@ its `PolygonCollider2D` points directly from `TerrainModule.GetTerrainPoints`.
 #### CreateMesh(Transform, Vector3[] points, int32[] indices, string sortingLayer, int32 sortingOrder, Material) -> Mesh
 
 - **Access:** private **static**
+- **Preconditions:** **Not established — body `[OPEN]`.** A live Unity scene
+  and a non-null `Material` are the minimum implied by the signature.
+  Flagged, not yet resolved.
 - **Status:** PARTIAL — signature confirmed, body not read (pure Unity mesh setup).
 
 #### GetIndices(int32 length) -> int32[]
 
 - **Access:** private instance
+- **Preconditions:** `length >= 2`. The method pre-sets `List.Capacity` to
+  `(length - 2) * 3`, which throws `ArgumentOutOfRangeException` for `length
+  < 2` before the loop is reached. No scene or singleton requirement
+  otherwise.
 - **Behavior:** builds a triangle fan from vertex 0:
   for `i` in `0 .. length-3`, emits `(0, i+2, i+1)`.
   Capacity is pre-set to `(length - 2) * 3`.
@@ -601,6 +747,9 @@ its `PolygonCollider2D` points directly from `TerrainModule.GetTerrainPoints`.
 #### GetAngleBetweenPoints(float64 size, int32 pointCount) -> float64
 
 - **Access:** **public static**
+- **Preconditions:** None beyond valid arguments — a public static with no
+  state. `pointCount != 1`, or the result is `∞` (a silent division by zero
+  in `double`, not an exception).
 - **Behavior:** `return size * π * 2.0 / (pointCount - 1);`
 - **Returns:** angular spacing in radians between adjacent vertices, where
   `size` is in normalised `[0, 1)` revolutions.
@@ -633,6 +782,8 @@ the visual and the collider paths — the one place the two systems meet.
 
 #### .ctor(int32 pointCount)
 
+- **Preconditions:** `pointCount >= 0`, or both array allocations throw
+  `OverflowException`. Nothing else — no scene, no singleton.
 - **Behavior:** allocates both arrays at `pointCount`. Nothing else.
 - **Status:** CONFIRMED
 

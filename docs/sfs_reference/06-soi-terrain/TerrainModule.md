@@ -53,6 +53,12 @@ Reached as `planet.data.terrain` (`SFS.WorldBase.PlanetData::terrain`).
 - **Access:** public instance
 - **Parameters:** `codeName` is used only in error messages; `log` receives
   compilation failures (see [`I_MsgLogger.md`](../13-challenges-logging/I_MsgLogger.md)).
+- **Preconditions:** **A loaded world.** The difficulty fallback chain reads
+  `SFS.Base.worldBase.settings.difficulty.difficulty`, so calling this
+  outside a loaded world NREs. **Ordering requirement: this must succeed
+  before any call to `GetTerrainPoints` or `GetMaxTerrainHeight` on the same
+  `TerrainModule`** — those dereference `terrainSampler`, which stays null
+  if compilation threw.
 - **Behavior:** resolves the terrain formula through a four-step fallback chain:
   1. `terrainFormulaDifficulties[Base.worldBase.settings.difficulty.difficulty]`
   2. else `terrainFormulaDifficulties[(DifficultyType)0]`
@@ -91,6 +97,13 @@ Reached as `planet.data.terrain` (`SFS.WorldBase.PlanetData::terrain`).
   - `forCollider` — changes the *end caps* only (see below).
 - **Returns:** a `TerrainPoints` whose `points` array has
   `pointCount + (forCollider ? 2 : 1)` entries.
+- **Preconditions:** `terrainSampler` and `textureSampler` must both be non-
+  null — i.e. `SetupSamplers` must already have completed **without**
+  throwing. `planet` must be non-null with `data` populated. `pointCount >=
+  1`. **No scene or singleton requirement**, including when `offset` is
+  true: `WorldView.GetOffset(Double2, double)` is a `public static` pure
+  function and does not touch `WorldView.main` (confirmed from its IL body,
+  `@199953`).
 - **Behavior:**
   ```
   from01   = (from_Angle_01 + 1.0) % 1.0;
@@ -152,6 +165,9 @@ Reached as `planet.data.terrain` (`SFS.WorldBase.PlanetData::terrain`).
 - **Access:** public instance
 - **Returns:** the maximum terrain height anywhere on the planet, sampled at
   1001 evenly spaced angles.
+- **Preconditions:** Same sampler requirement as `GetTerrainPoints` —
+  `SetupSamplers` must have succeeded. No scene or singleton requirement.
+  Note this is an expensive call: 1001 samples, allocating two arrays.
 - **Behavior:**
   ```
   double[] angles = new double[1001];
@@ -170,6 +186,8 @@ Reached as `planet.data.terrain` (`SFS.WorldBase.PlanetData::terrain`).
 
 #### GetVerticeSize(int32 LOD, int32 LOD_Max) -> float64
 
+- **Preconditions:** None beyond valid arguments. Reads only the
+  `verticeSize` field; no sampler, scene or singleton.
 - **Behavior:** `return Math.Pow(2.55, LOD_Max - LOD) * verticeSize;`
 - **Note:** the LOD ratio is **2.55**, not 2 — mesh resolution coarsens faster
   than the chunk subdivision (which is exactly 2 per level).
@@ -177,6 +195,9 @@ Reached as `planet.data.terrain` (`SFS.WorldBase.PlanetData::terrain`).
 
 #### GetLoadDistance(int32 LOD, int32 LOD_Max) -> float64
 
+- **Preconditions:** None beyond valid arguments. It reads no field at all —
+  both constants are inlined — so it is callable on a default-constructed
+  `TerrainModule`.
 - **Behavior:** `return Math.Pow(2.05, LOD_Max - LOD) * 250.0;`
 - **Note:** `250.0` is a hardcoded literal, not a field — the base load
   distance is not tunable per planet. Both `2.05` and `250.0` are inlined
@@ -185,6 +206,8 @@ Reached as `planet.data.terrain` (`SFS.WorldBase.PlanetData::terrain`).
 
 #### GetChunkSize_Angular(int32 baseChunkCount, int32 LOD) -> float64
 
+- **Preconditions:** None beyond valid arguments, plus `baseChunkCount != 0`
+  and `LOD < 31`. Reads no field.
 - **Behavior:** `return 1.0 / ((int)Math.Pow(2, LOD) * baseChunkCount);`
 - **Returns:** chunk width in normalised revolutions.
 - **Gotcha:** `Math.Pow(2, LOD)` is computed in `double` and then cast to
@@ -246,6 +269,16 @@ sites get level ground. Consumed by `SFS.World.TerrainSampler`, not by
 | `width` | `float64` | public | Angular half-width or full width — not disambiguated here. | PARTIAL |
 | `transition` | `float64` | public | Blend distance from flat zone back to formula terrain. | PARTIAL |
 
+### Methods
+
+#### .ctor()
+
+- **Access:** public instance
+- **Preconditions:** None beyond valid arguments.
+- **Behavior:** the compiler-generated default constructor; all four fields
+  are left at `0.0`.
+- **Status:** CONFIRMED
+
 No methods beyond `.ctor()`. **The semantics of `angle` / `width` /
 `transition` are decided entirely inside `SFS.World.TerrainSampler`,
 which is not yet documented.** [OPEN]
@@ -299,12 +332,17 @@ by the formula compiler.
 
 #### .ctor() / .ctor(float32[] points)
 
+- **Preconditions:** None beyond valid arguments. A null `points` argument
+  is stored as null and will NRE on the first `Evaluate`, not here.
 - **Behavior:** the field initialiser sets `points = new float[2] { 0f, 1f }`
   in **both** constructors; the array overload then overwrites it.
 - **Status:** CONFIRMED
 
 #### .ctor(UnityEngine.Texture2D image)
 
+- **Preconditions:** `image` must be non-null and **CPU-readable** —
+  `GetPixels32()` throws on a texture imported without Read/Write enabled.
+  `image.width >= 1`, or `points` is empty and every `Evaluate` then throws.
 - **Behavior:** `points = new float[image.width]`, then for each column
   `i` in `0 … width-1`:
   `points[points.Length - i - 1] = GetHeightAtX(i)`.
@@ -327,6 +365,10 @@ by the formula compiler.
 
 #### Evaluate(float32 a) -> float32
 
+- **Preconditions:** `points.Length >= 2` (a length of 1 makes the index `%`
+  a division by zero) and `a >= 0` (a negative argument yields a negative
+  index and throws `IndexOutOfRangeException`, because C#'s `%` keeps the
+  sign). No upper bound — the function wraps.
 - **Behavior:**
   ```
   a *= points.Length - 1;
@@ -345,6 +387,8 @@ by the formula compiler.
 
 #### EvaluateDoubleOut(float64 a) -> float64
 
+- **Preconditions:** Identical to `Evaluate`: `points.Length >= 2` and `a >=
+  0`. The `double` signature buys no extra safety and no extra precision.
 - **Behavior:** identical to `Evaluate`, but the input scaling and index are
   computed in `double` and the result is widened to `double` on return.
 - **Gotcha:** **this is not a double-precision evaluate.** `t` is narrowed to
@@ -355,6 +399,9 @@ by the formula compiler.
 
 #### EvaluateClamped(float32 a) -> float32
 
+- **Preconditions:** `points.Length >= 2`. **No constraint on `a`** — this
+  is the variant that is safe for arbitrary input, including negatives and
+  `NaN` (which returns the last sample).
 - **Behavior:**
   ```
   if (!(a < 1f)) return points[points.Length - 1];

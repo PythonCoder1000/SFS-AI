@@ -50,6 +50,12 @@ fails.
 #### .ctor()
 
 - **Access:** public instance
+- **Preconditions:** None beyond valid arguments — no scene, no singleton,
+  no world. **But there is an ordering consequence:** an instance built this
+  way has not been through `Difficulty.ScalePlanetData`, so assigning one to
+  `planet.data.atmospherePhysics` after planet load produces an unscaled
+  atmosphere that will not match the rest of the world. See the Reflection
+  notes below.
 - **Behavior:** assigns the nine defaults tabulated above. Note both
   dictionaries are constructed non-null, so a consumer can index them without
   a null check — but they are **empty**, so every lookup must still tolerate

@@ -18,10 +18,19 @@ works correctly, especially whenever SFS itself updates versions.
 **Full game coverage, including UI/Builds/ModGUI.** `SFS.UI`,
 `SFS.Builds`, and `SFS.UI.ModGUI` are in scope, same as everything else.
 
-**~26 vendored third-party types are excluded** (Firebase,
+**33 vendored third-party types are excluded** (Firebase,
 TranslucentImage, Unity IAP, the SDWebImage port, Steam/GPGS glue) --
 recorded with the reason, not silently dropped. These aren't SFS's own
 code and document nothing about game behavior.
+
+**Corrected 2026-08-29** — this read "~26" until Phase 1 Step 2, which
+counted only top-level types; the SDWebImage port contributes 7 nested
+ones as well. **In scope is 936, not 943.** Fixed here rather than only in
+`CORRECTIONS.md` because this file is the standing brief every session is
+told to read first, so a stale scope number here misleads by default —
+following the same in-place-correction precedent as `METHODOLOGY.md`'s
+provenance table. `manifest.json` is authoritative; the Step 0 artifact
+`INVENTORY.md` keeps its original figure under an inline CORRECTION block.
 
 ## Structure -- no monolithic file
 
