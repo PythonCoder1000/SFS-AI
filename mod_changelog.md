@@ -9,6 +9,30 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.40.0 — 2026-08-30 (later same day)
+
+- **New `script` command — conditional multi-step flight plans, checked
+  every physics tick, zero round-trip latency per step.** Syntax:
+  `script <cond1>:<cmd1>; <cond2>:<cmd2>; ...`, e.g.
+  `script h>=1000:setrot 5; h>=5000:setrot 10; h>=25000:setrot 70`.
+  Conditions are `<field><op><value>` (`>=`/`<=`/`==`/`!=`/`>`/`<`);
+  fields are the short telemetry names (`h`, `vv`, `t`, `m`, `v`, `rot`,
+  `angv`, `partCount`) with a fallback to `ResolvePath`'s existing
+  dot-path walker for anything else. Multiple commands per step via
+  `&&`. Every step's condition is checked independently, every tick, in
+  `FixedUpdate` right alongside `Sample()` — not sequential/ordered, so
+  out-of-order or simultaneous triggers are both handled correctly.
+  Built specifically to remove Claude's own polling round-trip (seconds
+  of real latency per checkpoint) from a scripted altitude-based flight
+  plan. No JSON parser — deliberately kept to this codebase's existing
+  plain-text comma/semicolon command style.
+- **New `scriptstatus`/`scriptclear` commands** for visibility (which
+  steps have fired) and control (abort a bad plan mid-flight).
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load.
+
+---
+
 ## v0.39.0 — 2026-08-30 (later same day)
 
 - **New `turn <value>` command.** Writes `arrowkeys.turnAxis` directly

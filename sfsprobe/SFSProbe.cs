@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.39.0";
+        public const string VersionString = "0.40.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (new 'turn' command: writes arrowkeys.turnAxis directly, the real rotation-model input -- NOTE this rocket has no TorqueModule so it only matters via gimbal while an engine fires; new 'setrot' command: instant orientation snap + angularVelocity zero, for clean flight-plan checkpoints; heatParts/difficulty/jointgraph from v0.38.0; AmbiguousMatchException fix from v0.37.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (new 'script' command: arms a whole conditional multi-step flight plan in one call -- 'script h>=1000:setrot 5; h>=5000:setrot 10; ...', checked every physics tick in FixedUpdate, zero round-trip latency per step; 'scriptstatus'/'scriptclear' for visibility/control; turn/setrot from v0.39.0; heatParts/difficulty/jointgraph from v0.38.0; AmbiguousMatchException fix from v0.37.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -136,6 +136,7 @@ namespace SFSProbe
             if (Probe.Telemetry) Probe.Sample();
             if (Probe.AutoStop) Probe.CheckAutoStop();
             if (Probe.Telemetry) Probe.CheckSeparation();
+            Probe.CheckScript();
         }
 
         void PollCommands()
@@ -322,6 +323,166 @@ namespace SFSProbe
                 lastRocketCount = count;
             }
             catch (Exception e) { ProbeMod.Log("separation check error: " + e.Message); }
+        }
+
+        // ---------- scripted flight plans (v0.40) ----------
+        //
+        // Removes Claude's own round-trip latency from a multi-checkpoint
+        // flight plan: instead of polling telemetry and sending each command
+        // individually (seconds of real-world latency and inconsistent
+        // timing per step), the WHOLE plan is armed in one 'script' command
+        // and checked every physics tick (60Hz) inside FixedUpdate, right
+        // alongside Sample()/CheckAutoStop(). Each step fires exactly once,
+        // the instant its condition is true.
+        //
+        // Syntax: "script <cond1>:<cmd1a> && <cmd1b>; <cond2>:<cmd2>; ..."
+        // Example: "script h>=1000:setrot 5; h>=5000:setrot 10; h>=25000:setrot 70"
+        // <cond> is "<field><op><value>" with op in {>=,<=,==,!=,>,<} (checked
+        // longest-first so ">=" isn't misread as ">"). <field> is one of the
+        // short telemetry names (h, vv, t, m, v, rot, angv, partCount) or any
+        // dot-path ResolvePath already understands (e.g. "rb2d.mass"), tried
+        // as a fallback. No JSON parser -- kept to this codebase's existing
+        // plain-text comma/semicolon command style on purpose.
+        //
+        // Deliberately NOT sequential/ordered: every step's condition is
+        // checked independently every tick, so out-of-order or simultaneous
+        // triggers are both handled correctly -- fine for a monotonically
+        // increasing field like altitude during ascent, and safe in general.
+        public class ScriptStep
+        {
+            public string Field;
+            public string Op;
+            public double Value;
+            public string[] Commands;
+            public bool Done;
+        }
+        public static List<ScriptStep> ScriptQueue = new List<ScriptStep>();
+
+        public static void CheckScript()
+        {
+            if (ScriptQueue.Count == 0) return;
+            try
+            {
+                object r = ActiveRocket();
+                if (r == null) return;
+                foreach (ScriptStep step in ScriptQueue)
+                {
+                    if (step.Done) continue;
+                    double val = GetScriptFieldValue(r, step.Field);
+                    if (double.IsNaN(val)) continue;
+                    if (!EvalOp(step.Op, val, step.Value)) continue;
+
+                    step.Done = true;
+                    ProbeMod.Log("[script] triggered: " + step.Field + step.Op + step.Value +
+                                 " (actual=" + val + ") -> " + string.Join(" && ", step.Commands));
+                    foreach (string cmd in step.Commands)
+                    {
+                        try { Command(cmd); }
+                        catch (Exception e) { ProbeMod.Log("[script] step command '" + cmd + "' threw: " + e.Message); }
+                    }
+                }
+            }
+            catch (Exception e) { ProbeMod.Log("[script] check error: " + e.Message); }
+        }
+
+        static int LoadScript(string spec)
+        {
+            ScriptQueue.Clear();
+            string[] stepsRaw = spec.Split(';');
+            int count = 0;
+            foreach (string raw in stepsRaw)
+            {
+                string s = raw.Trim();
+                if (s.Length == 0) continue;
+                int colonIdx = s.IndexOf(':');
+                if (colonIdx < 0) throw new Exception("step missing ':' separator: \"" + s + "\"");
+                string condPart = s.Substring(0, colonIdx).Trim();
+                string cmdPart = s.Substring(colonIdx + 1).Trim();
+
+                string field, op; double value;
+                if (!TryParseCondition(condPart, out field, out op, out value))
+                    throw new Exception("couldn't parse condition: \"" + condPart + "\"");
+
+                string[] commands = cmdPart.Split(new string[] { "&&" }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < commands.Length; i++) commands[i] = commands[i].Trim();
+                if (commands.Length == 0) throw new Exception("step has no command: \"" + s + "\"");
+
+                ScriptQueue.Add(new ScriptStep { Field = field, Op = op, Value = value, Commands = commands, Done = false });
+                count++;
+            }
+            return count;
+        }
+
+        static bool TryParseCondition(string cond, out string field, out string op, out double value)
+        {
+            field = null; op = null; value = 0;
+            // Longest-first so ">="/"<="/"=="/"!=" aren't misread as ">"/"<".
+            string[] ops = new string[] { ">=", "<=", "==", "!=", ">", "<" };
+            foreach (string o in ops)
+            {
+                int idx = cond.IndexOf(o, StringComparison.Ordinal);
+                if (idx > 0)
+                {
+                    field = cond.Substring(0, idx).Trim();
+                    op = o;
+                    string valStr = cond.Substring(idx + o.Length).Trim();
+                    return double.TryParse(valStr, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+                }
+            }
+            return false;
+        }
+
+        static bool EvalOp(string op, double a, double b)
+        {
+            switch (op)
+            {
+                case ">=": return a >= b;
+                case "<=": return a <= b;
+                case ">": return a > b;
+                case "<": return a < b;
+                case "==": return a == b;
+                case "!=": return a != b;
+                default: return false;
+            }
+        }
+
+        // Short telemetry-style field names (matching truth.jsonl's own
+        // naming) resolved directly for the common cases; anything else falls
+        // back to ResolvePath's dot-path walker (same mechanism scoped
+        // telemetry already uses), so "rb2d.mass" or "location.velocity.x"
+        // work too, no new resolution logic needed.
+        static double GetScriptFieldValue(object rocket, string field)
+        {
+            try
+            {
+                object loc = Unwrap(Get(rocket, "location"));
+                switch (field)
+                {
+                    case "h": return ToD(Get(loc, "Height"));
+                    case "vv": return ToD(Get(loc, "VerticalVelocity"));
+                    case "t": return ToD(Get(loc, "time"));
+                    case "m": return ToD(Get(Get(rocket, "rb2d"), "mass"));
+                    case "rot": return ToD(Get(Get(rocket, "rb2d"), "rotation"));
+                    case "angv": return ToD(Get(Get(rocket, "rb2d"), "angularVelocity"));
+                    case "v":
+                    {
+                        object velocity = GetWrapped(loc, "velocity");
+                        double vx = ToD(Get(velocity, "x"));
+                        double vy = ToD(Get(velocity, "y"));
+                        return Math.Sqrt(vx * vx + vy * vy);
+                    }
+                    case "partCount":
+                    {
+                        object holder = Get(rocket, "partHolder");
+                        object parts = Get(holder, "parts");
+                        var c = parts as System.Collections.ICollection;
+                        return c != null ? c.Count : -1;
+                    }
+                    default:
+                        return ToD(ResolvePath(rocket, field));
+                }
+            }
+            catch { return double.NaN; }
         }
 
         public static void OnScene(string n) { WroteWorld = false; DumpWorld("scene:" + n); }
@@ -1540,6 +1701,67 @@ namespace SFSProbe
                         break;
                     }
                     ProbeMod.Result("setrot " + deg + "deg" + (setrotOk ? " ok (angularVelocity zeroed)" : " PARTIAL (property not found)"));
+                    break;
+                }
+
+                case "script":
+                {
+                    // Arms a whole conditional flight plan in one call -- see the
+                    // "scripted flight plans" region below Command() for the full
+                    // syntax and design rationale. Path can't contain a space-2
+                    // split ambiguity here since ';'/'&&' are the real delimiters,
+                    // but the WHOLE rest of the line is the spec (commands inside
+                    // steps have their own spaces), so split into exactly 2 pieces
+                    // like loadblueprint/loadblueprintbuild do.
+                    string[] partsScript = line.Split(new char[] { ' ' }, 2);
+                    string specScript = partsScript.Length > 1 ? partsScript[1].Trim() : null;
+                    if (string.IsNullOrEmpty(specScript))
+                    {
+                        ProbeMod.Result("script: FAILED reason=no_spec");
+                        break;
+                    }
+                    try
+                    {
+                        int n = LoadScript(specScript);
+                        ProbeMod.Result("script: armed " + n + " step(s)");
+                    }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Result("script: FAILED reason=parse_error " + e.Message);
+                    }
+                    break;
+                }
+
+                case "scriptstatus":
+                {
+                    int pending = 0, done = 0;
+                    foreach (ScriptStep s in ScriptQueue) { if (s.Done) done++; else pending++; }
+                    var stsb = new StringBuilder();
+                    stsb.Append("{\"pending\":").Append(pending).Append(",\"done\":").Append(done);
+                    stsb.Append(",\"steps\":[");
+                    for (int i = 0; i < ScriptQueue.Count; i++)
+                    {
+                        ScriptStep s = ScriptQueue[i];
+                        if (i > 0) stsb.Append(",");
+                        stsb.Append("{\"field\":").Append(Q(s.Field)).Append(",\"op\":").Append(Q(s.Op));
+                        stsb.Append(",\"value\":").Append(Num(s.Value)).Append(",\"commands\":[");
+                        for (int j = 0; j < s.Commands.Length; j++)
+                        {
+                            if (j > 0) stsb.Append(",");
+                            stsb.Append(Q(s.Commands[j]));
+                        }
+                        stsb.Append("],\"done\":").Append(s.Done ? "true" : "false").Append("}");
+                    }
+                    stsb.Append("]}");
+                    ProbeMod.Result("scriptstatus: pending=" + pending + " done=" + done + " " + stsb.ToString());
+                    break;
+                }
+
+                case "scriptclear":
+                {
+                    int cleared = ScriptQueue.Count;
+                    ScriptQueue.Clear();
+                    ProbeMod.Result("scriptclear: cleared " + cleared + " step(s)");
                     break;
                 }
 
