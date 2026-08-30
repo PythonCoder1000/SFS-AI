@@ -159,6 +159,16 @@ against a genuine, hand-built, correctly-connected 4-part rocket
 (Engine Hawk / Fuel Tank / Capsule / Parachute) plus reference
 separators and side parachutes.
 
+**CORRECTION (2026-08-29):** `sfs_physics_reference.md` §1.3 and
+`sfs_source_reference.md` both currently state "Build-grid rounding:
+0.5-unit increments" as `[CONFIRMED]`. That's wrong — or at minimum,
+not the real mechanism. Confirmed via IL this same session: SFS's real
+part-connection system is `SFS.Builds.HoldGrid` + `MagnetModule`,
+geometric attachment-point matching, not coordinate-snap rounding. Not
+yet corrected in those two reference docs directly (out of scope for
+this session — that tree belongs to the parallel documentation pass);
+flagged here so whoever next touches that claim knows it's stale.
+
 - [x] **SFS's part-connection system is `SFS.Builds.HoldGrid` +
       `MagnetModule`, NOT a coordinate-snap grid.** Confirmed via IL:
       `MagnetModule.GetAllSnapOffsets`/`GetSnapPointsWorld`,
@@ -216,6 +226,17 @@ separators and side parachutes.
       indistinguishable in its output. `getparts`/`dumpblueprint`
       already use the correct field (`orientation.name`); apply the
       same fix to `getplacedmagnets` next time it's touched.
+- [ ] **`sfsprobe_build_stack_blueprint` (the MCP tool wrapping all of
+      the above) is built and compiles clean, but has NEVER BEEN RUN
+      end to end.** Every individual primitive it calls
+      (`loadblueprintbuild`, `getplacedmagnets`) is separately
+      confirmed working live; the orchestration itself (scout → read
+      real magnets → compute → load final → verify connectivity) is
+      not. First concrete next step: call it with a real part list
+      (e.g. `['Engine Hawk', 'Fuel Tank', 'Capsule']`) and check whether
+      the final loaded blueprint actually matches the confirmed manual
+      chaining math, and whether the post-load connectivity check
+      (`occupied` flags) reports clean.
 
 ## Design decisions owed — not blocked on research, pure decisions
 
