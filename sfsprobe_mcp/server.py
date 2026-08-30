@@ -47,6 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "python"))
 import sfs_telemetry as st  # noqa: E402
+import blueprint_builder as bpb  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -67,6 +68,7 @@ TRUTH_FILE = MOD_DIR / "truth.jsonl"
 INPUTS_FILE = MOD_DIR / "inputs.jsonl"
 DRAGAREA_JSON_FILE = MOD_DIR / "sfs_probe_dragarea.json"
 SNAPSHOT_JSON_FILE = MOD_DIR / "sfs_probe_flight.json"
+PLACED_MAGNETS_JSON_FILE = MOD_DIR / "sfs_probe_placed_magnets.json"
 ARCHIVE_DIR = MOD_DIR / "archive"
 FLIGHTS_LOG_FILE = _PROJECT_ROOT / "flights_log.jsonl"
 BLUEPRINTS_RESEARCH_DIR = _PROJECT_ROOT / "blueprints" / "research"
@@ -2062,6 +2064,182 @@ async def sfsprobe_load_blueprint(params: LoadBlueprintInput) -> str:
         "success": False, "path": str(blueprint_path), "target": params.target.value,
         "error_code": error_code, "failure_reason": reason,
         "error": response, "elapsed_seconds": round(elapsed, 3),
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# STAGE 13 -- magnet-based blueprint construction (build a stack from real
+# confirmed attachment-point data, not guessed positions)
+# ===========================================================================
+
+class BuildStackBlueprintInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    parts: List[str] = Field(
+        ..., min_length=1,
+        description="Real part names, bottom to top, e.g. ['Engine Hawk', "
+                     "'Fuel Tank', 'Capsule', 'Parachute']. Must match real "
+                     "PartsLoader.parts catalog names exactly (see "
+                     "sfsprobe_getparts, once wrapped). Surface-mount parts "
+                     "(confirmed: Parachute, Parachute Side, Side Separator -- "
+                     "no MagnetModule) are NOT supported yet and raise a clear "
+                     "error rather than silently guessing a position.",
+    )
+    name: str = Field(..., min_length=1, description="Blueprint name -- final result written to blueprints/research/<name>/.")
+    timeout_s: float = Field(default=10.0, ge=1.0, le=60.0)
+
+
+@mcp.tool(
+    name="sfsprobe_build_stack_blueprint",
+    annotations={
+        "title": "Build a vertically-stacked blueprint from real magnet-point data",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def sfsprobe_build_stack_blueprint(params: BuildStackBlueprintInput) -> str:
+    """Builds a correctly-connected vertical stack blueprint from a part
+    list, using REAL magnet-point (attachment-point) data confirmed
+    2026-08-29 -- not centerOfMass/height guessing, which was tried
+    first and produced a too-narrow tank and an overlapping parachute
+    (see mod_changelog.md v0.30-0.35, docs/high_level_checklist.md
+    "Blueprint construction").
+
+    Genuinely LIVE and two-phase, not a pure calculation -- REPLACES
+    whatever is currently in the Build_PC editor, twice:
+
+    1. SCOUT: places every part far apart (guaranteed non-overlapping)
+       so each becomes a real placed instance -- real magnet-point local
+       offsets can only be read from a placed part (a bare catalog
+       prefab returns null, confirmed empirically).
+    2. CORRECT: reads each part's real magnet points via
+       'getplacedmagnets', computes the exact stacked positions via the
+       confirmed magnet-chain formula (python/blueprint_builder.py),
+       writes the real blueprint to blueprints/research/<name>/, and
+       loads THAT as the final result.
+
+    After the final load, re-queries magnet points once more and checks
+    every expected connector's 'occupied' flag -- the game's own live
+    connectivity signal -- reporting any that aren't genuinely connected
+    rather than assuming success just because the load call succeeded.
+
+    LIMITATION, deliberately not silently wrong: any part with no
+    MagnetModule (confirmed for Parachute, Parachute Side, Side
+    Separator -- likely all "surface-mount" parts) raises a clear error
+    during the SCOUT phase (the CORRECT phase never runs in that case,
+    so the previous editor design isn't touched a second time) rather
+    than guessing a position for a part type this tool doesn't
+    understand yet.
+
+    Args:
+        params (BuildStackBlueprintInput): parts, name, timeout_s
+
+    Returns:
+        str: JSON with keys: success (bool), blueprint_path (the final
+        written file), positions (part name -> final y position),
+        connectivity_problems (list, empty if every checked connector
+        shows occupied=true), or error_code/error/failure_stage if
+        something failed (scout_build, scout_load, magnet_read,
+        position_compute, correct_load).
+    """
+    scout_folder = BLUEPRINTS_RESEARCH_DIR / f"_scout_{params.name}"
+    final_folder = BLUEPRINTS_RESEARCH_DIR / params.name
+
+    # Phase 1: scout placement -- far-apart, guaranteed non-overlapping,
+    # just to turn every requested part into a real placed instance.
+    try:
+        scout_bp = bpb.scout_blueprint(params.parts)
+    except ValueError as e:
+        return _error_for_exception(e, failure_stage="scout_build")
+
+    await asyncio.to_thread(bpb.write_blueprint, scout_bp, scout_folder)
+    scout_result = await sfsprobe_load_blueprint(LoadBlueprintInput(
+        path=str(scout_folder / "Blueprint.txt"), target=LoadBlueprintTarget.BUILD, timeout_s=params.timeout_s
+    ))
+    scout_result_d = json.loads(scout_result)
+    if not scout_result_d.get("success"):
+        scout_result_d["failure_stage"] = "scout_load"
+        return json.dumps(scout_result_d, indent=2)
+
+    # Phase 2: read REAL magnet points from the now-placed scout parts --
+    # only safe/possible now that they're placed instances, not bare
+    # catalog prefabs (confirmed empirically 2026-08-29).
+    try:
+        magnets_response, _ = await asyncio.to_thread(
+            send_command, "getplacedmagnets", params.timeout_s, DEFAULT_POLL_INTERVAL_S
+        )
+    except (ProbeTimeoutError, FileNotFoundError) as e:
+        return _error_for_exception(e, failure_stage="magnet_read")
+
+    if "getplacedmagnets: FAILED" in magnets_response:
+        return _error_response("SPAWN_FAILED", magnets_response, failure_stage="magnet_read")
+
+    try:
+        magnets_data = json.loads(PLACED_MAGNETS_JSON_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return _error_response("PARSE_ERROR", f"couldn't read placed-magnets file: {e}", failure_stage="magnet_read")
+
+    placed = magnets_data.get("placedParts", [])
+    if len(placed) < len(params.parts):
+        return _error_response(
+            "SPAWN_FAILED",
+            f"expected {len(params.parts)} placed parts after scout, found {len(placed)} -- "
+            "scout load may have partially failed",
+            failure_stage="magnet_read",
+        )
+    # Take the LAST len(parts) entries -- if anything else was already in
+    # the editor before this call started, scout's own parts were
+    # appended after it. Order within that tail is assumed to match
+    # placement order (matches every observation so far, not
+    # independently proven via IL -- flagged honestly, not asserted as
+    # certain).
+    scout_magnets = [p.get("magnetPoints") for p in placed[-len(params.parts):]]
+
+    # Phase 3: compute the real corrected stack from real local offsets.
+    try:
+        final_bp = bpb.build_stack_from_scout(params.parts, scout_magnets, center_the_stack=True)
+    except bpb.SurfaceMountPartError as e:
+        return _error_response(
+            "INVALID_PARAM", str(e), failure_stage="position_compute",
+            note="the scout blueprint is still loaded in the editor -- the "
+                 "CORRECT phase never ran, so nothing further was overwritten "
+                 "by this failure",
+        )
+
+    await asyncio.to_thread(bpb.write_blueprint, final_bp, final_folder)
+    final_result = await sfsprobe_load_blueprint(LoadBlueprintInput(
+        path=str(final_folder / "Blueprint.txt"), target=LoadBlueprintTarget.BUILD, timeout_s=params.timeout_s
+    ))
+    final_result_d = json.loads(final_result)
+    if not final_result_d.get("success"):
+        final_result_d["failure_stage"] = "correct_load"
+        return json.dumps(final_result_d, indent=2)
+
+    # Phase 4: verify REAL connectivity, not just that the load call
+    # succeeded -- occupied is the game's own live connectivity signal.
+    # Best-effort: verification failing doesn't undo the successful build.
+    connectivity_problems = []
+    try:
+        verify_response, _ = await asyncio.to_thread(
+            send_command, "getplacedmagnets", params.timeout_s, DEFAULT_POLL_INTERVAL_S
+        )
+        if "getplacedmagnets: " in verify_response and "FAILED" not in verify_response:
+            verify_data = json.loads(PLACED_MAGNETS_JSON_FILE.read_text())
+            verify_placed = verify_data.get("placedParts", [])
+            verify_magnets = [p.get("magnetPoints") for p in verify_placed[-len(params.parts):]]
+            connectivity_problems = bpb.check_connectivity(params.parts, verify_magnets)
+    except (ProbeTimeoutError, FileNotFoundError, OSError, json.JSONDecodeError):
+        pass
+
+    positions = {p["n"]: p["p"]["y"] for p in final_bp["parts"]}
+    return json.dumps({
+        "success": True,
+        "blueprint_path": str(final_folder / "Blueprint.txt"),
+        "positions": positions,
+        "connectivity_problems": connectivity_problems,
     }, indent=2)
 
 

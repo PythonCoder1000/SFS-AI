@@ -6,6 +6,48 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-29 (later same day) — blueprint_builder.py + sfsprobe_build_stack_blueprint
+
+- **Added `python/blueprint_builder.py`** — builds SFS blueprints from a
+  part list using REAL, empirically-confirmed magnet-point data instead
+  of guessed positions. Confirmed 2026-08-29 against a real hand-built,
+  connected 4-part rocket (see `docs/high_level_checklist.md`,
+  "Blueprint construction"): SFS's part-connection system is
+  `SFS.Builds.HoldGrid` + `MagnetModule`, not a coordinate-snap grid. A
+  part's own position ("pivot") is NOT its geometric center —
+  `MagnetModule.points` are local offsets FROM that pivot. The
+  magnet-chain formula (`next_pivot = prev_pivot + prev_exit_offset -
+  next_entry_offset`) is exact against real data, not derived from the
+  centerOfMass/height heuristics tried first (which produced a
+  too-narrow tank and an overlapping parachute).
+
+  Pure, testable functions, no game interaction: `scout_blueprint`
+  (rough far-apart placement, just to turn parts into placed instances
+  so their real magnet points become readable), `build_stack_from_scout`
+  (the actual chaining math + centering — also the fix for the
+  "blueprints end up off to the side" bug), `write_blueprint`,
+  `check_connectivity` (uses the game's own live `occupied` flag rather
+  than reimplementing collision geometry). Sanity-tested directly
+  against today's real confirmed numbers — relative spacing matched
+  exactly.
+
+  **Explicit, deliberate limitation:** parts with no `MagnetModule`
+  (`magnetPoints: null`, confirmed for `Parachute`, `Parachute Side`,
+  `Side Separator` — likely all "surface-mount" parts) raise
+  `SurfaceMountPartError` rather than silently guessing a position. Real
+  geometry/edge-matching (`HoldGrid.CollectSurfaceSnaps`) is a separate,
+  harder, deliberately-deferred problem — see the checklist.
+
+- **Added `sfsprobe_build_stack_blueprint`** to `sfsprobe_mcp` — the live
+  orchestration on top of the pure module: scout-place → read real
+  magnet points via the mod's `getplacedmagnets` (v0.35.5) → compute the
+  correct stack → write and load the final blueprint → re-verify real
+  connectivity via the `occupied` flag rather than assuming success from
+  a successful load call alone. Compiles and imports clean. **Not yet
+  live-tested end to end** — the underlying primitives
+  (`loadblueprintbuild`, `getplacedmagnets`) are each individually
+  confirmed working; this specific new orchestration hasn't been run.
+
 ## 2026-08-29 — reference_audit.py (template compliance checker)
 
 - **New `python/reference_audit.py`.** Mechanically enforces the

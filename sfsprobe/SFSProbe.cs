@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.35.4";
+        public const string VersionString = "0.35.5";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (Step 1.5 audit fixes: cheat now uses SandboxSettings.main not FindObjectsOfTypeAll[0] -- was silently succeeding while changing nothing -- plus a world-loaded gate; loadblueprintbuild now pre-validates part names against the real catalog before BuildState.Clear() can destroy the current design; getparts/MagnetModule as in v0.35.3; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (new getplacedmagnets command: reads REAL MagnetModule.points from ACTUALLY PLACED parts, not the bare catalog -- getparts came back null for magnet data on all 3 tested catalog parts, so this tests placed instances instead; Step 1.5 audit fixes as in v0.35.4; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1074,6 +1074,66 @@ namespace SFSProbe
                     }
 
                     ProbeMod.Result("loadblueprintbuild: OK path=" + pathBuild);
+                    break;
+                }
+
+                case "getplacedmagnets":
+                {
+                    // Reads REAL MagnetModule.points from the ACTUALLY PLACED
+                    // parts currently in the editor (BuildState.buildGrid.
+                    // activeGrid.partsHolder.parts -- the same live List<Part>
+                    // GetBlueprint() itself reads from), not the bare catalog
+                    // prefabs 'getparts' checks. Built 2026-08-29 after 'getparts'
+                    // came back null for magnet data on all three tested catalog
+                    // parts (Capsule/Fuel Tank/Engine Hawk) -- same class of gap
+                    // as surfaceGeometry needing an actual placed instance, not a
+                    // bare prefab, though unlike that case this doesn't need
+                    // InitializePart() at all (Point.position is a plain field).
+                    //
+                    // Requires Build_PC with at least one part already placed.
+                    Type buildStateTypeM = FindType("SFS.Builds.BuildState");
+                    if (buildStateTypeM == null)
+                    {
+                        ProbeMod.Result("getplacedmagnets: FAILED reason=type_resolution");
+                        break;
+                    }
+                    object buildStateMainM = Get(buildStateTypeM, "main");
+                    if (buildStateMainM == null)
+                    {
+                        ProbeMod.Result("getplacedmagnets: FAILED reason=no_buildstate_main");
+                        break;
+                    }
+                    object buildGrid = Get(buildStateMainM, "buildGrid");
+                    object activeGrid = Get(buildGrid, "activeGrid");
+                    object partsHolder = Get(activeGrid, "partsHolder");
+                    object placedParts = Get(partsHolder, "parts");
+                    var placedEn = placedParts as System.Collections.IEnumerable;
+                    if (placedEn == null)
+                    {
+                        ProbeMod.Result("getplacedmagnets: FAILED reason=no_placed_parts");
+                        break;
+                    }
+
+                    var placedItems = new List<string>();
+                    int placedCount = 0;
+                    foreach (object part in placedEn)
+                    {
+                        if (part == null) continue;
+                        placedCount++;
+                        string pname = "?";
+                        try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+                        var psb = new StringBuilder();
+                        psb.Append("{\"part\":").Append(Q(pname));
+                        psb.Append(",\"magnetPoints\":").Append(DumpMagnetPoints(part));
+                        psb.Append("}");
+                        placedItems.Add(psb.ToString());
+                    }
+
+                    var pOutSb = new StringBuilder();
+                    pOutSb.Append("{\"placedParts\":[").Append(string.Join(",", placedItems.ToArray()));
+                    pOutSb.Append("],\"total\":").Append(placedCount).Append("}");
+                    Write("sfs_probe_placed_magnets.json", pOutSb, "getplacedmagnets total=" + placedCount);
+                    ProbeMod.Result("getplacedmagnets: " + placedCount + " placed parts -> sfs_probe_placed_magnets.json");
                     break;
                 }
 

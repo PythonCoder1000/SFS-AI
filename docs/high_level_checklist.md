@@ -122,6 +122,71 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       getter (see above) -- worth the same treatment when this is picked
       up, not just the temperature-source fix alone.
 
+## Blueprint construction — magnet-based stacking confirmed, surface-mount deferred
+
+**Real findings, 2026-08-29**, from live IL research + hands-on testing
+against a genuine, hand-built, correctly-connected 4-part rocket
+(Engine Hawk / Fuel Tank / Capsule / Parachute) plus reference
+separators and side parachutes.
+
+- [x] **SFS's part-connection system is `SFS.Builds.HoldGrid` +
+      `MagnetModule`, NOT a coordinate-snap grid.** Confirmed via IL:
+      `MagnetModule.GetAllSnapOffsets`/`GetSnapPointsWorld`,
+      `HoldGrid.CollectSurfaceSnaps`/`CollectInterstageSnaps`. A part's
+      own position ("pivot") in a blueprint is NOT its geometric center
+      — `MagnetModule.points` are local-space offsets FROM that pivot,
+      and for a part like `Fuel Tank` the pivot sits at its bottom
+      connector, not its middle. This is why hand-picked positions in a
+      raw blueprint can land a part somewhere a human dragging with the
+      mouse never could — direct injection bypasses the snap step
+      entirely.
+- [x] **Magnet-chain stacking formula confirmed with real numbers, not
+      guessed.** For any part with a `MagnetModule`: next part's pivot
+      = previous part's pivot + previous part's local offset to its
+      "next" connector − next part's local offset to its "entry"
+      connector. Verified exactly against a real connected rocket’s
+      `dumpblueprint` output (Engine Hawk y=−3.0, Fuel Tank y=−3.0
+      [pivot = bottom connector], Fuel Tank top connector at
+      −3.0+4.0=1.0, Capsule y=1.0 — exact match). Also confirmed:
+      `Fuel Tank`'s `height` parametric variable (`N.height`) maps
+      1:1 to real magnet-to-magnet world-space spacing — no hidden
+      scale factor.
+- [x] **A genuinely distinct "surface-mount" attachment category
+      exists, confirmed across 3 part types.** `Parachute`,
+      `Parachute Side`, and `Side Separator` ALL return `magnetPoints:
+      null` (no `MagnetModule` at all) — not a `Parachute`-specific
+      quirk. Real placed positions for these don't follow the magnet-
+      chain formula (e.g. `Parachute` landed 2.0 units above the
+      `Capsule` it was attached to, with no connector data to explain
+      why). Most likely mechanism: `HoldGrid.CollectSurfaceSnaps`,
+      which matches actual geometric edges (`Line2`/`ProcessSurfaceSnap`)
+      rather than discrete points — genuinely harder to solve, needs
+      real part geometry (`surfacesFast`), which is itself gated behind
+      `Part.InitializePart()` (safe on placed instances only, per the
+      existing geometry-capture gotcha).
+- [ ] **Surface-mount positioning formula — NOT solved, deliberately
+      deferred.** Real separator positions from the reference build
+      (`x=11/8.5, y=0.5/-2.5` around a tank centered at x=10) don't fit
+      a simple offset rule from the data gathered so far. Needs either
+      (a) real geometry data from placed instances (`surfacesFast` via
+      `InitializePart()`, same pattern already proven safe for placed
+      parts elsewhere in this project), or (b) calling the game's own
+      `HoldGrid.CollectSurfaceSnaps`/`ProcessSurfaceSnap` directly via
+      reflection rather than reimplementing edge-matching in Python.
+      Scoped out of the v1 magnet-based stacking tool (see
+      `python/blueprint_builder.py`) — v1 covers stack/structural parts
+      (tanks, capsules, engines, adapters) correctly; surface-mount
+      parts (parachutes, separators, RCS, solar panels) are a known,
+      documented v2 gap, not silently wrong.
+- [ ] **Minor, low-priority tooling bug (not yet fixed):**
+      `sfsprobe`'s `getplacedmagnets` command reads part names via
+      `displayName.TranslatableName`, which returns a shared
+      localization KEY (e.g. `"Parachute_Name"`) rather than the
+      distinct catalog name — `Parachute` and `Parachute Side` are
+      indistinguishable in its output. `getparts`/`dumpblueprint`
+      already use the correct field (`orientation.name`); apply the
+      same fix to `getplacedmagnets` next time it's touched.
+
 ## Design decisions owed — not blocked on research, pure decisions
 
 - [ ] **Divergence threshold** — what numerically triggers the observer/gate.
