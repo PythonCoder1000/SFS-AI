@@ -254,6 +254,99 @@ All `protected`, so reflection **must** include `BindingFlags.NonPublic`.
   segments share both `x` and `y`, and the handling of surfaces belonging
   to different `owner` parts at the same `x`, were not fully traced.
 
+#### FixedUpdate_Reentry_And_Heating(float temperature, List&lt;Surface&gt; exposedSurfaces, float velocityAngleRad, Matrix2x2 localToWorld, out bool drewReentryMesh) -> void
+
+**[CONFIRMED 2026-08-30]** — full body read, resolving the exact question
+of what `HeatManager.ApplyHeat` actually receives.
+
+- **Access:** private instance · IL @216155, full body read (332 bytes)
+- **Behavior:**
+  ```csharp
+  if (temperature <= 0f) return;
+
+  // burn-mark visuals (Aero_Rocket only, gated on !noBurnMarks) -- skipped
+
+  exposedSurfaces = AeroModule.RemoveHighSlopeSurfaces(exposedSurfaces, 5f);
+  AeroModule.ApplyProtectionZone(exposedSurfaces);
+
+  heatManager.ApplyHeat(exposedSurfaces, temperature, frameIndex);
+
+  // reentry glow mesh visuals (reentryEdge/reentryOuter) -- skipped
+  ```
+- **The critical finding:** `temperature` is passed to `ApplyHeat`
+  **completely unmodified** (`ldarg.1`, straight through, IL_0052) — no
+  scaling, no offset. The raw `AeroFormula.GetTemperature()` output IS
+  what the accumulator sees. **But `exposedSurfaces` is NOT the raw
+  drag-path list** — it is filtered through two heating-only functions
+  first, and this filtering is what a heat-accumulation reimplementation
+  must reproduce (see below). Confirms and closes the `[OPEN]` status
+  this method previously had.
+- **Everything else in this method is visual** (burn marks, reentry glow
+  meshes) and irrelevant to the physics.
+- **Status:** [CONFIRMED]
+
+#### RemoveHighSlopeSurfaces(List&lt;Surface&gt; surfaces, float maxSlope) -> List&lt;Surface&gt;
+
+**[CONFIRMED 2026-08-30]** — full body read, including the closure
+predicate.
+
+- **Access:** private static · IL @217196
+- **Behavior:** `surfaces.Where(predicate).ToList()`, predicate:
+  ```csharp
+  float slope = Mathf.Abs(surface.line.SizeY() / surface.line.SizeX());
+  if (slope >= maxSlope) return false;
+  return surface.line.SizeX() > 0.1f;
+  ```
+- **Called with `maxSlope = 5f`** from `FixedUpdate_Reentry_And_Heating`.
+  Keeps only segments with `|dy/dx| < 5.0` **and** `dx > 0.1` — **10x
+  stricter than the drag path's `dx > 0.01` cull** in
+  `CalculateDragForce`
+  ([`AeroModule.md`](AeroModule.md) above), and it additionally excludes
+  steep (near-vertical) segments that the drag path keeps. A segment
+  drag counts as exposed can therefore be entirely absent from the heat
+  tally.
+- **Status:** [CONFIRMED]
+
+#### ApplyProtectionZone(List&lt;Surface&gt; surfaces) -> void
+
+**[CONFIRMED 2026-08-30]** — full body read (473 bytes). A real
+geometric shadow-occlusion pass, mutating `surfaces` in place.
+
+- **Access:** private static · IL @217219
+- **Behavior, per adjacent pair in the (already x-sorted) list:**
+  ```
+  for i in 1 .. count-1:
+      gapBack = surfaces[i].start.y - surfaces[i-1].end.y
+      if gapBack > 0.1f:
+          thresholdX = surfaces[i].start.x - min(gapBack * 0.2f, 0.4f)
+          # walk BACKWARD from j = i-1:
+          #   if surfaces[j].start.x > thresholdX: remove it entirely (fully shadowed)
+          #   else: clip surfaces[j].end to x = thresholdX, then stop
+
+      gapFwd = surfaces[i].end.y - surfaces[i+1].start.y
+      if gapFwd > 0.1f:
+          thresholdX = surfaces[i].end.x + min(gapFwd * 0.2f, 0.4f)
+          # walk FORWARD from j = i+1, same remove-or-clip-and-stop logic
+
+  # final cleanup pass: remove any remaining segment with SizeX() < 0.1f
+  ```
+- **Physical meaning:** wherever the outline has a vertical step
+  (`>0.1` unit y-discontinuity between adjacent segments), nearby
+  surface is shielded from airflow within a protection zone up to `0.4`
+  units wide (scaling with step size below that cap) — a protruding
+  part shadows recessed geometry behind it. Segments fully inside the
+  zone are removed; segments straddling the boundary are clipped, not
+  removed outright.
+- **Status:** [CONFIRMED]
+
+**Practical consequence for any Python/probe reimplementation:** do not
+reimplement this geometry independently — both functions are `private
+static` and directly reachable via reflection
+(`BindingFlags.NonPublic | BindingFlags.Static`), so calling the game's
+own real implementation is both simpler and safer than re-deriving the
+shadow-occlusion math. `sfsprobe`'s `heatParts` telemetry field does
+exactly this as of v0.41.0.
+
 #### Neighbouring methods
 
 **[PARTIAL]** — signatures confirmed; bodies not read except where noted.
@@ -393,6 +486,9 @@ case "dragarea":
 | Parachute drag bypasses the 0.2 damping | [CONFIRMED] — newly documented |
 | `GetExposedSurfaces` sweep structure, eps `0.001f` | [PARTIAL] |
 | `GetExposedSurfaces` tie-breaking | [OPEN] |
-| Neighbouring method bodies (`GetTemperatureAndShockwave`, `Sort`, `RotateSurfaces`, `GetIntensity`, `GetHeatTolerance`, `RemoveHighSlopeSurfaces`, `ApplyProtectionZone`, `FixedUpdate_Reentry_And_Heating`) | [OPEN] |
+| `FixedUpdate_Reentry_And_Heating` full body | [CONFIRMED] — `temperature` passed to `ApplyHeat` unmodified; `exposedSurfaces` filtered first |
+| `RemoveHighSlopeSurfaces` full body | [CONFIRMED] — `\|dy/dx\|<5.0` and `dx>0.1`, stricter than drag's `dx>0.01` |
+| `ApplyProtectionZone` full body | [CONFIRMED] — geometric shadow-occlusion, `>0.1` y-step triggers a `≤0.4`-wide protection zone |
+| Neighbouring method bodies (`GetTemperatureAndShockwave`, `Sort`, `RotateSurfaces`, `GetIntensity`, `GetHeatTolerance`) | [OPEN] |
 | The probe `dragarea` command | [UNTESTED-LIVE] — applied in v0.27.0, built, not yet run live |
 | `Aero_Astronaut`, `Water_Rocket` | [OPEN] — Step 2 |

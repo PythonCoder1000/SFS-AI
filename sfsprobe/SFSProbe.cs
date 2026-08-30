@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.40.0";
+        public const string VersionString = "0.41.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (new 'script' command: arms a whole conditional multi-step flight plan in one call -- 'script h>=1000:setrot 5; h>=5000:setrot 10; ...', checked every physics tick in FixedUpdate, zero round-trip latency per step; 'scriptstatus'/'scriptclear' for visibility/control; turn/setrot from v0.39.0; heatParts/difficulty/jointgraph from v0.38.0; AmbiguousMatchException fix from v0.37.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (ROOT-CAUSED the ~50% heat overprediction: heatParts' ExposedSurface tally now filters through the REAL RemoveHighSlopeSurfaces+ApplyProtectionZone (called via reflection, not reimplemented) before summing per-owner width -- confirmed via real IL read that HeatManager.ApplyHeat NEVER sees the raw drag-path exposed list, only this filtered one; script/setrot/turn from v0.39-0.40; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -2866,6 +2866,45 @@ namespace SFSProbe
                             {
                                 object exposedSurfaces = InvokeStatic(aeroModuleType, "GetExposedSurfaces",
                                     new Type[] { allSurfaces.GetType() }, new object[] { allSurfaces });
+
+                                // CONFIRMED via real IL 2026-08-30 (root-caused the ~50%
+                                // uniform overprediction in the first per-part heat
+                                // validation): the drag-path exposed list is NOT what
+                                // HeatManager.ApplyHeat actually sees. AeroModule
+                                // .FixedUpdate_Reentry_And_Heating filters it through TWO
+                                // heating-only functions BEFORE tallying ExposedSurface:
+                                //   RemoveHighSlopeSurfaces(list, 5.0f) -- keeps only
+                                //     |dy/dx|<5.0 AND dx>0.1 (10x stricter than drag's
+                                //     dx>0.01 cull, and excludes steep segments drag keeps).
+                                //   ApplyProtectionZone(list) -- a real geometric shadow-
+                                //     occlusion pass: wherever the outline has a >0.1-unit
+                                //     y-step, nearby segments within a min(gap*0.2,0.4)-wide
+                                //     zone are removed or clipped, modeling a protruding
+                                //     part shielding recessed geometry from airflow.
+                                // Calling the REAL private static methods via reflection
+                                // rather than reimplementing this geometry -- especially
+                                // ApplyProtectionZone -- risks a new bug; the game's own
+                                // code is ground truth by construction.
+                                if (exposedSurfaces != null)
+                                {
+                                    MethodInfo removeHighSlope = aeroModuleType.GetMethod("RemoveHighSlopeSurfaces",
+                                        BindingFlags.NonPublic | BindingFlags.Static, null,
+                                        new Type[] { exposedSurfaces.GetType(), typeof(float) }, null);
+                                    if (removeHighSlope != null)
+                                    {
+                                        try { exposedSurfaces = removeHighSlope.Invoke(null, new object[] { exposedSurfaces, 5.0f }); }
+                                        catch (Exception e) { ProbeMod.Log("[heat-parts] RemoveHighSlopeSurfaces threw: " + e.Message); }
+                                    }
+                                    MethodInfo applyProtectionZone = aeroModuleType.GetMethod("ApplyProtectionZone",
+                                        BindingFlags.NonPublic | BindingFlags.Static, null,
+                                        new Type[] { exposedSurfaces.GetType() }, null);
+                                    if (applyProtectionZone != null)
+                                    {
+                                        try { applyProtectionZone.Invoke(null, new object[] { exposedSurfaces }); }
+                                        catch (Exception e) { ProbeMod.Log("[heat-parts] ApplyProtectionZone threw: " + e.Message); }
+                                    }
+                                }
+
                                 var sEn = exposedSurfaces as System.Collections.IEnumerable;
                                 if (sEn != null)
                                 {

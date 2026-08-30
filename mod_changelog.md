@@ -9,6 +9,38 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.41.0 — 2026-08-30 (later same day)
+
+**Root-caused the ~50% heat overprediction from the per-part validation—
+by reading the actual IL, not guessing.** `scratch/full_il.txt` (the
+project's own decompiled-assembly dump) was on disk the whole time;
+directly confirmed `AeroModule.FixedUpdate_Reentry_And_Heating`,
+`RemoveHighSlopeSurfaces`, and `ApplyProtectionZone`'s real bodies.
+
+- **Finding:** `HeatManager.ApplyHeat` never sees the raw drag-path
+  exposed-surfaces list. It's filtered through two heating-only
+  functions first: `RemoveHighSlopeSurfaces(list, 5.0)` (keeps only
+  `\|dy/dx\|<5.0` and `dx>0.1` — 10x stricter than drag's `dx>0.01`
+  cull) and `ApplyProtectionZone(list)` (a real geometric
+  shadow-occlusion pass — a `>0.1`-unit y-step in the outline shields
+  nearby segments within a `≤0.4`-wide zone, modeling a protruding part
+  shadowing recessed geometry). `heatParts`' `ExposedSurface` tally had
+  been using the unfiltered list this whole time, systematically
+  inflating the `surfaceFactor` term and over-absorbing heat.
+- **`temperature` itself was ruled out** — confirmed passed to
+  `ApplyHeat` completely unmodified, no scaling or offset. The air-temp
+  formula was never the problem.
+- **Fixed:** `heatParts` now calls the REAL `RemoveHighSlopeSurfaces`
+  and `ApplyProtectionZone` via reflection (both `private static`,
+  directly reachable) before tallying per-owner `ExposedSurface`,
+  instead of reimplementing this geometry independently —
+  `ApplyProtectionZone` especially is involved enough that a
+  reimplementation risked a new bug.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load. Next real flight should show the ~50% overprediction closed.
+
+---
+
 ## v0.40.0 — 2026-08-30 (later same day)
 
 - **New `script` command — conditional multi-step flight plans, checked
