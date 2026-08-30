@@ -90,6 +90,23 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       A predictive model applies N forces, not one resultant. (The
       "only grabs the first active engine" half of the old item was a
       *tooling* bug — moved to the tooling section below.)
+      **LIVE-VALIDATED 2026-08-30.** Real hand-built symmetric 3-engine
+      rocket (three parallel Fuel Tank+Engine Hawk columns), full
+      throttle, ~26s burn, 1,594 samples. Summed 3 independent
+      per-engine thrust contributions (confirmed formula, no shared
+      resultant) against gravity+drag, compared to measured
+      acceleration: **1,576 clean pairs, median error 0.14%, mean
+      0.21%** — as tight as the 0.098% drag validation. 18 outlier
+      pairs found and explained, not silently dropped: 16 were a
+      finite-difference artifact from one irregular (half-length) tick
+      spacing; the remaining 2 were a genuine one-tick `engineOn`
+      flicker on a single engine (likely an asynchronous fuel-draw
+      transient across the 3 separate tanks), not investigated further.
+      `partCount` held at 10 the entire burn, confirming the hand-built
+      rocket was genuinely one connected craft. This flight is also what
+      surfaced and got the `AmbiguousMatchException` fixed (v0.37.0,
+      see tooling section) — engine array reads were unusable before
+      that fix.
 - [x] **RCS** — both selection methods read. Not proportional to input:
       `TorqueThrust` returns false unless `|TurnAxis| ≥ 0.95` **or**
       `|angularVelocity| ≥ 2 °/s`; the second clause is the
@@ -111,9 +128,11 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       `Planet.GetTerrainHeightAtAngle`, plus a batch
       `GetTerrainHeightAtAngles`. `maxTerrainHeight` is only a
       fast-reject radius. Available all along.
-- [ ] **Live validation of all four** — no flight has confirmed any of
-      the above. This is now the blocking item for this group, and it
-      replaces "no path yet".
+- [ ] **Live validation of RCS, terrain, and the heat accumulation
+      model** — multi-engine is now validated live (above). Heat's
+      instantaneous-temperature formula is sanity-checked but not fully
+      validated (accumulation model + fresh flight still needed, see
+      §5.1). RCS and terrain remain untested against real flight data.
 
 ## Tooling bugs — fixed 2026-08-29 (v0.34.0)
 

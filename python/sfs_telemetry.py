@@ -206,6 +206,85 @@ def predicted_reentry_temperature_for_sample(sample: dict, body: dict, body_name
     return predicted_reentry_temperature(velocity, vv, density, body_name, difficulty)
 
 
+def validate_multi_engine(samples: list[dict], inputs: list[dict], single_engine_thrust: float,
+                           start: int = 0, end: Optional[int] = None) -> dict:
+    """LIVE-VALIDATED 2026-08-30 (median 0.14% error, 1,576 clean pairs,
+    3-engine symmetric rocket). Confirms the 'no summation, N
+    independent forces' multi-engine model by summing each engine's OWN
+    thrust contribution (from inputs.jsonl's per-sample 'engines' array
+    -- requires sfsprobe v0.37.0+, the AmbiguousMatchException fix)
+    against gravity+drag, compared to measured (finite-difference)
+    acceleration.
+
+    Thrust direction is approximated as RADIAL (px,py)/r -- valid for a
+    symmetric multi-engine cluster with no steering input, where thrust
+    direction closely tracks 'straight up from the planet'; confirmed on
+    the validation flight (velocity/radial dot product = 1.0000
+    throughout). A rocket with active steering or asymmetric engines
+    would need real per-engine world-frame thrust vectors instead --
+    not implemented here, since inputs.jsonl only carries LOCAL
+    thrustDirX/Y (see EngineModule.md), not a world-frame transform.
+
+    samples and inputs must be the SAME flight's truth.jsonl/inputs.jsonl,
+    same length, index-aligned (as sfsprobe writes them).
+    """
+    if len(samples) != len(inputs):
+        raise ValueError("samples and inputs must be the same length (same flight, index-aligned)")
+    end = len(samples) - 1 if end is None else end
+    results = []
+    for i in range(max(1, start), min(end, len(samples) - 1)):
+        a, b = samples[i - 1], samples[i + 1]
+        dt = b["t"] - a["t"]
+        if dt <= 0:
+            continue
+        dt1, dt2 = samples[i]["t"] - a["t"], b["t"] - samples[i]["t"]
+        irregular_timestep = abs(dt1 - dt2) > 0.001
+        measured = ((b["vx"] - a["vx"]) / dt, (b["vy"] - a["vy"]) / dt)
+        body = PLANET_CONSTANTS.get(samples[i].get("body"))
+        if not body:
+            continue
+        grav_drag = predicted_gravity_drag_accel(samples[i], body)
+        if grav_drag is None:
+            continue
+        m = samples[i]["m"]
+        px, py = samples[i]["px"], samples[i]["py"]
+        r = math.hypot(px, py)
+        if r == 0 or m <= 0:
+            continue
+        thrust_accel_mag = sum(
+            single_engine_thrust * 9.8 * e.get("throttleOut", 0.0) / m
+            for e in inputs[i].get("engines", [])
+            if e.get("type") == "engine" and e.get("engineOn")
+        )
+        rx, ry = px / r, py / r
+        pred = (grav_drag[0] + thrust_accel_mag * rx, grav_drag[1] + thrust_accel_mag * ry)
+        pred_mag, meas_mag = math.hypot(*pred), math.hypot(*measured)
+        if pred_mag < 1e-6:
+            continue
+        err_pct = abs(pred_mag - meas_mag) / pred_mag * 100
+        results.append({
+            "t": samples[i]["t"], "h": samples[i].get("h"), "thrust_accel": thrust_accel_mag,
+            "pred_mag": pred_mag, "meas_mag": meas_mag, "err_pct": err_pct,
+            "irregular_timestep": irregular_timestep,
+        })
+    clean = [r for r in results if not r["irregular_timestep"]]
+    errs = [r["err_pct"] for r in clean]
+    suspect = [r for r in clean if r["err_pct"] > 5.0]
+    return {
+        "summary": {
+            "total_pairs": len(results),
+            "clean_pairs": len(clean),
+            "excluded_irregular_timestep": len(results) - len(clean),
+            "magnitude_error_pct": {
+                "median": statistics.median(errs), "mean": statistics.mean(errs), "max": max(errs),
+            } if errs else None,
+            "suspect_count": len(suspect),
+            "suspect_samples": suspect[:10],
+        },
+        "sample_results": results[:20],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 -- core stats & search
 # ---------------------------------------------------------------------------

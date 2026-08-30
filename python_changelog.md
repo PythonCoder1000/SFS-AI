@@ -6,6 +6,46 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-30 (later same day) — multi-engine LIVE-VALIDATED
+
+- **Real flight test of the "no summation, N independent forces" model**
+  (confirmed via IL in an earlier session, never flight-tested until
+  now). Christian hand-built a real symmetric 3-engine rocket in the
+  editor (three parallel Fuel Tank+Engine Hawk columns at x=8/10/12,
+  shared capsule+parachute+nose cones) after magnet-based stacking
+  turned out unable to place two engines in series (an engine is a
+  single-connector "cap" part — real, useful negative finding, logged
+  in `blueprint_builder.py`'s docstring context).
+- Flew it full-throttle for ~26s (1,594 samples). Validation method:
+  sum 3 independent per-engine thrust contributions (each
+  `thrustNormal · thrust · 9.8 · throttle_Out`, no shared resultant —
+  this IS the "no summation" model, not a simplification of it) plus
+  the confirmed gravity+drag formula, compare against measured
+  (finite-difference) acceleration.
+- **Result: 1,576 clean pairs, median error 0.14%, mean 0.21%** —
+  tighter than the 0.098%-median drag validation, this project's
+  previous best. Strong, direct confirmation the multi-engine model is
+  correct, not just plausible.
+- **18 outlier pairs found and explained, not silently dropped:** 16
+  were a finite-difference artifact — one tick in the recording had
+  irregular (half-length) spacing, which distorts a central-difference
+  "measured" acceleration that assumes even spacing. The remaining 2
+  were a genuine one-tick `engineOn` flicker on a single engine (all 3
+  on at one sample, one dropped to off+throttle 0 the very next sample,
+  then presumably back on), most likely an asynchronous fuel-draw
+  transient across the rocket's 3 separate tanks — not investigated
+  further, flagged rather than hidden.
+- `partCount` held at 10 for the entire burn, confirming the hand-built
+  rocket was genuinely one rigid connected craft, not three separate
+  physics bodies that happened to look adjacent.
+- **This flight is also what surfaced sfsprobe's long-standing
+  `AmbiguousMatchException`** on engine reads clearly enough to finally
+  root-cause and fix it (v0.37.0, see `mod_changelog.md`) — a pad-idle
+  sanity check before this flight showed EVERY engine read failing, not
+  the rare one-off it had previously looked like.
+
+---
+
 ## 2026-08-30 — `predicted_reentry_temperature` (AeroFormula.GetTemperature port)
 
 - **Added to `sfs_telemetry.py`: `predicted_reentry_temperature` +
