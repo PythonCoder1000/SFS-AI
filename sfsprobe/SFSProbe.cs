@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.35.5";
+        public const string VersionString = "0.36.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (new getplacedmagnets command: reads REAL MagnetModule.points from ACTUALLY PLACED parts, not the bare catalog -- getparts came back null for magnet data on all 3 tested catalog parts, so this tests placed instances instead; Step 1.5 audit fixes as in v0.35.4; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (new aeroformula command: reads the 4 live AeroFormula coefficients velPow/densityPow/tempOffset/m off GameManager.main.aeroData, needed to close the heat-formula validation gap; GetHeatState fixed to read via HeatModule/Part's Temperature property instead of the always-wrong Part.temperature field, and to exclude +-Inf sentinels; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1300,6 +1300,54 @@ namespace SFSProbe
                     break;
                 }
 
+                case "aeroformula":
+                {
+                    // Reads the 4 serialized AeroFormula coefficients (velPow,
+                    // densityPow, tempOffset, m) that GetTemperature() needs --
+                    // confirmed via IL to be serialized Unity data, not IL
+                    // literals, so they cannot be known without a live read.
+                    // Path per docs/sfs_reference/02-drag-aero/AeroFormula.md:
+                    // GameManager.main.aeroData.Formula -- tries that property
+                    // first, falls back to aeroData.formulaHolder.formula if the
+                    // property isn't there, and reports which path actually
+                    // worked rather than assuming.
+                    object gmAF = FindComponent("SFS.World.GameManager");
+                    object aeroData = Get(gmAF, "aeroData");
+                    if (aeroData == null) { ProbeMod.Result("aeroformula: FAILED reason=no_aeroData"); break; }
+
+                    object formula = Get(aeroData, "Formula");
+                    string formulaPath = "aeroData.Formula";
+                    if (formula == null)
+                    {
+                        object holderAF = Get(aeroData, "formulaHolder");
+                        formula = Get(holderAF, "formula");
+                        formulaPath = "aeroData.formulaHolder.formula";
+                    }
+                    if (formula == null)
+                    {
+                        ProbeMod.Result("aeroformula: FAILED reason=formula_not_found (tried aeroData.Formula and aeroData.formulaHolder.formula)");
+                        break;
+                    }
+
+                    float velPow = ToF(Get(formula, "velPow"));
+                    float densityPow = ToF(Get(formula, "densityPow"));
+                    float tempOffset = ToF(Get(formula, "tempOffset"));
+                    float mCoef = ToF(Get(formula, "m"));
+
+                    var afsb = new StringBuilder();
+                    afsb.Append("{\"path\":").Append(Q(formulaPath));
+                    afsb.Append(",\"velPow\":").Append(Num(velPow));
+                    afsb.Append(",\"densityPow\":").Append(Num(densityPow));
+                    afsb.Append(",\"tempOffset\":").Append(Num(tempOffset));
+                    afsb.Append(",\"m\":").Append(Num(mCoef));
+                    afsb.Append("}");
+                    Write("sfs_probe_aeroformula.json", afsb, "aeroformula coefficients via " + formulaPath);
+                    ProbeMod.Result("aeroformula: velPow=" + velPow + " densityPow=" + densityPow +
+                                     " tempOffset=" + tempOffset + " m=" + mCoef +
+                                     " (via " + formulaPath + ") -> sfs_probe_aeroformula.json");
+                    break;
+                }
+
                 case "cheat":
                 {
                     // FIXED (2026-08-29, Step 1.5 audit findings 1-4):
@@ -1498,10 +1546,25 @@ namespace SFSProbe
             catch (Exception e) { ProbeMod.Log("sample error: " + e.Message); }
         }
 
-        // Part.temperature is a plain public float, no wrapper. Part count
-        // dropping between ticks is the cleanest available destruction signal
-        // -- cheaper and more certain than trying to infer breakup from a
-        // temperature threshold we've never independently confirmed.
+        // FIXED (2026-08-30): old version read Part.temperature -- a plain
+        // field that is NEVER written for any part whose surfaces are owned
+        // by a HeatModule instead (Part IS a HeatModuleBase, but so is
+        // HeatModule, and only one of them is the real owner). That silently
+        // under-reported the rocket-wide max on any rocket carrying a
+        // HeatModule part.
+        //
+        // Fixed by reading the abstract Temperature PROPERTY (works on both
+        // subclasses via Get()'s field-then-property fallback) off whichever
+        // owner is more specific: a part's own HeatModule if it has one,
+        // otherwise the Part itself. Best-guess resolution of an open
+        // question the docs flag as not fully settled by IL alone, but the
+        // more specific tracker is the reasonable default until live data
+        // says otherwise.
+        //
+        // Also fixes the +Inf/-Inf sentinel trap: DissipateHeat writes
+        // +Infinity for 'fully cooled, not heated', so a naive max() would
+        // treat that sentinel as the hottest part on the rocket. Both +Inf
+        // and -Inf are now explicitly excluded before the max comparison.
         static Tuple<int,float> GetHeatState(object rocket)
         {
             try
@@ -1515,8 +1578,22 @@ namespace SFSProbe
                 foreach (object part in en)
                 {
                     count++;
-                    float temp = ToF(Get(part, "temperature"));
-                    if (temp > maxTemp) maxTemp = temp;
+                    object owner = null;
+                    foreach (object mv in ModuleValues(part))
+                    {
+                        if (mv.GetType().Name == "HeatModule") { owner = mv; break; }
+                    }
+                    if (owner == null) owner = part;
+
+                    float temp;
+                    try { temp = ToF(Get(owner, "Temperature")); }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Log("[heat-state] Temperature read error on owner " +
+                                     Name(owner) + ": " + e.Message);
+                        temp = float.NegativeInfinity;
+                    }
+                    if (!float.IsInfinity(temp) && temp > maxTemp) maxTemp = temp;
                 }
                 return Tuple.Create(count, float.IsNegativeInfinity(maxTemp) ? 0f : maxTemp);
             }

@@ -9,6 +9,39 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.36.0 — 2026-08-30
+
+First step in closing up the four "confirmed from code, untested live"
+physics items (heat, multi-engine, RCS, terrain) — starting with heat's
+single blocking read.
+
+- **New `aeroformula` command.** Reads the 4 serialized `AeroFormula`
+  coefficients (`velPow`, `densityPow`, `tempOffset`, `m`) live off
+  `GameManager.main.aeroData` — these feed `AeroFormula.GetTemperature`,
+  whose structure and literal constants were already confirmed from IL,
+  but these 4 values are Unity-serialized data with no IL-literal
+  equivalent, so they were the one thing standing between "formula read"
+  and "formula usable." Tries `aeroData.Formula` first, falls back to
+  `aeroData.formulaHolder.formula`, and reports which path actually
+  resolved rather than assuming. Writes `sfs_probe_aeroformula.json`.
+- **Fixed `GetHeatState`** — previously read `Part.temperature`
+  unconditionally, which is a plain field that's never written for any
+  part whose surfaces are actually owned by a `HeatModule` instead (both
+  `Part` and `HeatModule` implement the abstract `HeatModuleBase`, and
+  only one is the real owner per part). Now checks each part for an
+  attached `HeatModule` first and reads its `Temperature` **property**
+  instead of the raw field — this also fixes reading `Part`'s own
+  temperature correctly, since `Get()` resolves `"Temperature"` to the
+  property, not the differently-cased `"temperature"` field. Also now
+  excludes `+Inf`/`-Inf` sentinel values (`DissipateHeat`'s "fully
+  cooled" marker) from the max-temperature comparison, so a cooled part
+  can no longer be misread as the hottest thing on the rocket.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load (mod DLL is loaded once at startup) before `aeroformula` or a
+  heat-validation flight can be tried.
+
+---
+
 ## v0.35.4 — 2026-08-29 (later same day)
 
 - **Fixed 6 of 8 real bugs found by the Step 1.5 Mod-Integration Safety

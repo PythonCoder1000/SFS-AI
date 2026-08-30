@@ -19,3 +19,4 @@ __pycache__/
 
 # Local working-procedure notes -- not for the repo
 CLAUDE.md
+python/prediction_demo_data.json
