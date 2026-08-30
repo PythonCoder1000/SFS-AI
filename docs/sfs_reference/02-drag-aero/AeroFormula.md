@@ -63,25 +63,28 @@ Reached via `GameManager.main.aeroData.Formula` →
 
 | Name | Type | Access | Static | Description | Status |
 |---|---|---|---|---|---|
-| `velPow` | `float` | public | no | velocity exponent | **[OPEN] value** |
-| `densityPow` | `float` | public | no | density exponent (used as `1/densityPow`) | **[OPEN] value** |
-| `tempOffset` | `float` | public | no | ascent-discount coefficient | **[OPEN] value** |
-| `m` | `float` | public | no | overall divisor | **[OPEN] value** |
+| `velPow` | `float` | public | no | velocity exponent | **[CONFIRMED] = 1.85** |
+| `densityPow` | `float` | public | no | density exponent (used as `1/densityPow`) | **[CONFIRMED] = 2.2** |
+| `tempOffset` | `float` | public | no | ascent-discount coefficient | **[CONFIRMED] = -500** |
+| `m` | `float` | public | no | overall divisor | **[CONFIRMED] = 1.47** |
 
 > The `public float drag` field a naive extractor reports here does not
 > exist — it is a closure field on the nested `<>c__DisplayClass5_0`.
 
-> **[OPEN] — these four coefficients are serialized Unity data, not IL
-> literals.** They must be read live. Per the project's data-trust rule,
-> do not assume values for them.
+> **[CONFIRMED 2026-08-30]** — read live via the new `aeroformula` probe
+> command (sfsprobe v0.36.0): `velPow=1.85`, `densityPow=2.2`,
+> `tempOffset=-500`, `m=1.47`. Resolved through `GameManager.main.aeroData
+> .Formula` directly (the simpler of the two candidate paths worked on the
+> first live try; `aeroData.formulaHolder.formula` was the fallback and
+> was not needed). Raw result: `sfs_probe_aeroformula.json`.
 >
-> **Where to read them:** `GameManager.main.aeroData` is a serialized
-> `AeroData` field on the world-scene `GameManager` singleton, and it is
-> what supplies these. So the read is `GameManager.main.aeroData` → the
-> relevant `AeroFormula` → these four fields, all reachable from the
-> probe with no new plumbing. The `AeroData` type's own layout is
-> **[PARTIAL]** — not read — so the exact path from `aeroData` to an
-> `AeroFormula` still needs one live introspection pass.
+> **Sanity note on `tempOffset = -500`:** in `GetTemperature`, this value
+> is multiplied by a term capped at `[0, 0.4]` (see the formula body
+> below), so the actual ascent-branch contribution is bounded to
+> `[-200, 0]` before the `+0.2` — i.e. ascending flight gets a real,
+> possibly large *heating discount* on top of the separate velocity-based
+> discount, not a bonus. Not yet cross-checked against a real ascent's
+> measured temperature; flagged for the validation flight.
 
 ### Methods
 
@@ -174,6 +177,6 @@ Reached via `GameManager.main.aeroData.Formula` →
 | `AeroFormula` is a 4-field struct reached via `GameManager.main.aeroData` | [CONFIRMED] |
 | `GetTemperature` formula and its literal constants | [CONFIRMED] |
 | `GetQ` body | [CONFIRMED] |
-| `velPow` / `densityPow` / `tempOffset` / `m` **values** | **[OPEN]** — serialized data, must be read live |
+| `velPow` / `densityPow` / `tempOffset` / `m` **values** | **[CONFIRMED]** — 1.85 / 2.2 / -500 / 1.47, read live 2026-08-30 |
 | `AeroData` type layout | [PARTIAL] — not read |
 | `GetShockOpacity` body | [OPEN] — visuals only |

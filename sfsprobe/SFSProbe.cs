@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.36.0";
+        public const string VersionString = "0.36.1";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (new aeroformula command: reads the 4 live AeroFormula coefficients velPow/densityPow/tempOffset/m off GameManager.main.aeroData, needed to close the heat-formula validation gap; GetHeatState fixed to read via HeatModule/Part's Temperature property instead of the always-wrong Part.temperature field, and to exclude +-Inf sentinels; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (new atmophysics command: reads planet.data.atmospherePhysics.minHeatingVelocityMultiplier/shockwaveIntensity live, the last piece needed for the reentry-temperature formula; aeroformula command + GetHeatState fix from v0.36.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1345,6 +1345,50 @@ namespace SFSProbe
                     ProbeMod.Result("aeroformula: velPow=" + velPow + " densityPow=" + densityPow +
                                      " tempOffset=" + tempOffset + " m=" + mCoef +
                                      " (via " + formulaPath + ") -> sfs_probe_aeroformula.json");
+                    break;
+                }
+
+                case "atmophysics":
+                {
+                    // Reads planet.data.atmospherePhysics for the current
+                    // rocket's planet -- specifically minHeatingVelocityMultiplier
+                    // and shockwaveIntensity, the two float32 fields
+                    // AeroModule.GetTemperatureAndShockwave actually consumes.
+                    // Needed to complete the reentry-temperature formula: the
+                    // 3.0.ctor() default (1.0f) is NOT necessarily what Earth's
+                    // real planet file specifies -- per the project's data-trust
+                    // rule, this must be read live, not assumed. Also dumps
+                    // height/density/curve for reference (already scaled by
+                    // Difficulty.ScalePlanetData at this point, per
+                    // Atmosphere_Physics.md).
+                    object rAP = ActiveRocket();
+                    if (rAP == null) { ProbeMod.Result("atmophysics: no active rocket"); break; }
+                    object locAP = Unwrap(Get(rAP, "location"));
+                    object planetAP = Unwrap(Get(locAP, "planet"));
+                    if (planetAP == null) { ProbeMod.Result("atmophysics: no planet"); break; }
+                    object dataAP = Get(planetAP, "data");
+                    object atmoAP = Get(dataAP, "atmospherePhysics");
+                    if (atmoAP == null) { ProbeMod.Result("atmophysics: FAILED reason=no_atmospherePhysics"); break; }
+
+                    double heightAP = ToD(Get(atmoAP, "height"));
+                    double densityAP = ToD(Get(atmoAP, "density"));
+                    double curveAP = ToD(Get(atmoAP, "curve"));
+                    float minHeatVelMult = ToF(Get(atmoAP, "minHeatingVelocityMultiplier"));
+                    float shockwaveIntensity = ToF(Get(atmoAP, "shockwaveIntensity"));
+                    string bodyNameAP = Get(planetAP, "codeName") as string;
+
+                    var apsb = new StringBuilder();
+                    apsb.Append("{\"body\":").Append(Q(bodyNameAP));
+                    apsb.Append(",\"height\":").Append(Num(heightAP));
+                    apsb.Append(",\"density\":").Append(Num(densityAP));
+                    apsb.Append(",\"curve\":").Append(Num(curveAP));
+                    apsb.Append(",\"minHeatingVelocityMultiplier\":").Append(Num(minHeatVelMult));
+                    apsb.Append(",\"shockwaveIntensity\":").Append(Num(shockwaveIntensity));
+                    apsb.Append("}");
+                    Write("sfs_probe_atmophysics.json", apsb, "atmophysics for " + bodyNameAP);
+                    ProbeMod.Result("atmophysics: body=" + bodyNameAP + " minHeatingVelocityMultiplier=" +
+                                     minHeatVelMult + " shockwaveIntensity=" + shockwaveIntensity +
+                                     " -> sfs_probe_atmophysics.json");
                     break;
                 }
 

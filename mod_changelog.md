@@ -9,6 +9,23 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.36.1 — 2026-08-30 (later same day)
+
+- **New `atmophysics` command.** Reads `planet.data.atmospherePhysics`
+  for the current rocket's planet — specifically
+  `minHeatingVelocityMultiplier` and `shockwaveIntensity`, the two
+  fields `AeroModule.GetTemperatureAndShockwave` actually consumes.
+  Needed because `minHeatingVelocityMultiplier`'s `1.0f` in the docs is
+  only the class's *constructor default*, not necessarily what Earth's
+  real planet file specifies — per the project's data-trust rule this
+  has to be read live, same reasoning as `aeroformula` in v0.36.0. Also
+  dumps `height`/`density`/`curve` for reference. Writes
+  `sfs_probe_atmophysics.json`.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load, same as v0.36.0.
+
+---
+
 ## v0.36.0 — 2026-08-30
 
 First step in closing up the four "confirmed from code, untested live"
