@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.41.0";
+        public const string VersionString = "0.42.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (ROOT-CAUSED the ~50% heat overprediction: heatParts' ExposedSurface tally now filters through the REAL RemoveHighSlopeSurfaces+ApplyProtectionZone (called via reflection, not reimplemented) before summing per-owner width -- confirmed via real IL read that HeatManager.ApplyHeat NEVER sees the raw drag-path exposed list, only this filtered one; script/setrot/turn from v0.39-0.40; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (QoL: new 'telemetrysnapshot' command copies the live truth.jsonl/inputs.jsonl to timestamped snapshots WITHOUT stopping recording, avoiding the stop/restart discontinuity risk entirely; heat ExposedSurface fix from v0.41.0; script/setrot/turn from v0.39-0.40; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1762,6 +1762,59 @@ namespace SFSProbe
                     int cleared = ScriptQueue.Count;
                     ScriptQueue.Clear();
                     ProbeMod.Result("scriptclear: cleared " + cleared + " step(s)");
+                    break;
+                }
+
+                case "telemetrysnapshot":
+                {
+                    // QoL (2026-08-30): copies the LIVE truth.jsonl/inputs.jsonl to
+                    // timestamped snapshot files WITHOUT stopping recording -- avoids
+                    // the stop/restart dance entirely, including the real
+                    // discontinuity risk that dance carries (a stop+restart that
+                    // lands near a scene change can silently start a NEW rocket's
+                    // recording, as happened earlier this session). Telemetry keeps
+                    // running uninterrupted; this just hands back a consistent
+                    // point-in-time copy to pull and analyze mid-flight.
+                    //
+                    // Safe to File.Copy while Sample() is actively appending: both
+                    // run on Unity's single main thread (FixedUpdate and the command
+                    // dispatch from Update() never execute concurrently), so there is
+                    // no torn-read risk from a separate writer thread.
+                    if (!Telemetry)
+                    {
+                        ProbeMod.Result("telemetrysnapshot: FAILED reason=not_recording");
+                        break;
+                    }
+                    string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+                    string srcTruth = Path.Combine(ProbeMod.OutDir ?? ".", "truth.jsonl");
+                    string srcInputs = Path.Combine(ProbeMod.OutDir ?? ".", "inputs.jsonl");
+                    string dstDir = Path.Combine(ProbeMod.OutDir ?? ".", "snapshots");
+                    int truthLines = 0, inputLines = 0;
+                    string dstTruth = null, dstInputs = null;
+                    try
+                    {
+                        Directory.CreateDirectory(dstDir);
+                        if (File.Exists(srcTruth))
+                        {
+                            dstTruth = Path.Combine(dstDir, "truth_snapshot_" + stamp + ".jsonl");
+                            File.Copy(srcTruth, dstTruth, true);
+                            truthLines = File.ReadAllLines(dstTruth).Length;
+                        }
+                        if (File.Exists(srcInputs))
+                        {
+                            dstInputs = Path.Combine(dstDir, "inputs_snapshot_" + stamp + ".jsonl");
+                            File.Copy(srcInputs, dstInputs, true);
+                            inputLines = File.ReadAllLines(dstInputs).Length;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Result("telemetrysnapshot: FAILED reason=copy_error " + e.Message);
+                        break;
+                    }
+                    ProbeMod.Result("telemetrysnapshot: truth=" + truthLines + " lines, inputs=" + inputLines +
+                                     " lines -> snapshots/truth_snapshot_" + stamp + ".jsonl, snapshots/inputs_snapshot_" +
+                                     stamp + ".jsonl (recording continues uninterrupted)");
                     break;
                 }
 

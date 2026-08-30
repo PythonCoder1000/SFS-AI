@@ -9,6 +9,23 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.42.0 — 2026-08-30 (later same day)
+
+- **New `telemetrysnapshot` command (QoL).** Copies the live
+  `truth.jsonl`/`inputs.jsonl` to timestamped files under `snapshots/`
+  **without stopping the recording** — avoids the stop/restart dance
+  entirely, including the real discontinuity risk it carries (a
+  stop+restart landing near a scene change can silently start
+  recording a NEW rocket, as happened earlier this session with the
+  revert-mid-flight confusion). Safe to call mid-flight: `File.Copy`
+  and `Sample()`'s appends both run on Unity's single main thread, so
+  there's no torn-read risk.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load (the mod DLL in memory right now is still v0.41.0, mid-flight;
+  deliberately not restarting to avoid killing that recording).
+
+---
+
 ## v0.41.0 — 2026-08-30 (later same day)
 
 **Root-caused the ~50% heat overprediction from the per-part validation—
