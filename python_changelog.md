@@ -6,6 +6,44 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-29 (later same day) — forward_sim.py + interactive trajectory-prediction demo
+
+- **Added `python/forward_sim.py`.** Forward-integrates (RK4, not Euler)
+  the CONFIRMED gravity+drag formula — a verbatim port of
+  `sfs_telemetry.py`'s `predicted_gravity_drag_accel`/
+  `atmospheric_density`, not reimplemented from scratch — starting from
+  any real telemetry sample, for a chosen duration. Built to power an
+  interactive predicted-vs-actual trajectory demo using the exact
+  physics validated that same day at 0.098% median error across 70,858
+  pairs (see `docs/high_level_checklist.md`, "Drag FORCE formula").
+
+  `dragArea` is deliberately held constant at the starting sample's
+  real value for the whole prediction window — a documented
+  simplification (valid for an unpowered coast, where orientation stays
+  roughly fixed), not an oversight; noted in the module docstring as
+  something that would need revisiting for a window including active
+  thrust/rotation/staging.
+
+  `prep_demo_data()` loads a real archived flight, downsamples it for
+  embedding in a UI, and runs a **self-test** before shipping any
+  numbers into a demo: a 10s forward-simulation from a real mid-flight
+  sample, compared against the ACTUAL recorded trajectory at the
+  matching later timestamp. Against the real 73,108-sample drag-
+  validation flight: **0.0001% altitude error** — confirms the RK4 port
+  matches the validated formula before any UI gets built on top of it,
+  rather than assuming the port is correct.
+
+- **Built an interactive React artifact** (`TrajectoryPredictor.jsx`,
+  delivered directly, not committed to this repo) on top of
+  `forward_sim.py`'s output: pick a real sample (slider) and a
+  prediction duration (slider), see the live-computed predicted
+  trajectory (JS port of the same RK4 physics) overlaid on the real
+  recorded one, with a numeric predicted-vs-actual comparison at the
+  end of the window. Deliberately surfaces the real, still-unexplained
+  divergence zone found during validation (26–30km altitude,
+  high-speed ascent) as a shaded region when a chosen window crosses
+  it, rather than hiding a known limitation behind a clean-looking demo.
+
 ## 2026-08-29 (later same day) — blueprint_builder.py + sfsprobe_build_stack_blueprint
 
 - **Added `python/blueprint_builder.py`** — builds SFS blueprints from a
