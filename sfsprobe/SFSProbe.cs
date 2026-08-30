@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.43.0";
+        public const string VersionString = "0.44.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (new 'realAirTemp' per-tick truth.jsonl field + 'airtemp' on-demand command: both call the REAL AeroModule.GetTemperatureAndShockwave directly, bypassing our own Python air-temp formula, to definitively test whether a heat-accumulation gap comes from the formula itself vs. something downstream; telemetrysnapshot fix from v0.42.0; heat ExposedSurface fix from v0.41.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (RCS live-validation prep: new 'rcsinfo' command reads directionAngleThreshold/torqueAngleThreshold/thrust/ISP/thrustPosition/per-thruster-normal live for every RcsModule on the rocket; new 'directionalAxisX/Y' inputs.jsonl fields read the real Rocket.output_DirectionalAxis, confirmed via IL to be the actual DirectionalAxis source (not on arrowkeys) -- needed to reconstruct DirectionThrust's firing decision; realAirTemp diagnostic from v0.43.0; heat fully closed in v0.41.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1765,6 +1765,74 @@ namespace SFSProbe
                     break;
                 }
 
+                case "rcsinfo":
+                {
+                    // Live read of the two per-part-serialized RcsModule
+                    // thresholds (directionAngleThreshold, torqueAngleThreshold)
+                    // confirmed via IL re-read 2026-08-30 -- can only be read
+                    // live, never from IL literals. Also dumps thrust, ISP, and
+                    // thrustPosition (local) per module, and per-thruster
+                    // thrustNormal (local), everything needed to reconstruct
+                    // TorqueThrust/DirectionThrust's selection logic and the
+                    // resulting force for a live validation.
+                    object rRcs = ActiveRocket();
+                    if (rRcs == null) { ProbeMod.Result("rcsinfo: no active rocket"); break; }
+                    object holderRcs = Get(rRcs, "partHolder");
+                    object partsRcs = Get(holderRcs, "parts");
+                    var partsEnRcs = partsRcs as System.Collections.IEnumerable;
+                    var modules = new List<string>();
+                    if (partsEnRcs != null)
+                    {
+                        foreach (object part in partsEnRcs)
+                        {
+                            foreach (object mv in ModuleValues(part))
+                            {
+                                if (mv.GetType().Name != "RcsModule") continue;
+                                float dAngle = ToF(Get(mv, "directionAngleThreshold"));
+                                float tAngle = ToF(Get(mv, "torqueAngleThreshold"));
+                                float thrustVal = ToF(Get(mv, "thrust"));
+                                float ispVal = ToF(Get(mv, "ISP"));
+                                object thrustPos = Get(mv, "thrustPosition");
+                                float posX = ToF(Get(thrustPos, "x"));
+                                float posY = ToF(Get(thrustPos, "y"));
+
+                                var thrusterList = new List<string>();
+                                object thrusters = Get(mv, "thrusters");
+                                var thEn = thrusters as System.Collections.IEnumerable;
+                                if (thEn != null)
+                                {
+                                    foreach (object th in thEn)
+                                    {
+                                        object normal = Get(th, "thrustNormal");
+                                        float nx = ToF(Get(normal, "x"));
+                                        float ny = ToF(Get(normal, "y"));
+                                        thrusterList.Add("{\"normalX\":" + Num(nx) + ",\"normalY\":" + Num(ny) + "}");
+                                    }
+                                }
+
+                                var msb = new StringBuilder();
+                                msb.Append("{\"directionAngleThreshold\":").Append(Num(dAngle));
+                                msb.Append(",\"torqueAngleThreshold\":").Append(Num(tAngle));
+                                msb.Append(",\"thrust\":").Append(Num(thrustVal));
+                                msb.Append(",\"ISP\":").Append(Num(ispVal));
+                                msb.Append(",\"thrustPositionX\":").Append(Num(posX));
+                                msb.Append(",\"thrustPositionY\":").Append(Num(posY));
+                                msb.Append(",\"thrusterCount\":").Append(thrusterList.Count);
+                                msb.Append(",\"thrusters\":[").Append(string.Join(",", thrusterList.ToArray())).Append("]");
+                                msb.Append("}");
+                                modules.Add(msb.ToString());
+                            }
+                        }
+                    }
+                    var rsb = new StringBuilder();
+                    rsb.Append("{\"moduleCount\":").Append(modules.Count);
+                    rsb.Append(",\"modules\":[").Append(string.Join(",", modules.ToArray())).Append("]}");
+                    Write("sfs_probe_rcsinfo.json", rsb, "rcsinfo modules=" + modules.Count);
+                    ProbeMod.Result("rcsinfo: " + modules.Count + " RcsModule(s) found -> sfs_probe_rcsinfo.json" +
+                                     (modules.Count == 0 ? " (this rocket has no RCS parts)" : ""));
+                    break;
+                }
+
                 case "airtemp":
                 {
                     // Cheap on-demand diagnostic: single real-time read of
@@ -1978,6 +2046,15 @@ namespace SFSProbe
             int rcsFiring = CountFiringThrusters(r);
             object eng = GetEngineArray(r);
 
+            // CONFIRMED via IL 2026-08-30 (RcsModule re-verification):
+            // DirectionalAxis's real source is Rocket.output_DirectionalAxis
+            // (a Vector2_Local), NOT a field on arrowkeys -- needed to
+            // reconstruct RcsModule.DirectionThrust's firing decision, which
+            // was previously unrecoverable from telemetry.
+            object outputDirAxis = GetWrapped2(Get(r, "output_DirectionalAxis"));
+            float dirAxisX = ToF(Get(outputDirAxis, "x"));
+            float dirAxisY = ToF(Get(outputDirAxis, "y"));
+
             var si = new StringBuilder();
             si.Append("{\"t\":").Append(Num(t));
             si.Append(",\"fdt\":").Append(fdt.ToString("R"));
@@ -1988,6 +2065,8 @@ namespace SFSProbe
             si.Append(",\"torque\":").Append(Num(torque));
             si.Append(",\"rcsOn\":").Append(rcsOn ? "true" : "false");
             si.Append(",\"rcsFiring\":").Append(rcsFiring);
+            si.Append(",\"directionalAxisX\":").Append(Num(dirAxisX));
+            si.Append(",\"directionalAxisY\":").Append(Num(dirAxisY));
             si.Append(",\"engines\":[").Append(string.Join(",", ((List<string>)eng).ToArray())).Append("]");
             si.Append("}");
             return si.ToString();

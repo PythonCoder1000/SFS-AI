@@ -258,13 +258,20 @@ To replicate RCS, per module per tick:
    `transform.TransformPoint(thrustPosition)`; mass flow
    `thrust · count / ISP`.
 
-Everything needed is readable; the only per-part unknowns are the two
-angle thresholds, which are serialized and must be read live.
+Everything needed is readable; the two per-part angle thresholds and
+`DirectionalAxis` are now readable live too (`rcsinfo` command,
+`directionalAxisX`/`directionalAxisY` telemetry fields, both sfsprobe
+v0.44.0) — no remaining unknowns for a full live validation, only an
+actual flight to run it against.
 
-The probe currently exposes only `rcsOn` and a firing count
-(`CountFiringThrusters`). That count is a reasonable proxy for `count`
-above — but note the force depends on `sumNormal` too, which the probe
-does not compute.
+The probe currently exposes `rcsOn`, a firing count
+(`CountFiringThrusters`, confirmed to read the real per-tick
+`targetTime` state set in `FixedUpdate`), and now `directionalAxisX/Y`.
+That firing count is a reasonable proxy for `count` above — but note
+the force depends on `sumNormal` too, which the probe does not compute
+directly (though `rcsinfo`'s per-thruster `thrustNormal` list plus a
+Python-side reconstruction of `TorqueThrust`/`DirectionThrust` could
+derive it).
 
 ## Status summary
 
@@ -281,6 +288,7 @@ does not compute.
 | Mass flow `thrust·count/ISP`, no throttle, no `IspMultiplier` | [CONFIRMED] — re-verified 2026-08-30 |
 | RCS self-disables when fuel cannot flow, via `onStateChange` event | [CONFIRMED] — event-trigger detail added 2026-08-30 |
 | Force quadratic in firing-thruster count | [CONFIRMED] arithmetic, [OPEN] in flight |
-| `directionAngleThreshold` / `torqueAngleThreshold` values | [OPEN] — serialized per part, read live (needs a rocket with real RCS parts — the current test rocket has none) |
+| `directionAngleThreshold` / `torqueAngleThreshold` values | [x] read live — `rcsinfo` command, sfsprobe v0.44.0 |
 | `RCS_On` backing store (for writing it) | [OPEN] |
 | `ToggleRCS` bodies | [OPEN] |
+| `DirectionalAxis` telemetry (real source, needed for `DirectionThrust` reconstruction) | [x] `Rocket.output_DirectionalAxis`, confirmed via IL, sfsprobe v0.44.0 |

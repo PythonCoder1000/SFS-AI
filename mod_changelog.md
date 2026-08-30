@@ -9,6 +9,29 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.44.0 — 2026-08-30 (later same day)
+
+**RCS live-validation prep**, following the same-day RCS documentation
+re-verification against direct IL.
+
+- **New `rcsinfo` command.** Live read of `directionAngleThreshold`,
+  `torqueAngleThreshold`, `thrust`, `ISP`, `thrustPosition`, and every
+  thruster's local `thrustNormal`, for every `RcsModule` on the current
+  rocket. The two thresholds are per-part serialized data — confirmed
+  via IL to exist and matter, but their real values can only ever be
+  read live, same category as `aeroformula`'s coefficients.
+- **New `directionalAxisX`/`directionalAxisY` fields in `inputs.jsonl`.**
+  Reads `Rocket.output_DirectionalAxis` — confirmed via IL re-read to be
+  the REAL source `RcsModule.DirectionalAxis` receives via
+  `INJ_DirectionalAxis` injection (a `Vector2_Local` on the `Rocket`
+  itself, not a field on `arrowkeys` as might be assumed). Without this,
+  `DirectionThrust`'s firing decision was unrecoverable from recorded
+  telemetry.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load.
+
+---
+
 ## v0.43.0 — 2026-08-30 (later same day)
 
 **Ground-truth diagnostic for the remaining heat-accumulation gap.** After
