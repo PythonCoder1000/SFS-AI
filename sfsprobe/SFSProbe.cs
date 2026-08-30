@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.33.0";
+        public const string VersionString = "0.34.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (loadblueprintbuild command: real Load-Blueprint-button mechanism via BuildState.LoadBlueprint, requires Build_PC not World_PC, replaces the current editor design; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (per-engine telemetry array: replaces the old first-active-engine-only getter, which was structurally wrong for multi-engine rockets since there's no thrust summation; adds BoosterModule support and real exception logging instead of a bare swallow-catch; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1093,7 +1093,7 @@ namespace SFSProbe
                 float torque = SumEnabledTorque(r);
                 bool rcsOn = ToB(GetWrapped(arrowkeys, "rcs"));
                 int rcsFiring = CountFiringThrusters(r);
-                object eng = GetEngineDirection(r);   // (dirX, dirY, gimbalOn) of first active engine, local space
+                object eng = GetEngineArray(r);   // one entry per engine/booster module, on or off
 
                 // ---- inputs.jsonl ----
                 var si = new StringBuilder();
@@ -1106,14 +1106,7 @@ namespace SFSProbe
                 si.Append(",\"torque\":").Append(Num(torque));
                 si.Append(",\"rcsOn\":").Append(rcsOn ? "true" : "false");
                 si.Append(",\"rcsFiring\":").Append(rcsFiring);
-                if (eng != null)
-                {
-                    var t4 = (Tuple<float,float,bool,float>)eng;
-                    si.Append(",\"thrustDirX\":").Append(Num(t4.Item1));
-                    si.Append(",\"thrustDirY\":").Append(Num(t4.Item2));
-                    si.Append(",\"gimbalOn\":").Append(t4.Item3 ? "true" : "false");
-                    si.Append(",\"throttleOut\":").Append(Num(t4.Item4));
-                }
+                si.Append(",\"engines\":[").Append(string.Join(",", ((List<string>)eng).ToArray())).Append("]");
                 si.Append("}");
                 ProbeMod.Append("inputs.jsonl", si.ToString());
 
@@ -1270,41 +1263,92 @@ namespace SFSProbe
             public int GetHashCode(object o) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o); }
         }
 
-        // Resolves LOCAL (part-space) thrust direction AND the resolved output
-        // throttle of the first active, enabled EngineModule. thrustNormal is the
-        // game's own Composed_Float, already gimbal-deflected. throttle_Out is
-        // the value AFTER RecalculateEngineThrottle gates it by engineOn -- the
-        // actual force multiplier, distinct from the rocket's commanded 'thr'
-        // (master throttlePercent), which this engine might not be honoring if
-        // its own engineOn flag differs from the master state.
-        static Tuple<float,float,bool,float> GetEngineDirection(object rocket)
+        // Returns ONE ENTRY PER ENGINE/BOOSTER MODULE FOUND (regardless of
+        // on/off state -- the state itself is data, not a filter). Replaces
+        // the old GetEngineDirection(), which returned only the FIRST ACTIVE
+        // engine as a single tuple. That was wrong on two counts, both
+        // flagged in high_level_checklist.md: (1) there is no thrust
+        // summation anywhere in the game -- each engine calls
+        // AddForceAtPosition independently, so one engine's direction was
+        // never a meaningful summary of a multi-engine rocket; (2) it missed
+        // BoosterModule entirely, which uses thrustVector/boosterPrimed
+        // rather than thrustNormal/engineOn.
+        //
+        // Also fixes the silent-failure half of the same checklist item: the
+        // old function ended in a bare `catch { }`, so of its three candidate
+        // explanations for "why do thrustDirX/Y/gimbalOn/throttleOut never
+        // populate" (no matching module / engineOn false outside a burn /
+        // an exception thrown and swallowed), the third was unfalsifiable by
+        // inspection alone. Every read below is now individually try/caught
+        // and LOGGED (not swallowed) with the specific part name, so a real
+        // flight settles which of the three it actually was.
+        static List<string> GetEngineArray(object rocket)
         {
-            try
+            var results = new List<string>();
+            object holder = Get(rocket, "partHolder");
+            object parts = Get(holder, "parts");
+            var en = parts as System.Collections.IEnumerable;
+            if (en == null) return results;
+            foreach (object part in en)
             {
-                object holder = Get(rocket, "partHolder");
-                object parts = Get(holder, "parts");
-                var en = parts as System.Collections.IEnumerable;
-                if (en == null) return null;
-                foreach (object part in en)
+                string pname = "?";
+                try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+                foreach (object mv in ModuleValues(part))
                 {
-                    foreach (object mv in ModuleValues(part))
+                    string typeName = mv.GetType().Name;
+                    if (typeName == "EngineModule")
                     {
-                        if (mv.GetType().Name != "EngineModule") continue;
-                        bool engineOn = ToB(GetWrapped2(Get(mv, "engineOn")));
-                        if (!engineOn) continue;
-                        object normal = Get(mv, "thrustNormal");
-                        object nx = Get(normal, "x");
-                        object ny = Get(normal, "y");
-                        float dx = ToF(GetWrapped2(nx));
-                        float dy = ToF(GetWrapped2(ny));
-                        bool gimbal = ToB(GetWrapped2(Get(mv, "gimbalOn")));
-                        float throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
-                        return Tuple.Create(dx, dy, gimbal, throttleOut);
+                        try
+                        {
+                            bool engineOn = ToB(GetWrapped2(Get(mv, "engineOn")));
+                            object normal = Get(mv, "thrustNormal");
+                            float dx = ToF(GetWrapped2(Get(normal, "x")));
+                            float dy = ToF(GetWrapped2(Get(normal, "y")));
+                            bool gimbal = ToB(GetWrapped2(Get(mv, "gimbalOn")));
+                            float throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
+                            var esb = new StringBuilder();
+                            esb.Append("{\"part\":").Append(Q(pname));
+                            esb.Append(",\"type\":\"engine\"");
+                            esb.Append(",\"engineOn\":").Append(engineOn ? "true" : "false");
+                            esb.Append(",\"thrustDirX\":").Append(Num(dx));
+                            esb.Append(",\"thrustDirY\":").Append(Num(dy));
+                            esb.Append(",\"gimbalOn\":").Append(gimbal ? "true" : "false");
+                            esb.Append(",\"throttleOut\":").Append(Num(throttleOut));
+                            esb.Append("}");
+                            results.Add(esb.ToString());
+                        }
+                        catch (Exception e)
+                        {
+                            ProbeMod.Log("[engine-array] EngineModule read error on part \"" + pname + "\": " + e.Message);
+                            results.Add("{\"part\":" + Q(pname) + ",\"type\":\"engine\",\"error\":" + Q(e.Message) + "}");
+                        }
+                    }
+                    else if (typeName == "BoosterModule")
+                    {
+                        try
+                        {
+                            bool primed = ToB(GetWrapped2(Get(mv, "boosterPrimed")));
+                            object vec = Get(mv, "thrustVector");
+                            float vx = ToF(GetWrapped2(Get(vec, "x")));
+                            float vy = ToF(GetWrapped2(Get(vec, "y")));
+                            var bsb = new StringBuilder();
+                            bsb.Append("{\"part\":").Append(Q(pname));
+                            bsb.Append(",\"type\":\"booster\"");
+                            bsb.Append(",\"boosterPrimed\":").Append(primed ? "true" : "false");
+                            bsb.Append(",\"thrustVectorX\":").Append(Num(vx));
+                            bsb.Append(",\"thrustVectorY\":").Append(Num(vy));
+                            bsb.Append("}");
+                            results.Add(bsb.ToString());
+                        }
+                        catch (Exception e)
+                        {
+                            ProbeMod.Log("[engine-array] BoosterModule read error on part \"" + pname + "\": " + e.Message);
+                            results.Add("{\"part\":" + Q(pname) + ",\"type\":\"booster\",\"error\":" + Q(e.Message) + "}");
+                        }
                     }
                 }
             }
-            catch { }
-            return null;
+            return results;
         }
 
         // RCS applies force per-thruster with its own on/off selection logic
@@ -1772,7 +1816,7 @@ namespace SFSProbe
         // this file's existing style -- no DI, no registries elsewhere.
         // ADDING A NEW COMPUTED FIELD: add one case here reusing an existing
         // helper -- SumEnabledTorque, CountFiringThrusters, GetHeatState,
-        // FuelByStage, GetPredictedOrbit, and GetEngineDirection all already
+        // FuelByStage, GetPredictedOrbit, and GetEngineArray all already
         // exist and could be wired in exactly the same way as "dragArea" below,
         // with no new physics/reflection code needed, just a rebuild.
         static bool AppendComputedField(string name, object rocket, StringBuilder sb)
@@ -1788,6 +1832,12 @@ namespace SFSProbe
                     sb.Append(",\"dragCopY\":").Append(ok ? Num(copY) : "null");
                     sb.Append(",\"dragSurfaces\":").Append(allC);
                     sb.Append(",\"dragExposed\":").Append(expC);
+                    return true;
+                }
+                case "engines":
+                {
+                    List<string> engines = GetEngineArray(rocket);
+                    sb.Append(",\"engines\":[").Append(string.Join(",", engines.ToArray())).Append("]");
                     return true;
                 }
                 default:

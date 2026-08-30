@@ -86,43 +86,41 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       the above. This is now the blocking item for this group, and it
       replaces "no path yet".
 
+## Tooling bugs — fixed 2026-08-29 (v0.34.0)
+
+- [x] `thrustDirX`/`thrustDirY`/`gimbalOn`/`throttleOut` never populate --
+      **root cause no longer a mystery, fixed at the source.** The bare
+      `catch { }` that made the third candidate explanation
+      unfalsifiable is gone -- `GetEngineArray` (replacing
+      `GetEngineDirection`) logs every read failure individually, by
+      part name, instead of swallowing it. Whichever of the three
+      candidates was actually happening will show up in `probe.log` on
+      the next real flight instead of staying an open question forever.
+- [x] `GetEngineDirection()` only returns the first active engine --
+      **fixed by design change, not a better single-engine heuristic.**
+      Since there is no thrust summation anywhere in the game (each
+      engine calls `AddForceAtPosition` independently), a single
+      engine's direction was never a meaningful summary. Replaced with
+      `GetEngineArray()`, emitting one entry per engine/booster module
+      found, on or off. Also now covers `BoosterModule`
+      (`thrustVector`/`boosterPrimed`), which the old getter missed
+      entirely.
+- [ ] **Not yet live-tested.** Built and installed (v0.34.0), but no
+      flight has run against it yet -- next flight settles whether
+      engines were genuinely missing before, correctly reporting
+      `engineOn=false` outside a burn, or throwing.
+
 ## Tooling bugs — confirmed broken, unfixed
 
-- [ ] `thrustDirX`/`thrustDirY`/`gimbalOn`/`throttleOut` — never populate.
-      **NARROWED (source-doc pass), not fixed.** The IL *rules out* every
-      obvious cause: field names and wrapper access in
-      `GetEngineDirection` are all correct (`Composed_Vector2` really has
-      public `Composed_Float x, y`), and lazy init is not it
-      (`Composed<T>.get_Value()` calls `CheckInitialize()` first). All
-      four keys are emitted inside one `if (eng != null)` block, so they
-      fail *together* exactly when `GetEngineDirection` returns null.
-      Three candidates remain: no module matches
-      `GetType().Name == "EngineModule"`; every engine has
-      `engineOn == false` at sample time (which is **correct** outside a
-      burn, and is also what `CheckOutOfFuel` produces on fuel
-      exhaustion); or an exception is thrown and swallowed. **Do not
-      spend more IL-reading time on this** — the remaining causes are
-      runtime-state questions only a logged live run can settle.
-- [ ] **Bare `catch { }` blocks hide the above.** `GetEngineDirection`
-      ends in one with no logging; same pattern in `GetHeatState`,
-      `InvokeReturn`, `Get`. **Fix this first** — log the exception and
-      which branch was taken and the item above becomes a one-run answer.
-      The newer `InvokeStatic` helper already logs and is the better
-      model. `ErrorLogger.main.lastLogs` (public `List<string>`) also
-      catches exceptions thrown inside *game* code.
 - [ ] `thrOn` — unreliable as a thrust indicator (workaround exists: check
       mass flatness instead)
-- [ ] `GetEngineDirection()` — only returns the first active engine found.
-      **Reframed:** this is by design, and given there is no thrust
-      summation (above), one engine's direction is not a meaningful
-      summary of a multi-engine rocket. The fix is to emit a **per-engine
-      array**, not to pick a better single engine. It also misses
-      `BoosterModule` entirely, which uses `thrustVector`/`boosterPrimed`
-      rather than `thrustNormal`/`engineOn`.
 - [ ] `GetHeatState` may under-report — it reads the `Part.temperature`
       field, but for a part whose heat is owned by a separate
       `HeatModule` that field is never written. Read the `Temperature`
       property virtually off `HeatModuleBase` instead. Needs a live check.
+      Same bare-`catch{}`-hides-failures pattern as the now-fixed engine
+      getter (see above) -- worth the same treatment when this is picked
+      up, not just the temperature-source fix alone.
 
 ## Design decisions owed — not blocked on research, pure decisions
 

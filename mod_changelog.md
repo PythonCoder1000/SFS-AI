@@ -9,7 +9,40 @@ fact from session notes rather than logged at the time.
 
 ---
 
----
+## v0.34.0 — 2026-08-29 (later same day)
+
+- **Replaced `GetEngineDirection` (first-active-engine-only) with
+  `GetEngineArray` (one entry per engine/booster module).** Two real bugs
+  fixed, both flagged in `high_level_checklist.md`'s tooling-bugs section:
+
+  1. **Structural**: there is no thrust summation anywhere in the game --
+     each engine calls `AddForceAtPosition` independently, off-axis torque
+     is emergent. "First active engine" was never a meaningful summary of
+     a multi-engine rocket; a predictive model needs N independent forces,
+     not one. `inputs.jsonl`'s `engines` field is now an array, one entry
+     per module found (`{part, type, engineOn/boosterPrimed,
+     thrustDirX/Y or thrustVectorX/Y, gimbalOn, throttleOut}`), regardless
+     of on/off state -- state is data now, not a filter.
+  2. **Coverage**: `BoosterModule` (`thrustVector`/`boosterPrimed`) was
+     completely missed before -- only `EngineModule` (`thrustNormal`/
+     `engineOn`) was ever checked.
+
+  Also fixes the silent-failure half of the same checklist item:
+  `GetEngineDirection` ended in a bare `catch { }`, so of its three
+  candidate explanations for why `thrustDirX/Y`/`gimbalOn`/`throttleOut`
+  never populated (no matching module / `engineOn` false outside a burn,
+  which is correct / an exception thrown and swallowed), the third was
+  unfalsifiable by inspection alone. Every read in `GetEngineArray` is now
+  individually try/caught and **logged**, with the specific part name, so
+  a real flight settles which explanation it actually was instead of
+  staying a permanent mystery.
+
+  Added `computed:engines` for scoped telemetry, reusing the same helper.
+
+  Built and installed clean. **Not yet live-tested** -- next real flight
+  will show whether engines were actually being missed, correctly
+  reporting `engineOn=false` outside a burn, or throwing (now visible in
+  `probe.log` either way).
 
 ## v0.33.0 — 2026-08-29 (later same day)
 
