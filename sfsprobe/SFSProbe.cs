@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.37.0";
+        public const string VersionString = "0.38.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (ROOT-CAUSED the long-standing EngineModule AmbiguousMatchException: GetWrapped2/SetWrapped now walk the type hierarchy taking the first DECLARED-ONLY Value property, instead of a plain GetProperty that throws when a subclass like Float_Reference hides a base class's same-named Value property via `new`; atmophysics/aeroformula commands from v0.36.x; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (closing the heat gap: new 'difficulty' command reads real HeatVelocityMultiplier/MinHeatVelocityMultiplier + aeroData test flags instead of assuming Normal; new 'jointgraph' command dumps the live joint connectivity graph; truth.jsonl now carries 'heatParts' every tick -- real per-part Temperature/HeatTolerance/IsHeatShield plus a real per-owner ExposedSurface tally (replacing the whole-rocket dragArea proxy that caused ~27% error in the first accumulation-model validation); AmbiguousMatchException root-cause fix from v0.37.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1392,6 +1392,100 @@ namespace SFSProbe
                     break;
                 }
 
+                case "difficulty":
+                {
+                    // Item 4/6 from the heat gap list: reads the ACTUAL difficulty
+                    // heat multipliers instead of assuming Normal=1.0/1.0 (which broke
+                    // this project's own data-trust rule -- every other formula reads
+                    // live, this one didn't yet). Also checks aeroData.testShock/
+                    // testReentry, the debug override that would silently produce fake
+                    // temperatures unrelated to real flight state if either were true.
+                    object worldBase = Get(FindType("SFS.Base"), "worldBase");
+                    if (worldBase == null) { ProbeMod.Result("difficulty: FAILED reason=no_world_loaded"); break; }
+                    object settings = Get(worldBase, "settings");
+                    object difficulty = Get(settings, "difficulty");
+                    if (difficulty == null) { ProbeMod.Result("difficulty: FAILED reason=no_difficulty"); break; }
+
+                    string diffName = "?";
+                    try { diffName = Get(difficulty, "difficulty").ToString(); } catch { }
+                    float heatVelMult = ToF(Get(difficulty, "HeatVelocityMultiplier"));
+                    float minHeatVelMult = ToF(Get(difficulty, "MinHeatVelocityMultiplier"));
+                    double ispMult = ToD(Get(difficulty, "IspMultiplier"));
+                    double dryMassMult = ToD(Get(difficulty, "DryMassMultiplier"));
+
+                    object gmD = FindComponent("SFS.World.GameManager");
+                    object aeroDataD = Get(gmD, "aeroData");
+                    bool testShock = false, testReentry = false;
+                    try { testShock = ToB(Get(aeroDataD, "testShock")); } catch { }
+                    try { testReentry = ToB(Get(aeroDataD, "testReentry")); } catch { }
+
+                    var dsb = new StringBuilder();
+                    dsb.Append("{\"difficulty\":").Append(Q(diffName));
+                    dsb.Append(",\"heatVelocityMultiplier\":").Append(Num(heatVelMult));
+                    dsb.Append(",\"minHeatVelocityMultiplier\":").Append(Num(minHeatVelMult));
+                    dsb.Append(",\"ispMultiplier\":").Append(Num(ispMult));
+                    dsb.Append(",\"dryMassMultiplier\":").Append(Num(dryMassMult));
+                    dsb.Append(",\"aeroTestShock\":").Append(testShock ? "true" : "false");
+                    dsb.Append(",\"aeroTestReentry\":").Append(testReentry ? "true" : "false");
+                    dsb.Append("}");
+                    Write("sfs_probe_difficulty.json", dsb, "difficulty settings");
+                    ProbeMod.Result("difficulty: " + diffName + " heatVelMult=" + heatVelMult +
+                                     " minHeatVelMult=" + minHeatVelMult + " testShock=" + testShock +
+                                     " testReentry=" + testReentry + " -> sfs_probe_difficulty.json");
+                    break;
+                }
+
+                case "jointgraph":
+                {
+                    // Item 3 from the heat gap list: dumps the REAL live joint
+                    // connectivity graph (Rocket.jointsGroup.joints), confirmed via IL
+                    // to be a genuine index (unlike Part.modules' lazy memo -- see
+                    // docs/sfs_reference/11-joints-docking/joints-and-docking.md).
+                    // Each PartJoint is an undirected edge (a, b, anchor) -- no
+                    // strength or type, since SFS joints are graph edges, not physics
+                    // joint components. Combined with heatParts (in truth.jsonl), this
+                    // lets a caller predict WHICH joint breaks next and how many parts
+                    // it takes with it, not just that partCount will drop.
+                    object rJG = ActiveRocket();
+                    if (rJG == null) { ProbeMod.Result("jointgraph: no active rocket"); break; }
+                    object jointsGroup = Get(rJG, "jointsGroup");
+                    if (jointsGroup == null) { ProbeMod.Result("jointgraph: FAILED reason=no_jointsGroup"); break; }
+                    object joints = Get(jointsGroup, "joints");
+                    var jEn = joints as System.Collections.IEnumerable;
+                    var jointItems = new List<string>();
+                    int jointCount = 0;
+                    if (jEn != null)
+                    {
+                        foreach (object j in jEn)
+                        {
+                            jointCount++;
+                            object pa = Get(j, "a");
+                            object pb = Get(j, "b");
+                            string nameA = "?", nameB = "?";
+                            try { nameA = (string)Get(Get(pa, "displayName"), "TranslatableName"); } catch { }
+                            try { nameB = (string)Get(Get(pb, "displayName"), "TranslatableName"); } catch { }
+                            object anchor = Get(j, "anchor");
+                            float ax = ToF(Get(anchor, "x"));
+                            float ay = ToF(Get(anchor, "y"));
+                            jointItems.Add("{\"a\":" + Q(nameA) + ",\"b\":" + Q(nameB) +
+                                           ",\"anchorX\":" + Num(ax) + ",\"anchorY\":" + Num(ay) + "}");
+                        }
+                    }
+                    object partsListJG = Get(jointsGroup, "parts");
+                    var pEnJG = partsListJG as System.Collections.ICollection;
+                    int partCountJG = pEnJG != null ? pEnJG.Count : -1;
+
+                    var jsb = new StringBuilder();
+                    jsb.Append("{\"joints\":[").Append(string.Join(",", jointItems.ToArray())).Append("]");
+                    jsb.Append(",\"jointCount\":").Append(jointCount);
+                    jsb.Append(",\"partCount\":").Append(partCountJG);
+                    jsb.Append("}");
+                    Write("sfs_probe_jointgraph.json", jsb, "jointgraph joints=" + jointCount + " parts=" + partCountJG);
+                    ProbeMod.Result("jointgraph: " + jointCount + " joints, " + partCountJG +
+                                     " parts -> sfs_probe_jointgraph.json");
+                    break;
+                }
+
                 case "cheat":
                 {
                     // FIXED (2026-08-29, Step 1.5 audit findings 1-4):
@@ -1580,6 +1674,7 @@ namespace SFSProbe
                 st.Append(",\"dragCopY\":").Append(dragOk ? Num(dragCopY) : "null");
                 st.Append(",\"dragSurfaces\":").Append(dragAllSurfaces);
                 st.Append(",\"dragExposed\":").Append(dragExposedSurfaces);
+                st.Append(",\"heatParts\":").Append(GetHeatPartsArray(r));
                 object planet = Unwrap(Get(loc, "planet"));
                 st.Append(",\"body\":\"").Append(Get(planet, "codeName")).Append("\"");
                 st.Append("}");
@@ -2442,6 +2537,136 @@ namespace SFSProbe
             catch { return false; }
         }
 
+        // Item 1/2 from the heat gap list (2026-08-30): per-part ExposedSurface
+        // and real per-part Temperature/HeatTolerance/IsHeatShield, every tick.
+        // Recomputes GetDragSurfaces->GetExposedSurfaces independently of
+        // TryComputeDragArea above (a second reflection pass, not shared -- kept
+        // simple/separate rather than risking the already-working dragArea path)
+        // and tallies the REAL per-owner exposed width (Sum of s.line.end.x -
+        // s.line.start.x per owner, exactly matching HeatManager.ApplyHeat's own
+        // accumulator) instead of substituting whole-rocket dragArea, which was
+        // the single biggest source of error in the first accumulation-model
+        // validation (2026-08-30, ~27% peak-magnitude error). Walks every part,
+        // resolves its real heat owner (HeatModule if present, else the Part
+        // itself -- same resolution GetHeatState uses), and reads Temperature/
+        // HeatTolerance/IsHeatShield off that owner via the property (not the
+        // differently-named backing field). +-Infinity sentinels are preserved
+        // as explicit strings, not coerced to null, so the sign-mismatch bug
+        // (see HeatManager.md) is directly observable in real telemetry instead
+        // of being silently hidden by JSON null-coercion.
+        static string GetHeatPartsArray(object rocket)
+        {
+            var items = new List<string>();
+            try
+            {
+                object aero = Get(rocket, "aero");
+                var widthByOwner = new Dictionary<object, float>(ReferenceEqualityComparer.Instance);
+                if (aero != null)
+                {
+                    Type matrixType = FindType("Matrix2x2");
+                    Type aeroModuleType = FindType("SFS.World.Drag.AeroModule");
+                    if (matrixType != null && aeroModuleType != null)
+                    {
+                        object dloc = Unwrap(Get(rocket, "location"));
+                        object velocity = GetWrapped(dloc, "velocity");
+                        double velocityAngle = ToD(Get(velocity, "AngleRadians"));
+                        float rotationInput = (float)(-(velocityAngle - Math.PI / 2.0));
+                        object matrix = InvokeStatic(matrixType, "Angle", new Type[] { typeof(float) }, new object[] { rotationInput });
+                        if (matrix != null)
+                        {
+                            MethodInfo getDragSurfaces = aero.GetType().GetMethod("GetDragSurfaces",
+                                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                                null, new Type[] { matrixType }, null);
+                            object allSurfaces = null;
+                            if (getDragSurfaces != null)
+                            {
+                                try { allSurfaces = getDragSurfaces.Invoke(aero, new object[] { matrix }); }
+                                catch { allSurfaces = null; }
+                            }
+                            if (allSurfaces != null)
+                            {
+                                object exposedSurfaces = InvokeStatic(aeroModuleType, "GetExposedSurfaces",
+                                    new Type[] { allSurfaces.GetType() }, new object[] { allSurfaces });
+                                var sEn = exposedSurfaces as System.Collections.IEnumerable;
+                                if (sEn != null)
+                                {
+                                    foreach (object s in sEn)
+                                    {
+                                        object owner = Get(s, "owner");
+                                        if (owner == null) continue;
+                                        object lineObj = Get(s, "line");
+                                        object start = Get(lineObj, "start");
+                                        object end = Get(lineObj, "end");
+                                        float sx = ToF(Get(start, "x"));
+                                        float ex = ToF(Get(end, "x"));
+                                        float dx = ex - sx;
+                                        float cur;
+                                        widthByOwner.TryGetValue(owner, out cur);
+                                        widthByOwner[owner] = cur + dx;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                object holder = Get(rocket, "partHolder");
+                object parts = Get(holder, "parts");
+                var partsEn = parts as System.Collections.IEnumerable;
+                if (partsEn != null)
+                {
+                    foreach (object part in partsEn)
+                    {
+                        object owner = null;
+                        foreach (object mv in ModuleValues(part))
+                        {
+                            if (mv.GetType().Name == "HeatModule") { owner = mv; break; }
+                        }
+                        if (owner == null) owner = part;
+
+                        string name = "?";
+                        float temp = 0f, tol = 0f;
+                        bool shield = false;
+                        try { name = (string)Get(owner, "Name"); } catch { }
+                        try { temp = ToF(Get(owner, "Temperature")); } catch { }
+                        try { tol = ToF(Get(owner, "HeatTolerance")); } catch { }
+                        try { shield = ToB(Get(owner, "IsHeatShield")); } catch { }
+
+                        float width = 0f;
+                        widthByOwner.TryGetValue(owner, out width);
+
+                        var sb = new StringBuilder();
+                        sb.Append("{\"name\":").Append(Q(name));
+                        sb.Append(",\"temperature\":").Append(NumOrInf(temp));
+                        sb.Append(",\"heatTolerance\":").Append(Num(tol));
+                        sb.Append(",\"isHeatShield\":").Append(shield ? "true" : "false");
+                        sb.Append(",\"exposedSurface\":").Append(Num(width));
+                        sb.Append("}");
+                        items.Add(sb.ToString());
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[heat-parts] error: " + e.Message);
+            }
+            return "[" + string.Join(",", items.ToArray()) + "]";
+        }
+
+        // +-Infinity are real sentinel values in this system (DissipateHeat's
+        // "fully cooled" marker, PartSave.temperature's "never heated" default --
+        // see HeatManager.md's open sign-mismatch question), not error states.
+        // Num()'s ToString("R") would emit the literal word "Infinity", which is
+        // NOT valid JSON -- encoded as an explicit string instead so the sentinel
+        // is visible in telemetry rather than silently corrupting the file or
+        // being coerced away.
+        static string NumOrInf(float v)
+        {
+            if (float.IsPositiveInfinity(v)) return "\"+Inf\"";
+            if (float.IsNegativeInfinity(v)) return "\"-Inf\"";
+            return Num(v);
+        }
+
         // Generic dot-path walker for scoped telemetry field specs (v0.29),
         // e.g. "rb2d.mass" or "location.velocity.x". Starts from the given
         // root (the active rocket, currently the only supported root) and
@@ -2492,6 +2717,11 @@ namespace SFSProbe
                 {
                     List<string> engines = GetEngineArray(rocket);
                     sb.Append(",\"engines\":[").Append(string.Join(",", engines.ToArray())).Append("]");
+                    return true;
+                }
+                case "heatParts":
+                {
+                    sb.Append(",\"heatParts\":").Append(GetHeatPartsArray(rocket));
                     return true;
                 }
                 default:

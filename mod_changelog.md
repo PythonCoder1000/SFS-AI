@@ -9,6 +9,44 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.38.0 — 2026-08-30 (later same day)
+
+Closes the heat gaps identified from the first accumulation-model
+validation (~27% peak-magnitude error, main suspect: the whole-rocket
+`dragArea` stand-in for the real per-part `ExposedSurface`).
+
+- **`heatParts` now written every tick in `truth.jsonl`.** For every
+  part (resolved to its real heat owner — the `HeatModule` if it has
+  one, else the `Part` itself, same rule `GetHeatState` uses): real
+  `Temperature` (via the property, `+Inf`/`-Inf` sentinels preserved as
+  explicit strings rather than silently coerced to null or a crashing
+  `Infinity` literal), `HeatTolerance`, `IsHeatShield`, and a real
+  **per-owner `ExposedSurface`** tally — `Σ(line.end.x - line.start.x)`
+  over that owner's exposed segments, computed the same way
+  `HeatManager.ApplyHeat` computes it internally. This replaces the
+  whole-rocket `dragArea` proxy that was the leading suspect for the
+  27% peak-temperature error in the first validation pass, and also
+  gives real per-part temperature/tolerance data instead of only ever
+  seeing the rocket-wide max.
+- **New `difficulty` command.** Reads the ACTUAL
+  `HeatVelocityMultiplier`/`MinHeatVelocityMultiplier` off
+  `Base.worldBase.settings.difficulty` instead of assuming Normal =
+  1.0/1.0 (which broke this project's own data-trust rule for one
+  session). Also checks `aeroData.testShock`/`testReentry` — the debug
+  override that would silently fake reentry temperatures.
+- **New `jointgraph` command.** Dumps the live joint connectivity graph
+  (`Rocket.jointsGroup.joints` — confirmed a genuine index, not a lazy
+  memo): every `{a, b, anchor}` edge currently on the rocket. Combined
+  with `heatParts`, this is the input needed to eventually predict
+  *which* joint breaks next and how many parts it takes with it, not
+  just that `partCount` will drop.
+- `heatParts` also added as a `computed:heatParts` field for scoped
+  telemetry mode, for consistency with `computed:engines`/`dragArea`.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load, same as every version today.
+
+---
+
 ## v0.37.0 — 2026-08-30 (later same day)
 
 **Root-caused a bug that had been open since before v0.34** — the
