@@ -1767,54 +1767,32 @@ namespace SFSProbe
 
                 case "telemetrysnapshot":
                 {
-                    // QoL (2026-08-30): copies the LIVE truth.jsonl/inputs.jsonl to
-                    // timestamped snapshot files WITHOUT stopping recording -- avoids
-                    // the stop/restart dance entirely, including the real
-                    // discontinuity risk that dance carries (a stop+restart that
-                    // lands near a scene change can silently start a NEW rocket's
-                    // recording, as happened earlier this session). Telemetry keeps
-                    // running uninterrupted; this just hands back a consistent
-                    // point-in-time copy to pull and analyze mid-flight.
-                    //
-                    // Safe to File.Copy while Sample() is actively appending: both
-                    // run on Unity's single main thread (FixedUpdate and the command
-                    // dispatch from Update() never execute concurrently), so there is
-                    // no torn-read risk from a separate writer thread.
-                    if (!Telemetry)
-                    {
-                        ProbeMod.Result("telemetrysnapshot: FAILED reason=not_recording");
-                        break;
-                    }
-                    string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-                    string srcTruth = Path.Combine(ProbeMod.OutDir ?? ".", "truth.jsonl");
-                    string srcInputs = Path.Combine(ProbeMod.OutDir ?? ".", "inputs.jsonl");
-                    string dstDir = Path.Combine(ProbeMod.OutDir ?? ".", "snapshots");
-                    int truthLines = 0, inputLines = 0;
-                    string dstTruth = null, dstInputs = null;
-                    try
-                    {
-                        Directory.CreateDirectory(dstDir);
-                        if (File.Exists(srcTruth))
-                        {
-                            dstTruth = Path.Combine(dstDir, "truth_snapshot_" + stamp + ".jsonl");
-                            File.Copy(srcTruth, dstTruth, true);
-                            truthLines = File.ReadAllLines(dstTruth).Length;
-                        }
-                        if (File.Exists(srcInputs))
-                        {
-                            dstInputs = Path.Combine(dstDir, "inputs_snapshot_" + stamp + ".jsonl");
-                            File.Copy(srcInputs, dstInputs, true);
-                            inputLines = File.ReadAllLines(dstInputs).Length;
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        ProbeMod.Result("telemetrysnapshot: FAILED reason=copy_error " + e.Message);
-                        break;
-                    }
-                    ProbeMod.Result("telemetrysnapshot: truth=" + truthLines + " lines, inputs=" + inputLines +
-                                     " lines -> snapshots/truth_snapshot_" + stamp + ".jsonl, snapshots/inputs_snapshot_" +
-                                     stamp + ".jsonl (recording continues uninterrupted)");
+                    // Corrected 2026-08-30 (v0.42.0's first version copied the
+                    // accumulated FILES, which wasn't what was actually wanted).
+                    // This is a genuine one-tick READ: builds exactly the same
+                    // inputs/truth JSON a real recorded sample would contain (via
+                    // the SAME BuildInputsSample/BuildTruthSample functions
+                    // Sample() itself uses, so it can never silently drift from
+                    // real telemetry's schema), but does NOT touch Telemetry
+                    // state, sampleCount, or either file. Works identically
+                    // whether continuous recording is currently on, off, or
+                    // already running -- a pure peek, zero interruption either way.
+                    object rPeek = ActiveRocket();
+                    if (rPeek == null) { ProbeMod.Result("telemetrysnapshot: no active rocket"); break; }
+                    object rbPeek = Get(rPeek, "rb2d");
+                    object locPeek = Unwrap(Get(rPeek, "location"));
+                    double tPeek = ToD(Get(locPeek, "time"));
+
+                    string inputsPeek = BuildInputsSample(rPeek, rbPeek, tPeek);
+                    string truthPeek = BuildTruthSample(rPeek, rbPeek, locPeek, tPeek);
+
+                    var peekSb = new StringBuilder();
+                    peekSb.Append("{\"inputs\":").Append(inputsPeek);
+                    peekSb.Append(",\"truth\":").Append(truthPeek);
+                    peekSb.Append("}");
+                    Write("sfs_probe_telemetry_snapshot.json", peekSb, "telemetrysnapshot t=" + tPeek);
+                    ProbeMod.Result("telemetrysnapshot: t=" + tPeek + " recording=" + (Telemetry ? "ON" : "off") +
+                                     " (not affected either way) -> sfs_probe_telemetry_snapshot.json");
                     break;
                 }
 
@@ -1944,77 +1922,97 @@ namespace SFSProbe
                 }
 
                 object rb = Get(r, "rb2d");
-                object throttle = Get(r, "throttle");
-                object arrowkeys = Get(r, "arrowkeys");
-                float fdt = Time.fixedDeltaTime;
-                float thr = ToF(GetWrapped(throttle, "throttlePercent"));
-                bool thrOn = ToB(GetWrapped(throttle, "throttleOn"));
-                float turnAxis = ToF(GetWrapped(arrowkeys, "turnAxis"));
-                float mass = ToF(Get(rb, "mass"));
-                float torque = SumEnabledTorque(r);
-                bool rcsOn = ToB(GetWrapped(arrowkeys, "rcs"));
-                int rcsFiring = CountFiringThrusters(r);
-                object eng = GetEngineArray(r);   // one entry per engine/booster module, on or off
+                string inputsLine = BuildInputsSample(r, rb, t);
+                ProbeMod.Append("inputs.jsonl", inputsLine);
 
-                // ---- inputs.jsonl ----
-                var si = new StringBuilder();
-                si.Append("{\"t\":").Append(Num(t));
-                si.Append(",\"fdt\":").Append(fdt.ToString("R"));
-                si.Append(",\"m\":").Append(Num(mass));
-                si.Append(",\"thr\":").Append(Num(thr));
-                si.Append(",\"thrOn\":").Append(thrOn ? "true" : "false");
-                si.Append(",\"turnAxis\":").Append(Num(turnAxis));
-                si.Append(",\"torque\":").Append(Num(torque));
-                si.Append(",\"rcsOn\":").Append(rcsOn ? "true" : "false");
-                si.Append(",\"rcsFiring\":").Append(rcsFiring);
-                si.Append(",\"engines\":[").Append(string.Join(",", ((List<string>)eng).ToArray())).Append("]");
-                si.Append("}");
-                ProbeMod.Append("inputs.jsonl", si.ToString());
-
-                // ---- truth.jsonl ----
-                // world.position/velocity: true double-precision, world-frame,
-                // planet-centered vectors -- NOT the same as rb2d's local-frame
-                // linearVelocityX/Y used through v0.11.
-                object worldPos = GetWrapped(loc, "position");
-                object worldVel = GetWrapped(loc, "velocity");
-
-                var st = new StringBuilder();
-                st.Append("{\"t\":").Append(Num(t));
-                st.Append(",\"h\":").Append(Num(Get(loc, "Height")));
-                st.Append(",\"vv\":").Append(Num(Get(loc, "VerticalVelocity")));
-                st.Append(",\"m\":").Append(Num(mass));
-                st.Append(",\"rot\":").Append(Num(Get(rb, "rotation")));
-                st.Append(",\"angv\":").Append(Num(Get(rb, "angularVelocity")));
-                st.Append(",\"px\":").Append(Num(Get(worldPos, "x")));
-                st.Append(",\"py\":").Append(Num(Get(worldPos, "y")));
-                st.Append(",\"vx\":").Append(Num(Get(worldVel, "x")));
-                st.Append(",\"vy\":").Append(Num(Get(worldVel, "y")));
-                object orbit = GetPredictedOrbit(r);
-                st.Append(",\"predApo\":").Append(Num(Get(orbit, "apoapsis")));
-                st.Append(",\"predPeri\":").Append(Num(Get(orbit, "periapsis")));
-                st.Append(",\"predEcc\":").Append(Num(Get(orbit, "ecc")));
-                st.Append(",\"fuelByStage\":").Append(FuelByStage(r));
-                var heat = GetHeatState(r);
-                st.Append(",\"partCount\":").Append(heat.Item1);
-                st.Append(",\"maxTemp\":").Append(Num(heat.Item2));
-                float dragArea, dragCopX, dragCopY;
-                int dragAllSurfaces, dragExposedSurfaces;
-                bool dragOk = TryComputeDragArea(r, out dragArea, out dragCopX, out dragCopY,
-                                                  out dragAllSurfaces, out dragExposedSurfaces);
-                st.Append(",\"dragArea\":").Append(dragOk ? Num(dragArea) : "null");
-                st.Append(",\"dragCopX\":").Append(dragOk ? Num(dragCopX) : "null");
-                st.Append(",\"dragCopY\":").Append(dragOk ? Num(dragCopY) : "null");
-                st.Append(",\"dragSurfaces\":").Append(dragAllSurfaces);
-                st.Append(",\"dragExposed\":").Append(dragExposedSurfaces);
-                st.Append(",\"heatParts\":").Append(GetHeatPartsArray(r));
-                object planet = Unwrap(Get(loc, "planet"));
-                st.Append(",\"body\":\"").Append(Get(planet, "codeName")).Append("\"");
-                st.Append("}");
-                ProbeMod.Append("truth.jsonl", st.ToString());
+                string truthLine = BuildTruthSample(r, rb, loc, t);
+                ProbeMod.Append("truth.jsonl", truthLine);
 
                 sampleCount++;
             }
             catch (Exception e) { ProbeMod.Log("sample error: " + e.Message); }
+        }
+
+        // Extracted 2026-08-30 from Sample()'s inline body, unchanged logic --
+        // now shared between the continuous per-tick recorder (Sample(), which
+        // appends the result to inputs.jsonl every FixedUpdate while
+        // Telemetry==true) and the new 'telemetrypeek' command (which calls
+        // this directly for a ONE-TIME read, independent of whether continuous
+        // recording is on, off, or already running -- doesn't touch
+        // sampleCount or either file). Keeping this as the single source of
+        // truth means peek can never silently drift out of sync with what
+        // real recorded telemetry actually contains.
+        static string BuildInputsSample(object r, object rb, double t)
+        {
+            object throttle = Get(r, "throttle");
+            object arrowkeys = Get(r, "arrowkeys");
+            float fdt = Time.fixedDeltaTime;
+            float thr = ToF(GetWrapped(throttle, "throttlePercent"));
+            bool thrOn = ToB(GetWrapped(throttle, "throttleOn"));
+            float turnAxis = ToF(GetWrapped(arrowkeys, "turnAxis"));
+            float mass = ToF(Get(rb, "mass"));
+            float torque = SumEnabledTorque(r);
+            bool rcsOn = ToB(GetWrapped(arrowkeys, "rcs"));
+            int rcsFiring = CountFiringThrusters(r);
+            object eng = GetEngineArray(r);
+
+            var si = new StringBuilder();
+            si.Append("{\"t\":").Append(Num(t));
+            si.Append(",\"fdt\":").Append(fdt.ToString("R"));
+            si.Append(",\"m\":").Append(Num(mass));
+            si.Append(",\"thr\":").Append(Num(thr));
+            si.Append(",\"thrOn\":").Append(thrOn ? "true" : "false");
+            si.Append(",\"turnAxis\":").Append(Num(turnAxis));
+            si.Append(",\"torque\":").Append(Num(torque));
+            si.Append(",\"rcsOn\":").Append(rcsOn ? "true" : "false");
+            si.Append(",\"rcsFiring\":").Append(rcsFiring);
+            si.Append(",\"engines\":[").Append(string.Join(",", ((List<string>)eng).ToArray())).Append("]");
+            si.Append("}");
+            return si.ToString();
+        }
+
+        static string BuildTruthSample(object r, object rb, object loc, double t)
+        {
+            float mass = ToF(Get(rb, "mass"));
+            // world.position/velocity: true double-precision, world-frame,
+            // planet-centered vectors -- NOT the same as rb2d's local-frame
+            // linearVelocityX/Y used through v0.11.
+            object worldPos = GetWrapped(loc, "position");
+            object worldVel = GetWrapped(loc, "velocity");
+
+            var st = new StringBuilder();
+            st.Append("{\"t\":").Append(Num(t));
+            st.Append(",\"h\":").Append(Num(Get(loc, "Height")));
+            st.Append(",\"vv\":").Append(Num(Get(loc, "VerticalVelocity")));
+            st.Append(",\"m\":").Append(Num(mass));
+            st.Append(",\"rot\":").Append(Num(Get(rb, "rotation")));
+            st.Append(",\"angv\":").Append(Num(Get(rb, "angularVelocity")));
+            st.Append(",\"px\":").Append(Num(Get(worldPos, "x")));
+            st.Append(",\"py\":").Append(Num(Get(worldPos, "y")));
+            st.Append(",\"vx\":").Append(Num(Get(worldVel, "x")));
+            st.Append(",\"vy\":").Append(Num(Get(worldVel, "y")));
+            object orbit = GetPredictedOrbit(r);
+            st.Append(",\"predApo\":").Append(Num(Get(orbit, "apoapsis")));
+            st.Append(",\"predPeri\":").Append(Num(Get(orbit, "periapsis")));
+            st.Append(",\"predEcc\":").Append(Num(Get(orbit, "ecc")));
+            st.Append(",\"fuelByStage\":").Append(FuelByStage(r));
+            var heat = GetHeatState(r);
+            st.Append(",\"partCount\":").Append(heat.Item1);
+            st.Append(",\"maxTemp\":").Append(Num(heat.Item2));
+            float dragArea, dragCopX, dragCopY;
+            int dragAllSurfaces, dragExposedSurfaces;
+            bool dragOk = TryComputeDragArea(r, out dragArea, out dragCopX, out dragCopY,
+                                              out dragAllSurfaces, out dragExposedSurfaces);
+            st.Append(",\"dragArea\":").Append(dragOk ? Num(dragArea) : "null");
+            st.Append(",\"dragCopX\":").Append(dragOk ? Num(dragCopX) : "null");
+            st.Append(",\"dragCopY\":").Append(dragOk ? Num(dragCopY) : "null");
+            st.Append(",\"dragSurfaces\":").Append(dragAllSurfaces);
+            st.Append(",\"dragExposed\":").Append(dragExposedSurfaces);
+            st.Append(",\"heatParts\":").Append(GetHeatPartsArray(r));
+            object planet = Unwrap(Get(loc, "planet"));
+            st.Append(",\"body\":\"").Append(Get(planet, "codeName")).Append("\"");
+            st.Append("}");
+            return st.ToString();
         }
 
         // FIXED (2026-08-30): old version read Part.temperature -- a plain
