@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.42.0";
+        public const string VersionString = "0.43.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (QoL: new 'telemetrysnapshot' command copies the live truth.jsonl/inputs.jsonl to timestamped snapshots WITHOUT stopping recording, avoiding the stop/restart discontinuity risk entirely; heat ExposedSurface fix from v0.41.0; script/setrot/turn from v0.39-0.40; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (new 'realAirTemp' per-tick truth.jsonl field + 'airtemp' on-demand command: both call the REAL AeroModule.GetTemperatureAndShockwave directly, bypassing our own Python air-temp formula, to definitively test whether a heat-accumulation gap comes from the formula itself vs. something downstream; telemetrysnapshot fix from v0.42.0; heat ExposedSurface fix from v0.41.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1765,6 +1765,28 @@ namespace SFSProbe
                     break;
                 }
 
+                case "airtemp":
+                {
+                    // Cheap on-demand diagnostic: single real-time read of
+                    // AeroModule.GetTemperatureAndShockwave's actual output for
+                    // the current rocket, without needing to be recording
+                    // telemetry at all. The per-tick 'realAirTemp' field in
+                    // truth.jsonl (added same session) uses this exact same
+                    // helper -- use this command for a quick spot-check, use
+                    // the telemetry field for a full-flight comparison against
+                    // the Python air-temperature formula.
+                    object rAT = ActiveRocket();
+                    if (rAT == null) { ProbeMod.Result("airtemp: no active rocket"); break; }
+                    float realTemp = GetRealAirTemperature(rAT);
+                    if (float.IsNaN(realTemp))
+                    {
+                        ProbeMod.Result("airtemp: FAILED reason=read_error (see probe.log)");
+                        break;
+                    }
+                    ProbeMod.Result("airtemp: " + realTemp + " (real game value, straight from AeroModule.GetTemperatureAndShockwave)");
+                    break;
+                }
+
                 case "telemetrysnapshot":
                 {
                     // Corrected 2026-08-30 (v0.42.0's first version copied the
@@ -1971,6 +1993,37 @@ namespace SFSProbe
             return si.ToString();
         }
 
+        // Diagnostic (2026-08-30): calls the REAL AeroModule
+        // .GetTemperatureAndShockwave directly -- confirmed public static,
+        // takes only a Location -- to get the game's own live air-temperature
+        // computation, bypassing the project's own Python reimplementation
+        // entirely. Used to definitively separate whether a heat-accumulation
+        // gap comes from the temperature FORMULA itself vs. something else in
+        // how ApplyHeat integrates it. Returns NaN on any failure so a caller
+        // can distinguish "read failed" from "real value is 0" (0 is a normal,
+        // common reading -- e.g. outside the atmosphere or not moving).
+        static float GetRealAirTemperature(object rocket)
+        {
+            try
+            {
+                object loc = Unwrap(Get(rocket, "location"));
+                if (loc == null) return float.NaN;
+                Type aeroModuleType = FindType("SFS.World.Drag.AeroModule");
+                if (aeroModuleType == null) return float.NaN;
+                MethodInfo getTempMethod = aeroModuleType.GetMethod("GetTemperatureAndShockwave",
+                    BindingFlags.Public | BindingFlags.Static);
+                if (getTempMethod == null) return float.NaN;
+                object[] args = new object[] { loc, 0f, 0f, 0f };
+                getTempMethod.Invoke(null, args);
+                return ToF(args[3]);
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[airtemp] GetTemperatureAndShockwave threw: " + e.Message);
+                return float.NaN;
+            }
+        }
+
         static string BuildTruthSample(object r, object rb, object loc, double t)
         {
             float mass = ToF(Get(rb, "mass"));
@@ -2008,6 +2061,8 @@ namespace SFSProbe
             st.Append(",\"dragCopY\":").Append(dragOk ? Num(dragCopY) : "null");
             st.Append(",\"dragSurfaces\":").Append(dragAllSurfaces);
             st.Append(",\"dragExposed\":").Append(dragExposedSurfaces);
+            float realAirTemp = GetRealAirTemperature(r);
+            st.Append(",\"realAirTemp\":").Append(float.IsNaN(realAirTemp) ? "null" : Num(realAirTemp));
             st.Append(",\"heatParts\":").Append(GetHeatPartsArray(r));
             object planet = Unwrap(Get(loc, "planet"));
             st.Append(",\"body\":\"").Append(Get(planet, "codeName")).Append("\"");

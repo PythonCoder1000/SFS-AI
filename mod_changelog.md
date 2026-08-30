@@ -9,6 +9,37 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.43.0 — 2026-08-30 (later same day)
+
+**Ground-truth diagnostic for the remaining heat-accumulation gap.** After
+the v0.41.0 `ExposedSurface` fix reduced but did not close the
+per-part heat overprediction (~50% → ~46.6%, with a floor-test showing
+~14% remains even at the theoretical minimum exposed area), this adds
+the means to definitively test whether the Python air-temperature
+formula itself is the remaining cause.
+
+- **New `realAirTemp` field, written every tick in `truth.jsonl`.**
+  Calls the REAL `AeroModule.GetTemperatureAndShockwave` directly
+  (confirmed `public static`, takes only a `Location`) — the game's own
+  live air-temperature computation, bypassing the project's Python
+  reimplementation entirely. `null` on any read failure (distinct from
+  a genuine `0`, which is a normal reading outside the atmosphere or at
+  rest).
+- **New `airtemp` on-demand command** for a cheap single-tick spot check
+  without needing to be recording telemetry at all — same underlying
+  helper (`GetRealAirTemperature`) as the telemetry field, so the two
+  can never disagree with each other.
+- **Architectural note for future reference:** the game's own
+  calculation is used here as ground truth / validation, not as a
+  permanent replacement — the Python formula still has to exist and be
+  correct on its own, since its whole purpose is predicting states the
+  game hasn't reached yet (forward-simulating a future flight), which
+  by definition has no live value to query.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load.
+
+---
+
 ## v0.42.0 — 2026-08-30 (later same day)
 
 - **`telemetrysnapshot` command, corrected mid-implementation.** First
