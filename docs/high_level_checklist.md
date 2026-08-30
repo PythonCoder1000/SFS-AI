@@ -27,6 +27,29 @@ behind any confirmed item.
       `centerOfDrag=[-177.99, -319.43]`. `dragarea` probe command shipped
       in v0.27.0. **This was the single highest-priority Tier 1 blocker
       — now closed.**
+- [x] **Drag FORCE formula (predicted gravity+drag vs. measured
+      acceleration) — LIVE-VALIDATED 2026-08-29, the strongest result
+      to date.** Distinct from the item above: `dragArea` confirmed the
+      *computation mechanism* works; this confirms the *physics model*
+      itself predicts real measured acceleration. One continuous
+      73,108-sample flight (Engine Hawk/Fuel Tank/Capsule/Parachute) —
+      powered ascent, vacuum coast to `predApo≈685,164` (~370km
+      altitude), apoapsis, vacuum descent, real atmospheric reentry
+      through 30km, stopped at `h≈97m` (before impact, avoiding the
+      crash-telemetry corruption seen in the original test flight).
+      **70,858 comparison pairs, median magnitude error 0.098%** —
+      matches this project's other confirmed formulas (gravity
+      0.008–0.13%) and is far above the sample size of any prior test.
+      **One real, specific, deferred caveat:** 419 outlier pairs
+      (>20% error), ALL clustered at `h≈26,000–29,600m` during
+      high-speed ascent (`v≈1670–1690 m/s`), right at the edge of the
+      30,000m atmosphere-height cutoff — not scattered noise, a
+      specific reproducible zone. Hypothesized (not confirmed) to be a
+      finite-difference artifact from the density formula's hard cutoff
+      at the atmosphere boundary, similar in character to the earlier
+      apoapsis zero-crossing noise pattern. Root cause deferred by
+      explicit instruction — see `flights_log.jsonl`
+      (`drag_validation_full_ascent_reentry`) for full notes.
 
 ## Physics — was blocked, now has a path
 
@@ -105,10 +128,17 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       found, on or off. Also now covers `BoosterModule`
       (`thrustVector`/`boosterPrimed`), which the old getter missed
       entirely.
-- [ ] **Not yet live-tested.** Built and installed (v0.34.0), but no
-      flight has run against it yet -- next flight settles whether
-      engines were genuinely missing before, correctly reporting
-      `engineOn=false` outside a burn, or throwing.
+- [x] **Live-tested 2026-08-29** (a real 73,108-sample flight) — and
+      the new logging immediately paid off: `GetEngineArray` threw a
+      real, previously-invisible error repeatedly, `EngineModule read
+      error on part "Hawk_Engine_Name": Ambiguous match found` (a
+      genuine .NET `AmbiguousMatchException`, most likely a
+      property/field name collision across `EngineModule`'s inheritance
+      hierarchy). The OLD pre-v0.34 code's bare `catch { }` was almost
+      certainly swallowing this exact exception the whole time — this
+      is the fix working exactly as designed, surfacing a bug that was
+      always there rather than hiding it. **Not yet root-caused or
+      fixed, deferred by explicit instruction.**
 
 ## Tooling bugs — confirmed broken, unfixed
 
