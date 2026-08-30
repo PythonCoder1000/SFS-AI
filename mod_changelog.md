@@ -9,6 +9,27 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.39.0 — 2026-08-30 (later same day)
+
+- **New `turn <value>` command.** Writes `arrowkeys.turnAxis` directly
+  — the real state `Rocket.ApplyTorque` reads to drive rotation. No
+  clamp applied, matching the game's own confirmed direct-write
+  behavior. **Note:** the current test rocket (Capsule/Parachute/Fuel
+  Tank/Nose Cone/Hawk Engine) has no RCS or reaction wheel, so it
+  almost certainly has no `TorqueModule` — on this specific rocket the
+  command only matters via gimbal, and only while an engine's
+  `throttle_Out > 0`.
+- **New `setrot <degrees>` command.** Instant orientation snap — writes
+  `rb2d.rotation` directly and zeroes `rb2d.angularVelocity` in the same
+  call, so a scripted multi-checkpoint flight plan can start each leg
+  clean instead of carrying over spin from whatever happened before.
+  This teleports orientation in one frame; it does not simulate getting
+  there.
+- Compiled clean, installed. **Not yet run live** — needs a fresh game
+  load.
+
+---
+
 ## v0.38.0 — 2026-08-30 (later same day)
 
 Closes the heat gaps identified from the first accumulation-model

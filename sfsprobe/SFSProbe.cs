@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.38.0";
+        public const string VersionString = "0.39.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (closing the heat gap: new 'difficulty' command reads real HeatVelocityMultiplier/MinHeatVelocityMultiplier + aeroData test flags instead of assuming Normal; new 'jointgraph' command dumps the live joint connectivity graph; truth.jsonl now carries 'heatParts' every tick -- real per-part Temperature/HeatTolerance/IsHeatShield plus a real per-owner ExposedSurface tally (replacing the whole-rocket dragArea proxy that caused ~27% error in the first accumulation-model validation); AmbiguousMatchException root-cause fix from v0.37.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (new 'turn' command: writes arrowkeys.turnAxis directly, the real rotation-model input -- NOTE this rocket has no TorqueModule so it only matters via gimbal while an engine fires; new 'setrot' command: instant orientation snap + angularVelocity zero, for clean flight-plan checkpoints; heatParts/difficulty/jointgraph from v0.38.0; AmbiguousMatchException fix from v0.37.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -1483,6 +1483,63 @@ namespace SFSProbe
                     Write("sfs_probe_jointgraph.json", jsb, "jointgraph joints=" + jointCount + " parts=" + partCountJG);
                     ProbeMod.Result("jointgraph: " + jointCount + " joints, " + partCountJG +
                                      " parts -> sfs_probe_jointgraph.json");
+                    break;
+                }
+
+                case "turn":
+                {
+                    // Sets arrowkeys.turnAxis directly -- the SAME state
+                    // Rocket.ApplyTorque reads to drive real rotation
+                    // (turnAxis * torque_effective * dt / mass, torque_effective
+                    // = sum of enabled TorqueModule.torque). IMPORTANT: this
+                    // rocket's part list (Capsule/Parachute/Fuel Tank/Nose Cone/
+                    // Hawk Engine) contains no RCS thruster and no reaction
+                    // wheel, so it almost certainly has NO TorqueModule at all --
+                    // if so, torque_effective is 0 and this write has ZERO
+                    // physical effect via the torque path on THIS rocket. The
+                    // only remaining path is gimbal (RecalculateGimbal), which
+                    // only deflects while an engine's throttle_Out > 0. No
+                    // clamp is applied here, matching the game's own confirmed
+                    // behavior on this branch (nothing clamps turnAxis to +-1 on
+                    // a direct write) -- pass values responsibly.
+                    float turnV = float.Parse(arg, CultureInfo.InvariantCulture);
+                    object rTurn = ActiveRocket();
+                    object arrowkeys = Get(rTurn, "arrowkeys");
+                    bool turnOk = SetWrapped(arrowkeys, "turnAxis", turnV);
+                    ProbeMod.Result("turn " + turnV + (turnOk ? " ok" : " FAILED (arrowkeys obj=" + Name(arrowkeys) + ")"));
+                    break;
+                }
+
+                case "setrot":
+                {
+                    // INSTANT snap, not a simulated turn -- writes rb2d.rotation
+                    // directly (Unity's own plain Rigidbody2D property, degrees,
+                    // NOT one of SFS's Composed/Reference wrapper types) and
+                    // zeroes rb2d.angularVelocity so each checkpoint starts clean
+                    // rather than carrying over spin from whatever happened
+                    // before. Teleports orientation in one frame; does not
+                    // simulate the rotation getting there -- treat data
+                    // immediately after this command with less confidence about
+                    // "how did it get here", full confidence about "what does it
+                    // do FROM here".
+                    float deg = float.Parse(arg, CultureInfo.InvariantCulture);
+                    object rSetrot = ActiveRocket();
+                    object rbSetrot = Get(rSetrot, "rb2d");
+                    if (rbSetrot == null) { ProbeMod.Result("setrot: FAILED reason=no_rb2d"); break; }
+                    bool setrotOk = true;
+                    try
+                    {
+                        PropertyInfo rotProp = rbSetrot.GetType().GetProperty("rotation", BindingFlags.Public | BindingFlags.Instance);
+                        PropertyInfo angvProp = rbSetrot.GetType().GetProperty("angularVelocity", BindingFlags.Public | BindingFlags.Instance);
+                        if (rotProp != null) rotProp.SetValue(rbSetrot, deg, null); else setrotOk = false;
+                        if (angvProp != null) angvProp.SetValue(rbSetrot, 0f, null); else setrotOk = false;
+                    }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Result("setrot: FAILED reason=exception " + e.Message);
+                        break;
+                    }
+                    ProbeMod.Result("setrot " + deg + "deg" + (setrotOk ? " ok (angularVelocity zeroed)" : " PARTIAL (property not found)"));
                     break;
                 }
 
