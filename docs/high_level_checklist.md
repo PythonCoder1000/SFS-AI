@@ -405,6 +405,23 @@ the relevant section of `sfs_physics_reference.md`.
       mode the live value is a private `lastTrajectory`, and
       `SetLocationAndState` nulls the public field outright. Always call
       `GetTrajectory()`. (Confirms an earlier empirical note, from IL.)
+      **Further confirmed live 2026-08-30, and found worse than
+      previously known:** even via the confirmed `GetTrajectory()` call
+      (not the stale raw field), `predApo` gave a wildly wrong number
+      during a real flight — reported ~369km while the craft's actual
+      ballistic apex, independently confirmed via live telemetry AND the
+      confirmed gravity formula (agreement to 0.01%), was only ~54km.
+      The reading barely moved across a 34-second window where the
+      craft's real velocity swung by 250 m/s — looks like a genuine
+      non-refresh in live-physics mode, not just a one-off. Christian
+      separately reports a related class of bug in normal play: SFS's
+      own predicted paths sometimes intersect other planets incorrectly,
+      a known cause of his timewarp crashes — same underlying system,
+      different failure mode. **Practical rule for this project: never
+      trust `predApo`/`predPeri`/`predEcc` telemetry as ground truth.**
+      Compute apex/trajectory from real position/velocity with the
+      confirmed gravity formula instead — it's more accurate than the
+      game's own live prediction.
 - [x] **`Rocket.floating` means "in water"**, not "off the ground".
 - [x] **`maxTerrainHeight`** — see the terrain item above.
 - [x] **Harmony root cause** — see "Abandoned" below; corrected there.
