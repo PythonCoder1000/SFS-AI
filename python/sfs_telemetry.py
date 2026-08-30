@@ -105,6 +105,108 @@ def predicted_gravity_drag_accel(sample: dict, body: dict) -> Optional[tuple[flo
 
 
 # ---------------------------------------------------------------------------
+# Reentry temperature (AeroFormula.GetTemperature, confirmed 2026-08-30)
+# ---------------------------------------------------------------------------
+
+# The 4 serialized AeroFormula coefficients -- confirmed live via the
+# 'aeroformula' probe command (sfsprobe v0.36.0), NOT IL literals, so
+# these cannot be sourced any other way. See
+# docs/sfs_reference/02-drag-aero/AeroFormula.md.
+AEROFORMULA_COEFFICIENTS = {
+    "velPow": 1.85,
+    "densityPow": 2.2,
+    "tempOffset": -500.0,
+    "m": 1.47,
+}
+
+# Per-planet, confirmed live via 'atmophysics' (sfsprobe v0.36.1). Only
+# Earth populated so far -- extend as other bodies get read live. The
+# ctor default of 1.0f happened to match Earth's real value here, but
+# per the project's data-trust rule this was read, not assumed.
+ATMOSPHERE_PHYSICS = {
+    "Earth": {"minHeatingVelocityMultiplier": 1.0, "shockwaveIntensity": 1.0},
+}
+
+# Difficulty.HeatVelocityMultiplier / MinHeatVelocityMultiplier, by
+# difficulty tier (sfs_physics_reference.md section 5.1). This project's
+# empirical checks (e.g. ispMultiplier=1.0000) are all consistent with
+# Normal difficulty, so that's assumed here unless told otherwise --
+# flag if a flight was actually run on Hard/Realistic.
+HEAT_VELOCITY_MULTIPLIER = {"Normal": 1.0, "Hard": 1.3, "Realistic": 4.5}
+MIN_HEAT_VELOCITY_MULTIPLIER = {"Normal": 1.0, "Hard": 1.3, "Realistic": 3.0}
+
+
+def predicted_reentry_temperature(velocity: float, velocity_y: float, density: float,
+                                   body_name: str = "Earth", difficulty: str = "Normal") -> float:
+    """Port of AeroFormula.GetTemperature, confirmed via IL
+    (docs/sfs_reference/02-drag-aero/AeroFormula.md) with all 4
+    coefficients now confirmed live (2026-08-30) rather than guessed.
+
+    velocity: speed magnitude (m/s). velocity_y: SIGNED vertical
+    component (positive = ascending). density: atmospheric density at
+    the sample's altitude (use atmospheric_density(h, body) above).
+
+    This is the GLOBAL air temperature the rocket sees -- NOT a
+    per-part value. Per-part temperature is a separate accumulation
+    (HeatManager.ApplyHeat, not implemented here) that integrates this
+    value over time, weighted by each part's exposed surface. This
+    function gives you the instantaneous forcing input to that
+    accumulation, not the part's own temperature.
+    """
+    coef = AEROFORMULA_COEFFICIENTS
+    atmo = ATMOSPHERE_PHYSICS.get(body_name)
+    if atmo is None:
+        raise ValueError(f"no confirmed atmospherePhysics for body {body_name!r} -- "
+                          f"read it live via the 'atmophysics' probe command first")
+    hvm = HEAT_VELOCITY_MULTIPLIER[difficulty]
+    mhvm = MIN_HEAT_VELOCITY_MULTIPLIER[difficulty]
+
+    min_heat_velocity = atmo["minHeatingVelocityMultiplier"] * mhvm * 250.0
+
+    v = velocity / hvm
+    v_y = velocity_y / hvm
+    min_hv = min_heat_velocity / hvm
+
+    # Ascending? discount some speed -- climbing out heats less than falling in.
+    if v_y > 0.0:
+        v -= min(v_y * 2.5, v * 0.5)
+
+    if v < 0 or density <= 0:
+        return 0.0
+
+    t = (v ** coef["velPow"]) * (density ** (1.0 / coef["densityPow"])) / coef["m"]
+
+    ascent_term = min(v_y / v * 2.0, 0.4) if (v_y > 0.0 and v > 0) else 0.0
+    t += t * (coef["tempOffset"] * ascent_term + 0.2)
+
+    # Hard cap tied to how far above the heating-onset speed you are.
+    cap = (v - min_hv) * 6.0
+    if t > cap:
+        t = cap
+
+    # Soft knee above 2000.
+    if t > 2000.0:
+        t = 2000.0 + (t - 2000.0) / 1.5
+
+    return t if t > 0.0 else 0.0
+
+
+def predicted_reentry_temperature_for_sample(sample: dict, body: dict, body_name: str = "Earth",
+                                              difficulty: str = "Normal") -> Optional[float]:
+    """Convenience wrapper: pulls velocity/velocity_y/density straight
+    from a telemetry sample dict, the way validate_gravity_drag's sibling
+    functions do. velocity_y is 'vv' (VerticalVelocity) in this
+    project's telemetry schema."""
+    vx, vy = sample.get("vx"), sample.get("vy")
+    vv, h = sample.get("vv"), sample.get("h")
+    if None in (vx, vy, vv, h):
+        return None
+    velocity = math.hypot(vx, vy)
+    density = atmospheric_density(h, body)
+    return predicted_reentry_temperature(velocity, vv, density, body_name, difficulty)
+
+
+# ---------------------------------------------------------------------------
 # Stage 1 -- core stats & search
 # ---------------------------------------------------------------------------
 

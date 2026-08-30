@@ -410,7 +410,7 @@ game's own numbers directly (rather than only synthetic test cases).
 > `sfs_source_reference.md`; only the results are here.
 
 ### 5.1 Heat / destruction — was [OPEN], now [CONFIRMED from code],
-[UNTESTED-LIVE]
+[PARTIALLY LIVE-VALIDATED 2026-08-30]
 
 The whole chain is read. A **default part breaks at 412.0 °C**:
 `Part.HeatTolerance` is hardcoded to `HeatTolerance.Low`
@@ -441,12 +441,34 @@ AeroFormula.GetTemperature(velocity, velocity_Y, density, minHeatVelocity):
 `heatVelocityMultiplier` by difficulty is `[1.0, 1.3, 4.5]`;
 `minHeatVelocityMultiplier` is `[1.0, 1.3, 3.0]`.
 
-**Still [OPEN]: the four `AeroFormula` coefficients** `velPow`,
-`densityPow`, `tempOffset`, `m`. They are serialized Unity data, not IL
-literals, so the formula cannot be evaluated offline until they are read
-live. **Their location is now known** — `GameManager.main.aeroData` —
-which closes the "no known path" half of this item; the `AeroData` type's
-own layout is unread, so one live introspection pass finishes it.
+**RESOLVED 2026-08-30 — the four `AeroFormula` coefficients are now
+CONFIRMED, not open.** Read live via the new `aeroformula` probe command
+(sfsprobe v0.36.0): `velPow=1.85`, `densityPow=2.2`, `tempOffset=-500`,
+`m=1.47`. Earth's `atmospherePhysics.minHeatingVelocityMultiplier=1.0`
+and `shockwaveIntensity=1.0` also confirmed live (`atmophysics` command,
+v0.36.1). Full formula now implemented in `python/sfs_telemetry.py` as
+`predicted_reentry_temperature`. **Sanity-checked** (not yet a full
+validation) against the real 73,108-sample reentry flight: predicted air
+temperature is ~0 above 30km, ramps sharply during the real high-speed
+low-altitude descent, peaking ~5900°C as *air* temperature right around
+when that flight's actual parts started breaking off (~410°C part
+temperature, via the slow `ApplyHeat` absorption this doesn't yet model).
+Physically consistent, good sign, **not proof** — see the two remaining
+gaps below.
+
+**Still [OPEN]:**
+1. **The part-level accumulation** (`HeatManager.ApplyHeat`/
+   `DissipateHeat`'s absorb/dissipate integration over time) is not yet
+   implemented in Python — `predicted_reentry_temperature` gives the
+   instantaneous *air* temperature (the forcing input), not a part's own
+   accumulated temperature. This is the real remaining engineering work,
+   not a data gap.
+2. **A genuinely fresh validation flight is needed.** The existing
+   archived reentry flight predates the `GetHeatState` fix (also
+   v0.36.0) — its `maxTemp` telemetry reads `Part.temperature`
+   unconditionally, which is confirmed wrong for any `HeatModule`-
+   carrying part. A flight recorded with the CURRENT probe is needed
+   before real per-part temperature data can be trusted for validation.
 
 Also resolved: **per-part temperature is reachable.** Read the
 `Temperature` property virtually off the `HeatModuleBase` (e.g.

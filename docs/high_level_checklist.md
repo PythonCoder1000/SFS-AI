@@ -67,17 +67,23 @@ four. **None is validated live**, so each is checked as a *research*
 item and re-opened as a *validation* item — a confirmed code reading is
 not a validated physics model. Detail in `sfs_physics_reference.md` §5.
 
-- [x] **Heat/destruction formula** — chain read end to end. Default part
-      breaks at **412.0 °C** (`HeatTolerance.Low` = 400, threshold
-      `× 1.03`), which explains the lone 410.8 °C data point exactly.
-      `ApplyHeat`/`DissipateHeat`/`GetTemperature` all transcribed.
-      Per-part temperature **is** reachable — read `Temperature`
-      virtually off `HeatModuleBase`, not the `Part.temperature` field.
-- [ ] **Heat: the four `AeroFormula` coefficients** (`velPow`,
-      `densityPow`, `tempOffset`, `m`) — serialized Unity data, not IL
-      literals, so the formula can't be evaluated offline yet.
-      **Location now known: `GameManager.main.aeroData`.** `AeroData`'s
-      own layout is unread; one live introspection pass closes this.
+- [x] **Heat/destruction formula** — chain read end to end AND all 4
+      serialized coefficients confirmed live (2026-08-30):
+      `velPow=1.85`, `densityPow=2.2`, `tempOffset=-500`, `m=1.47`.
+      Default part breaks at **412.0 °C**. Full formula implemented in
+      `python/sfs_telemetry.py` (`predicted_reentry_temperature`),
+      sanity-checked against a real reentry flight (predicted air temp
+      ramps sharply exactly where that flight's parts actually broke
+      off). **Still open:** the part-level heat accumulation
+      (`ApplyHeat`/`DissipateHeat` integration over time) isn't
+      implemented yet, and a fresh validation flight is needed (the old
+      archived flight predates the `GetHeatState` read fix).
+- [ ] **Heat: the four `AeroFormula` coefficients** — **CONFIRMED LIVE
+      2026-08-30**: `velPow=1.85`, `densityPow=2.2`, `tempOffset=-500`,
+      `m=1.47`, via the new `aeroformula` probe command. No longer open
+      as a research item — kept here only until the part-level
+      accumulation + fresh validation flight (tracked above) closes it
+      out entirely.
 - [x] **Multi-engine rockets** — resolved by discovering there is
       **nothing to model**: no summation exists. Each engine calls
       `AddForceAtPosition` independently; off-axis torque is emergent.

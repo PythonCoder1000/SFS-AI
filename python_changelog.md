@@ -6,6 +6,53 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-08-30 — `predicted_reentry_temperature` (AeroFormula.GetTemperature port)
+
+- **Added to `sfs_telemetry.py`: `predicted_reentry_temperature` +
+  `predicted_reentry_temperature_for_sample`.** Full port of
+  `AeroFormula.GetTemperature`, confirmed via IL
+  (`docs/sfs_reference/02-drag-aero/AeroFormula.md`), now runnable end
+  to end because the last two unknowns got read live today:
+  - The 4 `AeroFormula` coefficients (`velPow=1.85`, `densityPow=2.2`,
+    `tempOffset=-500`, `m=1.47`) via the new `aeroformula` probe command
+    (sfsprobe v0.36.0).
+  - Earth's `atmospherePhysics.minHeatingVelocityMultiplier=1.0` and
+    `shockwaveIntensity=1.0` via the new `atmophysics` probe command
+    (sfsprobe v0.36.1) — the ctor default happened to match, but per the
+    project's data-trust rule this was read, not assumed.
+  Difficulty multipliers (`HeatVelocityMultiplier`/
+  `MinHeatVelocityMultiplier`) are assumed **Normal** (1.0/1.0), matching
+  every other empirical check this project has run (e.g. `ispMultiplier
+  = 1.0000`) — flag if a flight was ever actually run on Hard/Realistic.
+- **This is the GLOBAL instantaneous air temperature (the forcing
+  input), not a per-part accumulated temperature.** `HeatManager
+  .ApplyHeat`'s absorption/dissipation integration over time is a
+  separate step, **not yet implemented in Python** — this function
+  answers "how hot is the air right now", not "how hot has this part
+  gotten."
+- **Sanity-checked against the real 73,108-sample reentry flight**
+  (`flight01_2026-08-29`, the same one behind the 0.098%-error drag
+  validation): predicted air temperature is essentially zero for the
+  whole vacuum-coast portion above 30km (atmosphere cutoff engaging
+  correctly), then ramps sharply exactly during the real high-speed
+  low-altitude descent (~t=1089–1100s, h≈20,000m→10,000m, v≈1700m/s),
+  peaking near 5900°C as *air* temperature — physically consistent with
+  why the actual PART temperature (subject to slow absorption) crossed
+  the 412°C break threshold and started shedding parts right around
+  that same window. Not a full validation (that needs the part-level
+  integration plus a fresh flight recorded with the fixed `GetHeatState`
+  — see below), but strong corroborating evidence the formula's right
+  before investing in that integration layer.
+- **Next step:** implement `HeatManager.ApplyHeat`/`DissipateHeat`'s
+  per-part accumulation in Python, then fly a fresh reentry (the
+  existing archived flight predates the `GetHeatState` fix in sfsprobe
+  v0.36.0, so its `maxTemp` telemetry may be silently wrong for any
+  `HeatModule`-carrying part) to get real per-part temperature data to
+  validate the full accumulation model against, not just this
+  instantaneous forcing-function sanity check.
+
+---
+
 ## 2026-08-29 (later same day) — forward_sim.py + interactive trajectory-prediction demo
 
 - **Added `python/forward_sim.py`.** Forward-integrates (RK4, not Euler)
