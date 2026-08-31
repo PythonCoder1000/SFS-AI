@@ -18,6 +18,8 @@ __pycache__/
 .DS_Store
 
 # Local working-procedure notes -- not for the repo
-CLAUDE.md
-python/prediction_demo_data.json
-temp_claude_state/
+analysis/prediction_demo_data.json
+bookkeeping/active_state.md
+
+# Parked/unused assets -- moved here instead of deleted, not for the repo
+unused_assets/

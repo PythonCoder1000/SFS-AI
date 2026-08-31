@@ -23,34 +23,39 @@ editor and a decompiler.
 **Steam auto-update must stay off.** Every value and field offset derived
 so far is tied to this exact build. An update doesn't just stale the
 numbers -- it makes measurements taken before and after incomparable.
-`python/il_inventory.py` and `sfsprobe_regression_check` exist specifically
+`analysis/il_inventory.py` and `sfsprobe_regression_check` exist specifically
 to catch this if it ever happens.
 
 ## Layout
 
+Organized by content theme, not file type. Reorganized 2026-08-30 --
+CLAUDE.md now lives in Project knowledge, not this repo.
+
 ```
 SFS AI/
   README.md              this file
-  CLAUDE.md               local working notes (gitignored, not in the repo)
-  mod_changelog.md        SFSProbe.cs version history
-  python_changelog.md     Python-side (analysis/tooling) history
-  flights_log.jsonl       tagged flight bookkeeping (gitignored)
 
   sfsprobe/               the C# probe mod (SFSProbe.cs, build.sh)
-    probe_cmd.py           standalone adaptive-polling CLI (superseded by sfsprobe_mcp, kept as a thin fallback)
+    mod_changelog.md        SFSProbe.cs version history (lives with the mod it documents)
+    probe_cmd.py            standalone adaptive-polling CLI (superseded by sfsprobe_mcp, kept as a thin fallback)
 
   sfsprobe_mcp/           MCP server -- the primary way to talk to the mod
     server.py               ~30 tools: live game control, telemetry analysis,
                              flight orchestration, bookkeeping
     README.md                full tool reference
 
-  python/                 shared analysis engine + standalone scripts
+  analysis/               shared analysis engine + standalone scripts (renamed from python/)
     sfs_telemetry.py        the analysis logic sfsprobe_mcp's tools call into
     analyze_dragarea.py      standalone CLI validation script
     il_inventory.py          type/method/field inventory generator (re-runnable
                              after an SFS update as a "did anything change" diff)
     reference_index.py       docs/sfs_reference/'s manifest/INDEX.md generator
     reference_add.py         adds one class's docs into the reference set
+    python_changelog.md      Python-side (analysis/tooling) history (lives with the code it documents)
+
+  bookkeeping/            session/flight state, not research
+    flights_log.jsonl       tagged flight bookkeeping (gitignored)
+    active_state.md          lightweight "where we left off" state (gitignored)
 
   docs/                   research, physics reference, and the SFS Documentation
     sfs_reference/           per-class API reference of SFS's own decompiled
@@ -59,7 +64,13 @@ SFS AI/
     high_level_checklist.md   Tier 1 research status tracker
     sfs_reference_plan.md     standing instructions for the SFS Documentation effort
 
+  blueprints/             rocket designs (research/, live/)
+
   scratch/                gitignored -- raw IL dumps, not our code
+
+  unused_assets/          gitignored -- parked, not deleted: old session handoffs,
+                          macOS .DS_Store cruft, stale __pycache__, the unused
+                          harmonyx lib, and the superseded local CLAUDE.md
 ```
 
 ## sfsprobe (the mod)

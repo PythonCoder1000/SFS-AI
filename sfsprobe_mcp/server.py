@@ -39,13 +39,13 @@ from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# python/ (this project's analysis code) lives alongside sfsprobe_mcp/,
-# not inside it -- add it to sys.path so these tools call directly into
-# sfs_telemetry.py (no subprocess). Keeps mac-terminal-mcp reserved for
-# things that actually need a real shell (compiling the mod), per
-# Christian's explicit ask.
+# analysis/ (this project's analysis code, renamed from python/ 2026-08-30)
+# lives alongside sfsprobe_mcp/, not inside it -- add it to sys.path so
+# these tools call directly into sfs_telemetry.py (no subprocess). Keeps
+# mac-terminal-mcp reserved for things that actually need a real shell
+# (compiling the mod), per Christian's explicit ask.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_PROJECT_ROOT / "python"))
+sys.path.insert(0, str(_PROJECT_ROOT / "analysis"))
 import sfs_telemetry as st  # noqa: E402
 import blueprint_builder as bpb  # noqa: E402
 
@@ -70,7 +70,7 @@ DRAGAREA_JSON_FILE = MOD_DIR / "sfs_probe_dragarea.json"
 SNAPSHOT_JSON_FILE = MOD_DIR / "sfs_probe_flight.json"
 PLACED_MAGNETS_JSON_FILE = MOD_DIR / "sfs_probe_placed_magnets.json"
 ARCHIVE_DIR = MOD_DIR / "archive"
-FLIGHTS_LOG_FILE = _PROJECT_ROOT / "flights_log.jsonl"
+FLIGHTS_LOG_FILE = _PROJECT_ROOT / "bookkeeping" / "flights_log.jsonl"
 BLUEPRINTS_RESEARCH_DIR = _PROJECT_ROOT / "blueprints" / "research"
 BLUEPRINTS_LIVE_DIR = _PROJECT_ROOT / "blueprints" / "live"
 
