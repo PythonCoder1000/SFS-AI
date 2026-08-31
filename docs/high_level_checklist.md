@@ -134,7 +134,13 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
 - [ ] **Live validation of RCS and terrain.** Heat and multi-engine
       are now both validated live (heat: 0.18% mean peak error, formula
       independently confirmed against the game's own real computation;
-      multi-engine: 0.14% median error). RCS and terrain remain
+      multi-engine: 0.14% median error). **RCS partially validated
+      2026-08-30**: the `TorqueThrust` selection gate matches real
+      flight data at 99.63% (4081/4096 samples) — the two per-part
+      thresholds are now read live too (`rcsinfo` command). Still open:
+      actual force magnitude/direction (needs an engines-off flight)
+      and the quadratic-scaling arithmetic (needs per-part world
+      orientation telemetry, not yet added). Terrain remains completely
       untested against real flight data.
 
 ## Tooling bugs — fixed 2026-08-29 (v0.34.0)

@@ -13,9 +13,24 @@ can be trusted at face value. RCS held up: one small correction (an
 interface name) and one new clarifying detail (`Update_RCS_On` is
 event-driven), but every physics-determining method (`FixedUpdate`,
 `TorqueThrust`, `DirectionThrust`) matched the existing documentation
-exactly, instruction for instruction. **Not yet live-validated** — no
-rocket with actual RCS parts has been flown this project; the two angle
-thresholds remain unread as a result.
+exactly, instruction for instruction.
+
+**The `TorqueThrust` selection gate is now LIVE-VALIDATED, not just
+confirmed from IL** (2026-08-30, same day, a manual test flight with a
+real 6-thruster RCS-equipped rocket, symmetry-placed). Checked every
+tick where `DirectionalAxis == 0` (so only `TorqueThrust` could explain
+firing) against the confirmed gate `\|TurnAxis\|≥0.95 OR \|angv\|≥2`:
+**4,081 of 4,096 samples matched exactly (99.63%)**. The 15 apparent
+mismatches all showed `TurnAxis` already back at exactly `0` with
+firing still reported, clustered in tight sub-100ms groups — consistent
+with a one-tick read-order artifact (the probe's own telemetry sampling
+and `RcsModule.FixedUpdate` are separate Unity scripts with no
+guaranteed execution order within a tick), not a real logic mismatch.
+**Not yet validated:** the actual force magnitude/direction (needs an
+engines-off flight to isolate RCS's own contribution from simultaneous
+main-engine thrust) and the quadratic-force-scaling arithmetic (needs
+per-part world orientation, not currently in telemetry, to reconstruct
+`sumNormal`).
 
 ---
 
@@ -288,6 +303,7 @@ derive it).
 | Mass flow `thrust·count/ISP`, no throttle, no `IspMultiplier` | [CONFIRMED] — re-verified 2026-08-30 |
 | RCS self-disables when fuel cannot flow, via `onStateChange` event | [CONFIRMED] — event-trigger detail added 2026-08-30 |
 | Force quadratic in firing-thruster count | [CONFIRMED] arithmetic, [OPEN] in flight |
+| Torque gate `\|TurnAxis\|≥0.95 OR \|angv\|≥2` matches real firing | [x] LIVE-VALIDATED 2026-08-30 — 99.63% (4081/4096), residual explained by sampling order |
 | `directionAngleThreshold` / `torqueAngleThreshold` values | [x] read live — `rcsinfo` command, sfsprobe v0.44.0 |
 | `RCS_On` backing store (for writing it) | [OPEN] |
 | `ToggleRCS` bodies | [OPEN] |
