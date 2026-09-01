@@ -60,12 +60,11 @@ behind any confirmed item.
 
 ## Physics — was "still open, no path yet"; now read from code, awaiting live validation
 
-**STATUS CHANGE (source-doc pass, `session-2026-08-27-sfs_source_code_docs.md`):**
-all four items below previously read "no formula read from code" /
-"untouched". Reading the IL bodies produced confirmed formulas for all
-four. **None is validated live**, so each is checked as a *research*
-item and re-opened as a *validation* item — a confirmed code reading is
-not a validated physics model. Detail in `sfs_physics_reference.md` §5.
+**STATUS (updated 2026-08-31):** all four items below previously read
+"no formula read from code" / "untouched". Reading the IL bodies
+produced confirmed formulas for all four, and as of this date **all
+four are also validated live** against real flight data — heat,
+multi-engine, terrain, and RCS. Detail in `sfs_physics_reference.md` §5.
 
 - [x] **Heat/destruction formula** — chain read end to end, all 4
       coefficients confirmed live, AND live-validated against the
@@ -110,15 +109,12 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       surfaced and got the `AmbiguousMatchException` fixed (v0.37.0,
       see tooling section) — engine array reads were unusable before
       that fix.
-- [x] **RCS** — both selection methods read. Not proportional to input:
-      `TorqueThrust` returns false unless `|TurnAxis| ≥ 0.95` **or**
-      `|angularVelocity| ≥ 2 °/s`; the second clause is the
-      auto-stabilisation. Thrusters are effectively on/off.
-- [ ] **RCS force scaling in firing-thruster count** — `sumNormal` is an
-      unnormalised sum then multiplied by `count` again, so force looks
-      quadratic while mass flow stays linear. Both `mul` opcodes
-      confirmed, **flight effect unmeasured** — do not treat N² as
-      established.
+- [x] **RCS** — both selection methods read, and force
+      magnitude/direction fully live-validated — see the comprehensive
+      entry below ("Live validation of RCS — fully closed 2026-08-31").
+      Not proportional to input: `TorqueThrust` returns false unless
+      `|TurnAxis| ≥ 0.95` **or** `|angularVelocity| ≥ 2 °/s`; the second
+      clause is the auto-stabilisation. Thrusters are effectively on/off.
 - [x] **SOI transitions** — mechanism read. Crossing an SOI boundary in
       physics mode sets `PhysicsMode = false`, which **disables every
       collider and zeroes angular velocity**, calls
@@ -131,17 +127,68 @@ not a validated physics model. Detail in `sfs_physics_reference.md` §5.
       `Planet.GetTerrainHeightAtAngle`, plus a batch
       `GetTerrainHeightAtAngles`. `maxTerrainHeight` is only a
       fast-reject radius. Available all along.
-- [ ] **Live validation of RCS and terrain.** Heat and multi-engine
-      are now both validated live (heat: 0.18% mean peak error, formula
-      independently confirmed against the game's own real computation;
-      multi-engine: 0.14% median error). **RCS partially validated
-      2026-08-30**: the `TorqueThrust` selection gate matches real
-      flight data at 99.63% (4081/4096 samples) — the two per-part
-      thresholds are now read live too (`rcsinfo` command). Still open:
-      actual force magnitude/direction (needs an engines-off flight)
-      and the quadratic-scaling arithmetic (needs per-part world
-      orientation telemetry, not yet added). Terrain remains completely
-      untested against real flight data.
+- [x] **Terrain height live-validated 2026-08-30** (new `terrain` probe
+      command, v0.45.0). 13-point angular sweep on Earth showed genuine
+      per-angle variation — real land ~45-52m right at the craft's
+      position, dropping to deep underwater terrain (down to -3557m
+      unclamped, correctly clamped to 0 with `clampToWater=true`) a few
+      degrees either side, while `maxTerrainHeight` reported 261.4m for
+      the same body — well above the real local surface. Cross-check
+      (`Location.Height` − `Location.GetTerrainHeight(true)` = swept
+      value at offset 0) matched to full precision.
+- [x] **Terrain surface queries live-validated 2026-08-30** (new
+      `terraingeo` probe command, v0.46.0). `IsInsideTerrain` exercised
+      at three points: real craft position (`false`), a synthetic point
+      5m below the local surface (`true` — confirms the real
+      surface-comparison branch), and a synthetic point 1000m above
+      `maxTerrainHeight` (`false` — confirms the fast-reject branch).
+      `GetTerrainColor` returned a plausible grass green matching the
+      landmass under the craft; `GetMaxLOD()` returned 12.
+- [x] **Terrain research fully closed 2026-08-30** — read the IL body
+      for the two remaining open pieces:
+      - `GetTerrainNormal` is **misnamed**: it's actually a
+        central-difference **tangent** vector along the surface, in
+        **global XY** (not a local frame as first guessed) — matches
+        the live reading to 5+ significant figures once decoded.
+      - `GetTerrainHeightAtAngles`' wrapper body: normalizes angles,
+        returns an all-zero array for bodies with no solid surface
+        (`hasTerrain==false`, e.g. gas giants — don't mistake that `0`
+        for sea level), delegates the actual noise to
+        `TerrainSampler.GetTerrainSamples`, which itself (1) calls a
+        per-planet `SampleCommand` pipeline for the raw heightmap
+        (**[OPEN, deprioritized]** — genuinely deep procedural noise,
+        not needed since the wrapper API is fully validated), (2)
+        actively **lowers** underwater terrain further via a
+        water-color-driven depth adjustment (explains the -3557m deep
+        readings from the live sweep), and (3) blends toward `FlatZone`
+        targets near guaranteed-flat landing sites.
+      - `SFS.World.Terrain` namespace (`DynamicTerrain`,
+        `TerrainColliderModule`) confirmed to be Unity mesh-LOD and
+        physics-collider plumbing — real collision is handled
+        automatically by the engine, out of scope for the agent.
+      Terrain is now closed end-to-end: height querying, surface
+      queries (inside/color/normal/LOD), and the underlying mechanism
+      are all understood to the confirmed standard.
+- [x] **Live validation of RCS — fully closed 2026-08-31.** Heat and
+      multi-engine are both validated live (heat: 0.18% mean peak error,
+      formula independently confirmed against the game's own real
+      computation; multi-engine: 0.14% median error). RCS: the
+      `TorqueThrust` selection gate matches real flight data at 99.63%
+      (4081/4096 samples, 2026-08-30) — the two per-part thresholds are
+      read live too (`rcsinfo`). **Force magnitude/direction validated
+      live 2026-08-31** on an engines-off coast flight: predicted force
+      (per-module `sumNormal·thrust·count·9.8`, `rcsforce` command
+      v0.47.0) matched real finite-differenced force to 0.06%
+      (29.38 real vs 29.4 predicted for `turnAxis<0`; the `turnAxis>0`
+      case, predicted exactly zero by geometric cancellation, landed
+      close to the measurement noise floor). Median per-tick direction
+      error 6.1°. See `docs/sfs_source_reference.md` §D3.8 — including
+      an honest note on a Python re-derivation bug (wrongly pooling all
+      6 RCS modules' `count` together instead of scoping per-module)
+      caught and corrected during the analysis; the probe tooling and
+      the original IL reading were both right all along. This closes
+      the last open Tier 1 physics item — heat, multi-engine, terrain,
+      and RCS are now all fully closed.
 
 ## Tooling bugs — fixed 2026-08-29 (v0.34.0)
 
@@ -477,14 +524,17 @@ Materially: aero torque magnitude computed from the now-confirmed
 dragArea geometry, plus a decision (not necessarily research) on each of
 the items in "Design decisions owed."
 
-**REVISED (source-doc pass).** The old framing said heat, multi-engine,
-RCS and SOI/terrain "matter more once flying complex rockets in Tier 2+
-than for a first working demo — worth flagging as deferrable rather than
-blocking." That is still the right *priority* call, but the reason has
-changed: they are no longer deferred because they are unknown. **All four
-now have confirmed formulas read from IL**; what they lack is live
-validation. So the deferral is cheap now — picking any of them up is a
-flight-test, not a research project.
+**REVISED (2026-08-31).** All four items the old framing called out as
+deferrable-but-unknown — heat, multi-engine, terrain, RCS — are now
+**fully closed**: confirmed from IL *and* live-validated against real
+flight data (heat 0.18% mean peak error; multi-engine 0.14% median
+error; terrain height/surface queries + `GetTerrainNormal`/
+`GetTerrainHeightAtAngles` bodies all confirmed and live-checked; RCS
+selection gate 99.63% live match plus force magnitude 0.06% live match).
+None of them are research items anymore, deferred or otherwise — there's
+nothing left to look up. The earlier note that "picking any of them up
+is a flight-test, not a research project" turned out to be exactly
+right, and all four flight-tests are now done.
 
 Two things did get *added* to Tier 1 by this pass, both decisions rather
 than research:
@@ -495,7 +545,11 @@ than research:
 2. **The timewarp ceiling is now two decisions, not one** — physics warp
    and rails warp scale different quantities and gate different physics.
 
-One item to keep honest: the four confirmed formulas are `[CONFIRMED]` as
-*code readings* and `[UNTESTED-LIVE]` as *physics*. Do not let the
-checkboxes above collapse that distinction — a demo that relies on the
-heat model without a flight test is relying on something never executed.
+**Updated 2026-08-31**: the caveat that used to live here — that the
+four confirmed formulas were code readings only, not validated physics —
+no longer applies. All four now have real flight-test validation
+(heat 0.18% mean peak error; multi-engine 0.14% median error; terrain
+height/surface queries live-confirmed; RCS force magnitude 0.06% error).
+A demo relying on any of the four is now relying on something that has
+actually been measured against reality, not just read from decompiled
+code.

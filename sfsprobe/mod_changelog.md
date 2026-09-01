@@ -9,6 +9,112 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.48.0 — 2026-08-30 (later same day)
+
+**New player-assignable key bindings** — `assignkey`/`unassignkey`/
+`listkeys`/`clearkeys`, letting the person bind a key themselves to
+trigger any probe command at the exact in-flight moment only they know
+is right, instead of Claude reacting a beat late to typed narration.
+Built for the RCS engines-off test (e.g. `assignkey - rcsforce` to snap
+a force reading the instant full deflection is hit) but general-purpose
+— any command string is bindable.
+
+- **`assignkey <key> <command...>`** — binds a key to a full command
+  line, run through the normal `Command()` dispatch on every press (so
+  target commands can have their own args, e.g.
+  `assignkey - terrain -10,0,10`). Accepts real `KeyCode` names
+  (`R`, `F5`, `LeftShift`), bare digits (`5` → `Alpha5`), and
+  symbol/word aliases for keys that aren't valid identifiers on their
+  own (`-`, `=`, `.`, `space`, `enter`, etc.).
+- **`unassignkey <key>`**, **`listkeys`**, **`clearkeys`** — remove one
+  binding, list all active bindings, or clear all of them.
+- Checked in `ProbeRunner.Update()` (not `FixedUpdate`) every frame, on
+  the same reasoning as the existing F9/`=`/Enter/Backslash hotkeys
+  already there: `Input.GetKeyDown` is a one-frame-true edge and
+  `FixedUpdate`'s fixed cadence can miss it at high framerate.
+- Bindings are in-memory only (a `Dictionary<KeyCode,string>` on the
+  static `Probe` class) — they reset on mod reload / game restart, same
+  as everything else in the probe's live state.
+
+---
+
+## v0.47.0 — 2026-08-30 (later same day)
+
+**New `rcsforce` command**, completes the tooling needed for RCS force
+magnitude/direction and N² firing-count validation.
+
+- **New `rcsforce` command.** Replicates `RcsModule.FixedUpdate`'s exact
+  real-call sequence per RCS module by calling the actual game/Unity
+  functions via reflection — `Rigidbody2D.worldCenterOfMass`,
+  `Transform.TransformPoint`, `Transform_Utility.TransformVectorUnscaled`,
+  and the private `TorqueThrust`/`DirectionThrust` selection methods
+  themselves — rather than reimplementing any of that math. Only the
+  final `sumNormal` vector sum and `thrust·count·9.8` force scaling are
+  computed locally, matching `FixedUpdate`'s own IL exactly. Reports
+  per-module deadzone status, per-thruster world normals and real
+  fire/no-fire decisions, predicted force vector and mass flow, plus
+  rocket-wide totals and `rocketMass` for predicted-acceleration
+  comparisons. Output: `sfs_probe_rcsforce.json`.
+- Fresh IL re-read of `RcsModule.FixedUpdate` (RVA 0x65f34) during this
+  pass confirmed the D3.1 writeup exactly, including two Unity-side
+  calls (`Transform.TransformPoint`, `Vector2.op_Implicit`) not
+  previously traced. `TransformPoint` and the `Vector2`→`Vector3`
+  conversion are resolved by explicit parameter type (not the shared
+  `InvokeReturn` helper) since they live in `UnityEngine.CoreModule`,
+  outside this project's own IL dump, where Unity commonly has multiple
+  overloads that would throw `AmbiguousMatchException` on a plain
+  `GetMethod(name)` lookup.
+- **Tooling-complete, not yet live-validated**: still blocked on an
+  actual engines-off test flight to compare the predicted force against
+  a real finite-difference measurement. See
+  `docs/sfs_source_reference.md` §D3.7.
+
+---
+
+## v0.46.0 — 2026-08-30 (later same day)
+
+**New `terraingeo` command**, completes live validation of terrain surface
+queries following v0.45.0's height sweep.
+
+- **New `terraingeo` command.** Reads `IsInsideTerrain`, `GetTerrainNormal`,
+  `GetTerrainColor`, and `GetMaxLOD` at the active craft's real position,
+  plus exercises `IsInsideTerrain` at two synthetic `Double2` points
+  (built via reflection on the live position's own type): 5m below the
+  local surface at the same angle, and 1000m above `maxTerrainHeight` at
+  the same angle — directly hitting both the surface-comparison and
+  fast-reject branches without needing to teleport the real craft.
+  Output: `sfs_probe_terraingeo.json`.
+- **Live-validated same day**: all three `IsInsideTerrain` checks matched
+  expectations exactly (real position `false`, underground `true`, deep
+  space `false`). `GetTerrainColor` returned a plausible grass green;
+  `GetMaxLOD()` returned 12. `GetTerrainNormal` returned a valid unit
+  vector but **not** aligned with the global radial direction — flagged
+  as an open question (likely a local tangent-frame vector) rather than
+  asserted, since the IL body wasn't read this session. See
+  `docs/sfs_source_reference.md` §D4.4 and `docs/high_level_checklist.md`.
+
+---
+
+## v0.45.0 — 2026-08-30 (later same day)
+
+**New `terrain` command**, first live look at terrain height querying.
+
+- **New `terrain` command.** Reads the active rocket's current angular
+  position and sweeps real per-angle terrain height around it via
+  `Planet.GetTerrainHeightAtAngles` (batched call, both `clampToWater=true`
+  and `false` in one pass), plus `Location.GetTerrainHeight` for a direct
+  cross-check against `Height`. Optional arg: comma-separated degree
+  offsets (e.g. `terrain -10,0,10`); defaults to a 13-point ±30° fan.
+  Output: `sfs_probe_terrain.json`.
+- **Live-validated same day**: confirmed real per-angle terrain variation
+  on Earth (land ~45-52m near the craft, dropping to deep underwater a
+  few degrees off, `maxTerrainHeight` reporting 261.4m as just the
+  fast-reject bound), and the `Location.GetTerrainHeight` /
+  `GetTerrainHeightAtAngle` cross-check matched to full precision. See
+  `docs/sfs_source_reference.md` §D4.4 and `docs/high_level_checklist.md`.
+
+---
+
 ## v0.44.0 — 2026-08-30 (later same day)
 
 **RCS live-validation prep**, following the same-day RCS documentation

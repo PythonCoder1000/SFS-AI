@@ -519,7 +519,7 @@ it has moved to the checklist's tooling section. Given the above, one
 engine's direction is not a meaningful summary of a multi-engine rocket
 anyway; the probe should emit a per-engine array.
 
-### 5.3 RCS — was [OPEN, deliberately unmodeled], now [CONFIRMED]
+### 5.3 RCS — was [OPEN, deliberately unmodeled], now [CONFIRMED-LIVE]
 
 Both selection methods are read. The gate that makes RCS behave as a
 rotation damper:
@@ -537,12 +537,19 @@ RcsModule.FixedUpdate:
 on/off, firing only at near-full deflection **or** whenever the craft is
 rotating faster than 2 °/s. The second clause is the auto-stabilisation.
 
-One caveat kept explicitly open: `sumNormal` is an **unnormalised** vector
-sum that is then multiplied by `count` again, so force appears quadratic
-in the number of firing thrusters while mass flow stays linear. Both
-`mul` opcodes are confirmed, but non-parallel normals partially cancel
-and **the flight consequence has not been measured** — do not treat the
-N² as established.
+**Live-validated 2026-08-31** on an engines-off coast flight (see
+`sfs_source_reference.md` §D3.8 for the full derivation): `sumNormal` and
+`count` are scoped **per RCS module** (`FixedUpdate` is an instance
+method, so each module only sums over its own thrusters), which does
+make force quadratic in a single module's own firing-thruster count —
+confirmed both in the arithmetic and now in real flight data, matching
+to 0.06% (29.38 measured vs 29.4 predicted for one steering direction;
+the other direction predicts exact cancellation to zero and measured
+close to the noise floor). Median per-tick direction error 6.1°. An
+earlier hand re-derivation during this validation mistakenly pooled all
+modules into one shared count, which would have overstated the force by
+~6x — caught and corrected before it reached this doc; the per-module
+scoping above is what's confirmed.
 
 ### 5.4 SOI transitions and terrain — was [OPEN], now [CONFIRMED
 mechanism], [UNTESTED-LIVE]
@@ -573,6 +580,18 @@ discontinuity across the transition. Never observed in flight — watch
 > `IsInsideTerrain`. Terrain-relative altitude has been available all
 > along. Note this is a different quantity from `Location.Height`, which
 > is altitude above the **datum radius**, not above ground.
+>
+> **Fully closed 2026-08-30** — both live-validated (new `terrain` and
+> `terraingeo` probe commands, v0.45.0/v0.46.0) and IL-confirmed for
+> every piece: height querying, `IsInsideTerrain`, `GetTerrainColor`,
+> `GetMaxLOD`, and `GetTerrainNormal` (which turned out to be misnamed —
+> it returns a **tangent** vector along the surface in global XY, not a
+> perpendicular normal; see `docs/sfs_source_reference.md` §D4.4 for the
+> full IL derivation and live cross-checks). The underlying noise
+> generator (`TerrainSampler.Executor.Calculate`) is a per-planet command
+> pipeline, deliberately left unread since the wrapper API above is
+> already fully validated. `SFS.World.Terrain` (mesh/collider generation)
+> confirmed out of scope — real collision is handled by the engine.
 
 Also newly available and directly relevant to trajectory work: the game
 ships a complete public static orbital-mechanics library (`Kepler`, ~30
@@ -592,10 +611,6 @@ means `periapsis > Planet.OrbitRadius`, not `ecc < 1`. See
 - **Aerodynamic torque magnitude** (§2.5) — geometry unblocked, the
   computation still has not been done.
 - **`AeroFormula` coefficients** (§5.1) — location known, values not read.
-- **Every §5 formula is untested live.** Four confirmed code readings are
-  not four validated physics models; each needs a flight to confirm.
-- **RCS force scaling in the firing-thruster count** (§5.3) — arithmetic
-  confirmed, effect unmeasured.
 - **The heat sentinel sign mismatch** — `DissipateHeat` writes **+∞** when
   a module finishes cooling, but `ApplyHeat` and `HeatPart` both test
   `IsNegativeInfinity`. `PartSave.temperature` initialises to `+∞`, which

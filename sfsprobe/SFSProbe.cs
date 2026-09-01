@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.44.0";
+        public const string VersionString = "0.48.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -121,6 +121,24 @@ namespace SFSProbe
             }
             catch { }
 
+            // User-assignable key bindings (v0.48.0) -- see 'assignkey' command.
+            try
+            {
+                if (Probe.KeyBindings.Count > 0)
+                {
+                    foreach (KeyCode kc in new List<KeyCode>(Probe.KeyBindings.Keys))
+                    {
+                        if (Input.GetKeyDown(kc))
+                        {
+                            string boundCmd = Probe.KeyBindings[kc];
+                            try { Probe.Command(boundCmd); }
+                            catch (Exception e) { ProbeMod.Result("ERROR (keybind " + kc + ") '" + boundCmd + "' " + e.Message); }
+                        }
+                    }
+                }
+            }
+            catch { }
+
             poll += Time.deltaTime;
             if (poll > 0.5f) { poll = 0f; PollCommands(); }
 
@@ -165,6 +183,53 @@ namespace SFSProbe
     {
         public static bool WroteWorld;
         public static bool Telemetry;
+
+        // ---------- live key -> command bindings (v0.48.0) ----------
+        // Lets the person bind a key themselves at flight time (e.g. during
+        // a manual test flight, when only THEY know the precise moment a
+        // maneuver starts) rather than relying on Claude reacting to typed
+        // narration, which is inherently a beat or two late. Checked in
+        // ProbeRunner.Update() every frame (NOT FixedUpdate -- Input.GetKeyDown
+        // is a one-frame-true edge and FixedUpdate's fixed cadence can miss it
+        // at high framerate, same reason the existing F9/=/Enter/Backslash
+        // hotkeys above are in Update()). Set via the 'assignkey' command,
+        // e.g. "assignkey - rcsforce" runs the real 'rcsforce' command every
+        // time '-' is pressed, until 'unassignkey -' or 'clearkeys'.
+        public static Dictionary<KeyCode, string> KeyBindings = new Dictionary<KeyCode, string>();
+
+        static readonly Dictionary<string, KeyCode> KeyAliases =
+            new Dictionary<string, KeyCode>(StringComparer.OrdinalIgnoreCase)
+        {
+            {"-", KeyCode.Minus}, {"minus", KeyCode.Minus}, {"dash", KeyCode.Minus},
+            {"=", KeyCode.Equals}, {"plus", KeyCode.Equals},
+            {"[", KeyCode.LeftBracket}, {"]", KeyCode.RightBracket},
+            {"\\", KeyCode.Backslash}, {"/", KeyCode.Slash},
+            {".", KeyCode.Period}, {",", KeyCode.Comma},
+            {";", KeyCode.Semicolon}, {"'", KeyCode.Quote}, {"`", KeyCode.BackQuote},
+            {"space", KeyCode.Space}, {"spacebar", KeyCode.Space},
+            {"enter", KeyCode.Return}, {"return", KeyCode.Return},
+            {"tab", KeyCode.Tab},
+            {"esc", KeyCode.Escape}, {"escape", KeyCode.Escape},
+        };
+
+        // Accepts real KeyCode names ("R", "F5", "LeftShift"), bare digits
+        // ("5" -> Alpha5, since "5" alone isn't a valid KeyCode identifier),
+        // and the symbol/word aliases above for keys that aren't valid C#
+        // identifiers on their own (e.g. "-", "=", ".").
+        internal static KeyCode? ParseKeyCode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+            KeyCode alias;
+            if (KeyAliases.TryGetValue(s, out alias)) return alias;
+            if (s.Length == 1 && char.IsDigit(s[0]))
+            {
+                KeyCode alpha;
+                if (Enum.TryParse<KeyCode>("Alpha" + s, true, out alpha)) return alpha;
+            }
+            KeyCode kc;
+            if (Enum.TryParse<KeyCode>(s, true, out kc)) return kc;
+            return null;
+        }
         static int sampleCount;
         static int flightNumber;
 
@@ -1553,6 +1618,194 @@ namespace SFSProbe
                     break;
                 }
 
+                case "terrain":
+                {
+                    // First live terrain check for this project. Reads REAL
+                    // per-angle terrain height via Planet.GetTerrainHeightAtAngles
+                    // (confirmed via IL: maxTerrainHeight is only a fast-reject
+                    // bound, not real geometry -- see sfs_source_reference.md D4.4).
+                    // Sweeps a fan of angles around the active craft's current
+                    // angular position so we can directly see real variation
+                    // across the sweep, rather than trusting maxTerrainHeight as
+                    // if it were the surface. Also cross-checks Location.GetTerrainHeight
+                    // (the ground-clearance figure) against Height minus the swept
+                    // value at offset 0 -- those two should agree if both paths are
+                    // reading the same underlying function.
+                    // arg (optional): comma-separated list of degree offsets, e.g.
+                    // "terrain -30,-10,-2,0,2,10,30". Defaults to a standard fan if
+                    // no arg given.
+                    object rTer = ActiveRocket();
+                    if (rTer == null) { ProbeMod.Result("terrain: no active rocket"); break; }
+                    object locTer = Unwrap(Get(rTer, "location"));
+                    object planetTer = Unwrap(Get(locTer, "planet"));
+                    if (planetTer == null) { ProbeMod.Result("terrain: no planet"); break; }
+
+                    object posTer = Get(locTer, "position");
+                    double posX = ToD(Get(posTer, "x"));
+                    double posY = ToD(Get(posTer, "y"));
+                    double curAngleRad = Math.Atan2(posY, posX);
+                    double curHeight = ToD(Get(locTer, "Height"));
+                    double maxTerHeight = ToD(Get(planetTer, "maxTerrainHeight"));
+                    double planetRadiusTer = ToD(Get(planetTer, "Radius"));
+                    string bodyNameTer = Get(planetTer, "codeName") as string;
+
+                    double[] offsetsDeg;
+                    if (!string.IsNullOrEmpty(arg))
+                    {
+                        string[] parts = arg.Split(',');
+                        offsetsDeg = new double[parts.Length];
+                        for (int i = 0; i < parts.Length; i++)
+                            offsetsDeg[i] = double.Parse(parts[i], CultureInfo.InvariantCulture);
+                    }
+                    else
+                    {
+                        offsetsDeg = new double[] { -30, -20, -10, -5, -2, -1, 0, 1, 2, 5, 10, 20, 30 };
+                    }
+
+                    double[] anglesRad = new double[offsetsDeg.Length];
+                    for (int i = 0; i < offsetsDeg.Length; i++)
+                        anglesRad[i] = curAngleRad + offsetsDeg[i] * Math.PI / 180.0;
+
+                    object heightsObjWater = InvokeReturn(planetTer, "GetTerrainHeightAtAngles",
+                        new object[] { anglesRad, true });
+                    object heightsObjNoWater = InvokeReturn(planetTer, "GetTerrainHeightAtAngles",
+                        new object[] { anglesRad, false });
+                    double[] heightsWater = heightsObjWater as double[];
+                    double[] heightsNoWater = heightsObjNoWater as double[];
+                    if (heightsWater == null)
+                    {
+                        ProbeMod.Result("terrain: FAILED reason=GetTerrainHeightAtAngles_returned_null");
+                        break;
+                    }
+
+                    // Cross-check: Location.GetTerrainHeight(clampToWater) should
+                    // equal Height - GetTerrainHeightAtAngle(currentAngle, clampToWater).
+                    object groundClearObj = InvokeReturn(locTer, "GetTerrainHeight", new object[] { true });
+                    double groundClearance = groundClearObj != null ? ToD(groundClearObj) : double.NaN;
+
+                    var terSb = new StringBuilder();
+                    terSb.Append("{\"body\":").Append(Q(bodyNameTer));
+                    terSb.Append(",\"maxTerrainHeight\":").Append(Num(maxTerHeight));
+                    terSb.Append(",\"planetRadius\":").Append(Num(planetRadiusTer));
+                    terSb.Append(",\"currentAngleDeg\":").Append(Num(curAngleRad * 180.0 / Math.PI));
+                    terSb.Append(",\"currentHeight\":").Append(Num(curHeight));
+                    terSb.Append(",\"groundClearance_clampWater\":").Append(Num(groundClearance));
+                    terSb.Append(",\"sweep\":[");
+                    for (int i = 0; i < offsetsDeg.Length; i++)
+                    {
+                        if (i > 0) terSb.Append(",");
+                        double hw = heightsWater[i];
+                        double hn = heightsNoWater != null ? heightsNoWater[i] : double.NaN;
+                        terSb.Append("{\"offsetDeg\":").Append(Num(offsetsDeg[i]));
+                        terSb.Append(",\"terrainHeight_clampWater\":").Append(Num(hw));
+                        terSb.Append(",\"terrainHeight_noClamp\":").Append(Num(hn));
+                        terSb.Append("}");
+                    }
+                    terSb.Append("]}");
+                    Write("sfs_probe_terrain.json", terSb, "terrain sweep for " + bodyNameTer);
+                    ProbeMod.Result("terrain: body=" + bodyNameTer + " maxTerrainHeight=" + maxTerHeight +
+                                     " currentHeight=" + curHeight + " groundClearance=" + groundClearance +
+                                     " sweep0=" + heightsWater[offsetsDeg.Length / 2] +
+                                     " -> sfs_probe_terrain.json");
+                    break;
+                }
+
+                case "terraingeo":
+                {
+                    // Remaining terrain surface queries after height:
+                    // GetTerrainNormal, GetTerrainColor, IsInsideTerrain,
+                    // GetMaxLOD. All [CONFIRMED] in IL (signatures only,
+                    // @148158-@149756) but never called live before now.
+                    // IsInsideTerrain is exercised at three points: the
+                    // real craft position, a synthetic point 5m below the
+                    // local surface (same angle), and a synthetic point
+                    // 1000m above the maxTerrainHeight fast-reject bound
+                    // (same angle) -- since we can't teleport the real
+                    // craft mid-session, these synthetic Double2 points are
+                    // built via reflection on the same Double2 type as the
+                    // craft's live position, to directly exercise both the
+                    // fast-reject branch and the real surface-comparison
+                    // branch inside IsInsideTerrain.
+                    object rTg = ActiveRocket();
+                    if (rTg == null) { ProbeMod.Result("terraingeo: no active rocket"); break; }
+                    object locTg = Unwrap(Get(rTg, "location"));
+                    object planetTg = Unwrap(Get(locTg, "planet"));
+                    if (planetTg == null) { ProbeMod.Result("terraingeo: no planet"); break; }
+
+                    object posTg = Get(locTg, "position");
+                    Type double2Type = posTg.GetType();
+                    FieldInfo xField = double2Type.GetField("x");
+                    FieldInfo yField = double2Type.GetField("y");
+                    double posXg = ToD(Get(posTg, "x"));
+                    double posYg = ToD(Get(posTg, "y"));
+                    double angleTg = Math.Atan2(posYg, posXg);
+                    double radiusHere = Math.Sqrt(posXg * posXg + posYg * posYg);
+
+                    double maxTerHeightTg = ToD(Get(planetTg, "maxTerrainHeight"));
+                    double planetRadiusTg = ToD(Get(planetTg, "Radius"));
+                    string bodyNameTg = Get(planetTg, "codeName") as string;
+
+                    object terrainHereObj = InvokeReturn(planetTg, "GetTerrainHeightAtAngle",
+                        new object[] { angleTg, true });
+                    double terrainHereWater = terrainHereObj != null ? ToD(terrainHereObj) : double.NaN;
+
+                    object underPos = Activator.CreateInstance(double2Type);
+                    double underRadius = planetRadiusTg + terrainHereWater - 5.0;
+                    xField.SetValue(underPos, underRadius * Math.Cos(angleTg));
+                    yField.SetValue(underPos, underRadius * Math.Sin(angleTg));
+
+                    object spacePos = Activator.CreateInstance(double2Type);
+                    double spaceRadius = planetRadiusTg + maxTerHeightTg + 1000.0;
+                    xField.SetValue(spacePos, spaceRadius * Math.Cos(angleTg));
+                    yField.SetValue(spacePos, spaceRadius * Math.Sin(angleTg));
+
+                    object insideReal = InvokeReturn(planetTg, "IsInsideTerrain", new object[] { posTg, 0.0, true });
+                    object insideUnder = InvokeReturn(planetTg, "IsInsideTerrain", new object[] { underPos, 0.0, true });
+                    object insideSpace = InvokeReturn(planetTg, "IsInsideTerrain", new object[] { spacePos, 0.0, true });
+
+                    object normalObj = InvokeReturn(planetTg, "GetTerrainNormal", new object[] { posTg });
+                    double normalX = double.NaN, normalY = double.NaN;
+                    if (normalObj != null)
+                    {
+                        normalX = ToD(Get(normalObj, "x"));
+                        normalY = ToD(Get(normalObj, "y"));
+                    }
+
+                    object colorObj = InvokeReturn(planetTg, "GetTerrainColor", new object[] { posTg });
+                    string colorStr = "null";
+                    if (colorObj != null)
+                    {
+                        float cr = ToF(Get(colorObj, "r"));
+                        float cg = ToF(Get(colorObj, "g"));
+                        float cb = ToF(Get(colorObj, "b"));
+                        float ca = ToF(Get(colorObj, "a"));
+                        colorStr = "{\"r\":" + Num(cr) + ",\"g\":" + Num(cg) + ",\"b\":" + Num(cb) +
+                                   ",\"a\":" + Num(ca) + "}";
+                    }
+
+                    object maxLodObj = InvokeReturn(planetTg, "GetMaxLOD", new object[0]);
+
+                    var tgSb = new StringBuilder();
+                    tgSb.Append("{\"body\":").Append(Q(bodyNameTg));
+                    tgSb.Append(",\"currentAngleDeg\":").Append(Num(angleTg * 180.0 / Math.PI));
+                    tgSb.Append(",\"currentRadius\":").Append(Num(radiusHere));
+                    tgSb.Append(",\"terrainHeightHere_clampWater\":").Append(Num(terrainHereWater));
+                    tgSb.Append(",\"isInsideTerrain_realPosition\":").Append(ToB(insideReal) ? "true" : "false");
+                    tgSb.Append(",\"isInsideTerrain_5mUnderground\":").Append(ToB(insideUnder) ? "true" : "false");
+                    tgSb.Append(",\"isInsideTerrain_1000mAboveBound\":").Append(ToB(insideSpace) ? "true" : "false");
+                    tgSb.Append(",\"terrainNormal\":{\"x\":").Append(Num(normalX)).Append(",\"y\":").Append(Num(normalY)).Append("}");
+                    tgSb.Append(",\"terrainColor\":").Append(colorStr);
+                    tgSb.Append(",\"maxLOD\":").Append(maxLodObj != null ? maxLodObj.ToString() : "null");
+                    tgSb.Append("}");
+                    Write("sfs_probe_terraingeo.json", tgSb, "terrain normal/color/IsInsideTerrain/MaxLOD for " + bodyNameTg);
+                    ProbeMod.Result("terraingeo: body=" + bodyNameTg +
+                                     " insideReal=" + ToB(insideReal) + " insideUnder=" + ToB(insideUnder) +
+                                     " insideSpace=" + ToB(insideSpace) +
+                                     " normal=(" + normalX + "," + normalY + ")" +
+                                     " -> sfs_probe_terraingeo.json");
+                    break;
+                }
+
                 case "difficulty":
                 {
                     // Item 4/6 from the heat gap list: reads the ACTUAL difficulty
@@ -1830,6 +2083,258 @@ namespace SFSProbe
                     Write("sfs_probe_rcsinfo.json", rsb, "rcsinfo modules=" + modules.Count);
                     ProbeMod.Result("rcsinfo: " + modules.Count + " RcsModule(s) found -> sfs_probe_rcsinfo.json" +
                                      (modules.Count == 0 ? " (this rocket has no RCS parts)" : ""));
+                    break;
+                }
+
+                case "rcsforce":
+                {
+                    // Live validation support for RCS force magnitude/direction
+                    // and the N^2 firing-count arithmetic (sfs_source_reference.md
+                    // D3.1). Replicates RcsModule.FixedUpdate's exact real-call
+                    // sequence per module -- NOT a reimplementation of the game's
+                    // math, but the same calls the game itself makes, via
+                    // reflection: Rigidbody2D.worldCenterOfMass,
+                    // Transform.TransformPoint, Transform_Utility.TransformVectorUnscaled,
+                    // and the private TorqueThrust/DirectionThrust selection
+                    // methods are all invoked directly on the live objects. Only
+                    // the final vector sum / scaling (sumNormal, count, the
+                    // thrust*count*9.8 force formula) is arithmetic done here,
+                    // matching FixedUpdate's own IL exactly (confirmed via a
+                    // fresh IL read 2026-08-30, RVA 0x65f34).
+                    object rF = ActiveRocket();
+                    if (rF == null) { ProbeMod.Result("rcsforce: no active rocket"); break; }
+                    object rb2dF = Get(rF, "rb2d");
+                    if (rb2dF == null) { ProbeMod.Result("rcsforce: no rb2d"); break; }
+                    object worldCoMObj = Get(rb2dF, "worldCenterOfMass");
+                    if (worldCoMObj == null) { ProbeMod.Result("rcsforce: worldCenterOfMass read failed"); break; }
+                    float comX = ToF(Get(worldCoMObj, "x"));
+                    float comY = ToF(Get(worldCoMObj, "y"));
+                    double rocketMass = ToD(Get(rb2dF, "mass"));
+
+                    object holderF = Get(rF, "partHolder");
+                    object partsF = Get(holderF, "parts");
+                    var partsEnF = partsF as System.Collections.IEnumerable;
+                    var moduleResults = new List<string>();
+                    float totalForceX = 0f, totalForceY = 0f;
+                    double totalMassFlow = 0.0;
+                    Type vector3TypeCache = null;
+                    MethodInfo transformPointMethod = null;
+                    MethodInfo vec2ToVec3Method = null;
+
+                    if (partsEnF != null)
+                    {
+                        foreach (object part in partsEnF)
+                        {
+                            foreach (object mv in ModuleValues(part))
+                            {
+                                if (mv.GetType().Name != "RcsModule") continue;
+
+                                bool rcsOnF = ToB(Get(mv, "RCS_On"));
+                                float turnAxisF = ToF(Get(mv, "TurnAxis"));
+                                object dirAxisObj = Get(mv, "DirectionalAxis");
+                                float dirAxisX = ToF(Get(dirAxisObj, "x"));
+                                float dirAxisY = ToF(Get(dirAxisObj, "y"));
+                                double dirAxisSqrMag = (double)dirAxisX * dirAxisX + (double)dirAxisY * dirAxisY;
+
+                                // Matches FixedUpdate's own top-level early-out exactly:
+                                // Rocket==null / !RCS_On / (both axes under threshold) -> no force, zero mass flow.
+                                bool moduleDeadzoned = !rcsOnF ||
+                                    (Math.Abs(turnAxisF) < 0.01f && dirAxisSqrMag < 0.01);
+
+                                object rcsTransform = Get(mv, "transform");
+                                float thrustVal = ToF(Get(mv, "thrust"));
+                                float ispVal = ToF(Get(mv, "ISP"));
+                                object thrustPosLocal = Get(mv, "thrustPosition");
+
+                                if (vector3TypeCache == null && rcsTransform != null && thrustPosLocal != null)
+                                {
+                                    // Resolve UnityEngine overloaded methods explicitly by
+                                    // parameter type -- these live in UnityEngine.CoreModule,
+                                    // outside this project's own IL dump, and Unity commonly
+                                    // has multiple overloads (TransformPoint(Vector3) vs.
+                                    // TransformPoint(float,float,float); Vector2's several
+                                    // op_Implicit conversions) that would throw
+                                    // AmbiguousMatchException on a plain GetMethod(name) call.
+                                    Type vector2TypeLocal = thrustPosLocal.GetType();
+                                    vec2ToVec3Method = vector2TypeLocal.GetMethod("op_Implicit",
+                                        BindingFlags.Public | BindingFlags.Static, null,
+                                        new Type[] { vector2TypeLocal }, null);
+                                    if (vec2ToVec3Method != null)
+                                    {
+                                        vector3TypeCache = vec2ToVec3Method.ReturnType;
+                                        transformPointMethod = rcsTransform.GetType().GetMethod("TransformPoint",
+                                            BindingFlags.Public | BindingFlags.Instance, null,
+                                            new Type[] { vector3TypeCache }, null);
+                                    }
+                                }
+
+                                float thrustPosWorldX = float.NaN, thrustPosWorldY = float.NaN;
+                                if (vec2ToVec3Method != null && transformPointMethod != null && rcsTransform != null)
+                                {
+                                    object thrustPosVec3 = vec2ToVec3Method.Invoke(null, new object[] { thrustPosLocal });
+                                    object worldPosVec3 = transformPointMethod.Invoke(rcsTransform, new object[] { thrustPosVec3 });
+                                    thrustPosWorldX = ToF(Get(worldPosVec3, "x"));
+                                    thrustPosWorldY = ToF(Get(worldPosVec3, "y"));
+                                }
+
+                                float posToComX = thrustPosWorldX == thrustPosWorldX ? comX - thrustPosWorldX : float.NaN;
+                                float posToComY = thrustPosWorldY == thrustPosWorldY ? comY - thrustPosWorldY : float.NaN;
+                                object posToComVec2 = null;
+                                if (posToComX == posToComX && thrustPosLocal != null)
+                                {
+                                    posToComVec2 = Activator.CreateInstance(thrustPosLocal.GetType());
+                                    thrustPosLocal.GetType().GetField("x").SetValue(posToComVec2, posToComX);
+                                    thrustPosLocal.GetType().GetField("y").SetValue(posToComVec2, posToComY);
+                                }
+
+                                object transformUtilType = FindType("Transform_Utility");
+                                float sumNormalX = 0f, sumNormalY = 0f;
+                                float firingCount = 0f;
+                                int thrusterTotal = 0;
+                                var thrusterResults = new List<string>();
+
+                                object thrustersF = Get(mv, "thrusters");
+                                var thEnF = thrustersF as System.Collections.IEnumerable;
+                                if (thEnF != null && !moduleDeadzoned && transformUtilType != null && rcsTransform != null && posToComVec2 != null)
+                                {
+                                    foreach (object th in thEnF)
+                                    {
+                                        thrusterTotal++;
+                                        object localNormal = Get(th, "thrustNormal");
+                                        object worldNormalObj = InvokeReturn(transformUtilType, "TransformVectorUnscaled",
+                                            new object[] { rcsTransform, localNormal });
+                                        if (worldNormalObj == null) continue;
+                                        float wnx = ToF(Get(worldNormalObj, "x"));
+                                        float wny = ToF(Get(worldNormalObj, "y"));
+
+                                        object fireTorqueObj = InvokeReturn(mv, "TorqueThrust",
+                                            new object[] { worldNormalObj, posToComVec2 });
+                                        object fireDirObj = InvokeReturn(mv, "DirectionThrust",
+                                            new object[] { worldNormalObj });
+                                        bool fires = ToB(fireTorqueObj) || ToB(fireDirObj);
+
+                                        thrusterResults.Add("{\"worldNormalX\":" + Num(wnx) + ",\"worldNormalY\":" + Num(wny) +
+                                            ",\"firing\":" + (fires ? "true" : "false") + "}");
+
+                                        if (fires) { sumNormalX += wnx; sumNormalY += wny; firingCount += 1f; }
+                                    }
+                                }
+                                else if (thEnF != null)
+                                {
+                                    foreach (object th in thEnF) thrusterTotal++;
+                                }
+
+                                float predForceX = sumNormalX * (thrustVal * firingCount * 9.8f);
+                                float predForceY = sumNormalY * (thrustVal * firingCount * 9.8f);
+                                double predMassFlow = firingCount > 0f ? (double)thrustVal * firingCount / ispVal : 0.0;
+
+                                totalForceX += predForceX;
+                                totalForceY += predForceY;
+                                totalMassFlow += predMassFlow;
+
+                                var msb2 = new StringBuilder();
+                                msb2.Append("{\"rcsOn\":").Append(rcsOnF ? "true" : "false");
+                                msb2.Append(",\"turnAxis\":").Append(Num(turnAxisF));
+                                msb2.Append(",\"directionalAxis\":{\"x\":").Append(Num(dirAxisX)).Append(",\"y\":").Append(Num(dirAxisY)).Append("}");
+                                msb2.Append(",\"moduleDeadzoned\":").Append(moduleDeadzoned ? "true" : "false");
+                                msb2.Append(",\"thrustPositionWorld\":{\"x\":").Append(Num(thrustPosWorldX)).Append(",\"y\":").Append(Num(thrustPosWorldY)).Append("}");
+                                msb2.Append(",\"thrusterCount\":").Append(thrusterTotal);
+                                msb2.Append(",\"firingCount\":").Append(Num(firingCount));
+                                msb2.Append(",\"sumNormal\":{\"x\":").Append(Num(sumNormalX)).Append(",\"y\":").Append(Num(sumNormalY)).Append("}");
+                                msb2.Append(",\"predictedForce\":{\"x\":").Append(Num(predForceX)).Append(",\"y\":").Append(Num(predForceY)).Append("}");
+                                msb2.Append(",\"predictedMassFlow\":").Append(Num(predMassFlow));
+                                msb2.Append(",\"thrusters\":[").Append(string.Join(",", thrusterResults.ToArray())).Append("]");
+                                msb2.Append("}");
+                                moduleResults.Add(msb2.ToString());
+                            }
+                        }
+                    }
+
+                    var fsb = new StringBuilder();
+                    fsb.Append("{\"moduleCount\":").Append(moduleResults.Count);
+                    fsb.Append(",\"totalPredictedForce\":{\"x\":").Append(Num(totalForceX)).Append(",\"y\":").Append(Num(totalForceY)).Append("}");
+                    fsb.Append(",\"totalPredictedMassFlow\":").Append(Num(totalMassFlow));
+                    fsb.Append(",\"rocketMass\":").Append(Num(rocketMass));
+                    fsb.Append(",\"worldCenterOfMass\":{\"x\":").Append(Num(comX)).Append(",\"y\":").Append(Num(comY)).Append("}");
+                    fsb.Append(",\"modules\":[").Append(string.Join(",", moduleResults.ToArray())).Append("]}");
+                    Write("sfs_probe_rcsforce.json", fsb, "rcsforce modules=" + moduleResults.Count);
+                    ProbeMod.Result("rcsforce: " + moduleResults.Count + " module(s), totalForce=(" +
+                                     totalForceX + "," + totalForceY + ") -> sfs_probe_rcsforce.json" +
+                                     (moduleResults.Count == 0 ? " (this rocket has no RCS parts)" : ""));
+                    break;
+                }
+
+                case "assignkey":
+                {
+                    // "assignkey <key> <command...>" -- binds a key so the
+                    // PLAYER can trigger a probe command at the exact moment
+                    // only they know is right (e.g. "the instant I hit full
+                    // deflection"), rather than Claude reacting a beat late
+                    // to typed narration. The target command runs through the
+                    // normal Command() dispatch, so anything callable via
+                    // command.txt is bindable, including commands with their
+                    // own args (e.g. "assignkey - terrain -10,0,10").
+                    int firstSpaceAK = line.IndexOf(' ');
+                    string afterCmdAK = firstSpaceAK >= 0 ? line.Substring(firstSpaceAK + 1).TrimStart() : "";
+                    int secondSpaceAK = afterCmdAK.IndexOf(' ');
+                    if (secondSpaceAK < 0)
+                    {
+                        ProbeMod.Result("assignkey: need a key and a command, e.g. 'assignkey - rcsforce'");
+                        break;
+                    }
+                    string keyStrAK = afterCmdAK.Substring(0, secondSpaceAK);
+                    string targetCmdAK = afterCmdAK.Substring(secondSpaceAK + 1).Trim();
+                    if (targetCmdAK.Length == 0)
+                    {
+                        ProbeMod.Result("assignkey: empty target command");
+                        break;
+                    }
+                    KeyCode? kcAK = ParseKeyCode(keyStrAK);
+                    if (kcAK == null)
+                    {
+                        ProbeMod.Result("assignkey: unrecognized key '" + keyStrAK + "'");
+                        break;
+                    }
+                    KeyBindings[kcAK.Value] = targetCmdAK;
+                    ProbeMod.Result("assignkey: '" + keyStrAK + "' (" + kcAK.Value + ") -> '" + targetCmdAK +
+                                     "'  (" + KeyBindings.Count + " binding(s) active)");
+                    break;
+                }
+
+                case "unassignkey":
+                {
+                    if (string.IsNullOrEmpty(arg))
+                    {
+                        ProbeMod.Result("unassignkey: need a key, e.g. 'unassignkey -'");
+                        break;
+                    }
+                    KeyCode? kcUK = ParseKeyCode(arg);
+                    if (kcUK == null)
+                    {
+                        ProbeMod.Result("unassignkey: unrecognized key '" + arg + "'");
+                        break;
+                    }
+                    bool removedUK = KeyBindings.Remove(kcUK.Value);
+                    ProbeMod.Result("unassignkey: '" + arg + "' " + (removedUK ? "removed" : "was not bound") +
+                                     "  (" + KeyBindings.Count + " binding(s) active)");
+                    break;
+                }
+
+                case "listkeys":
+                {
+                    var lkParts = new List<string>();
+                    foreach (var kv in KeyBindings)
+                        lkParts.Add("{\"key\":" + Q(kv.Key.ToString()) + ",\"command\":" + Q(kv.Value) + "}");
+                    ProbeMod.Result("listkeys: " + KeyBindings.Count + " binding(s): [" +
+                                     string.Join(",", lkParts.ToArray()) + "]");
+                    break;
+                }
+
+                case "clearkeys":
+                {
+                    int nCK = KeyBindings.Count;
+                    KeyBindings.Clear();
+                    ProbeMod.Result("clearkeys: removed " + nCK + " binding(s)");
                     break;
                 }
 

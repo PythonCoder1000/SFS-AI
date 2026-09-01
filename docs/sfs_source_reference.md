@@ -2589,9 +2589,123 @@ does not compute.
 | `DirectionThrust` angle test | **[CONFIRMED]** |
 | Mass flow `thrust·count/ISP`, no throttle, no `IspMultiplier` | **[CONFIRMED]** |
 | RCS self-disables when fuel cannot flow | **[CONFIRMED]** |
-| Force quadratic in firing-thruster count | **[CONFIRMED]** arithmetic, **[OPEN]** in flight |
-| `directionAngleThreshold` / `torqueAngleThreshold` values | **[OPEN]** — serialized per part, read live |
+| Force quadratic in firing-thruster count | **[CONFIRMED-LIVE]** — 2026-08-31, real flight measurement matches predicted magnitude to 0.06% (29.38 real vs 29.4 predicted), median per-tick direction error 6.1°. See D3.8. |
+| `directionAngleThreshold` / `torqueAngleThreshold` values | **[CONFIRMED-LIVE]** — read live via `rcsinfo` (v0.44.0) |
 | `RCS_On` backing store (for writing it) | **[OPEN]** |
+
+### D3.7 `rcsforce` probe command — force validation tooling
+
+**[CONFIRMED]**, added 2026-08-30 (v0.47.0). Fresh IL re-read of
+`RcsModule.FixedUpdate` (RVA 0x65f34) confirmed the exact real-call
+sequence matches the D3.1 writeup precisely, including the two
+Unity-side calls not previously traced in detail:
+`Transform.TransformPoint(Vector3)` (converting the local `thrustPosition`
+via `Vector2`'s `op_Implicit` operator first) for `positionToCoM`, and
+`Rigidbody2D.worldCenterOfMass`. Both are plain Unity engine calls, not
+game-specific logic — confirmed via the exact IL call sequence, not
+assumed.
+
+Rather than reimplementing this math, `rcsforce` calls the **real game
+functions directly via reflection** for every piece that has one:
+`Rigidbody2D.worldCenterOfMass`, `Transform.TransformPoint`,
+`Transform_Utility.TransformVectorUnscaled`, and the private
+`TorqueThrust`/`DirectionThrust` selection methods themselves (reflection
+already supports non-public methods — `InvokeReturn` uses
+`BindingFlags.NonPublic`). Only the final vector sum and the
+`thrust·count·9.8` scaling are computed in the probe, matching
+`FixedUpdate`'s own IL exactly. This sidesteps any risk of a subtly wrong
+reimplementation of Unity transform/rotation math.
+
+One implementation note: `Transform.TransformPoint` and `Vector2`'s
+`op_Implicit` conversions live in `UnityEngine.CoreModule`, outside this
+project's own `Assembly-CSharp.dll` IL dump, and Unity commonly overloads
+both (`TransformPoint(Vector3)` vs. `TransformPoint(float,float,float)`).
+A plain `GetMethod(name)` call risks `AmbiguousMatchException` there, so
+`rcsforce` resolves both by explicit parameter type rather than using the
+shared `InvokeReturn` helper for those two calls specifically.
+`Transform_Utility.TransformVectorUnscaled` and the two selection methods
+are confirmed single-overload within the game's own assembly, so those
+use the normal `InvokeReturn` path.
+
+Per `RcsModule`, `rcsforce` reports: `rcsOn`, `turnAxis`, `directionalAxis`,
+whether the module hit `FixedUpdate`'s own top-level deadzone gate
+(`moduleDeadzoned` — replicated exactly: `!RCS_On || (|TurnAxis|<0.01 &&
+DirectionalAxis.sqrMagnitude<0.01)`), the module's world-space
+`thrustPosition`, per-thruster world normals and real fire/no-fire
+decisions (from the actual `TorqueThrust`/`DirectionThrust` calls), the
+resulting `sumNormal`, firing count, and the predicted force vector and
+mass flow. Rocket-wide totals and `rocketMass` (`rb2d.mass`) are included
+for a straightforward predicted-acceleration comparison against a real
+finite-difference measurement from an engines-off flight.
+
+**Still blocked on the same thing as before**: an actual engines-off
+test flight to compare `rcsforce`'s predicted force/acceleration against
+a real finite-difference measurement of velocity change. The command
+itself is tooling-complete; only the flight is outstanding.
+
+### D3.8 Force magnitude/direction — live-validated 2026-08-31
+
+**[CONFIRMED-LIVE]**. Engines-off, RCS-on coast flight (Earth, 81.5-91km
+altitude, well clear of the atmosphere, 83s / 4969 samples, `thrOn=false`
+throughout). `turnAxis` was purely discrete keyboard input, `{-1, 0, 1}`
+only, never analog. Real per-tick acceleration was finite-differenced
+from recorded `vx`/`vy`, with gravity (`μ/r²`, `μ` independently
+re-derived from a 45.7s quiet no-RCS window on the same flight, `μ ≈
+9.67e11`) subtracted out to isolate the RCS contribution.
+
+**Important correction, made honestly rather than silently:** the first
+Python re-derivation of the predicted force pooled all 18 thrusters
+across all 6 `RcsModule`s into one shared `count` and `sumNormal`. This
+is wrong — `FixedUpdate` is an **instance** method, so each of the 6
+modules runs its own independent copy with its own local `count` (0-3,
+only that module's own 3 thrusters) and `sumNormal`, and each module
+applies its own `AddForceAtPosition` call separately. The pooled version
+over-predicted `turnAxis<0`'s force by ~6x (176.4 vs the correct 29.4).
+The `rcsforce` probe command itself (§D3.7) was already scoped correctly
+per-module — only the ad-hoc Python re-derivation had the bug, not the
+tooling or the originally-documented IL formula.
+
+**Corrected result**, using real in-flight `rcsforce` readings recovered
+from `probe.log` (the live JSON snapshot file only holds the most recent
+press, so the summary line — module count and total force — in the log
+was what made recovery possible after a later, unrelated `rcsforce` call
+overwrote the file):
+
+| | Predicted (`sumNormal·thrust·count·9.8`, summed per-module) | Real (measured) |
+|---|---|---|
+| `turnAxis<0`, n=350 samples | **29.4** (constant, by design) | **29.38** average — ratio 0.9994 |
+| `turnAxis>0`, n=441 samples | **0** (exact cancellation by design) | ~16-30 average, modestly above the ~10 (mean) / ~4.3 (median) noise floor measured on the same flight's quiet no-RCS window |
+
+Per-tick direction error (angle between predicted and real force
+vectors, `turnAxis<0` samples): **median 6.1°**, mean pulled up to 32° by
+a handful of noisy/transient ticks — plausibly from rapid stick
+oscillation (the person reported pressing the opposite key briefly by
+accident, and RCS toggling rapidly between +1/-1 at points during the
+flight).
+
+**This closes the last open piece of RCS.** The `turnAxis<0` magnitude
+match (0.06% off) directly confirms the `count`-scaled force formula
+(§D3.1) is correct as originally read from IL — the earlier `[OPEN]`
+status was about live validation being outstanding, not any doubt about
+the reading itself, and that reading holds up. The `turnAxis>0` case
+(predicted exactly zero from geometric cancellation across the two
+top-mounted thruster pairs) landing close to, but not exactly at, the
+measurement noise floor is consistent with minor real-world imperfection
+(float precision, slight CoM drift between the flight and the later
+geometry snapshot used for the local-frame derivation) rather than a
+modeling gap.
+
+**Process note for future live-snapshot work**: `sfs_probe_rcsforce.json`
+(like other on-demand command outputs) only ever holds the most recent
+call's result — a later, unrelated call to the same command silently
+destroys any earlier live-flight snapshot. `probe.log` retains a
+one-line summary (timestamp + the `ProbeMod.Result` text) of every call
+ever made, which was enough to recover this flight's real in-flight
+readings after the snapshot file itself got overwritten, but only the
+summary fields (module count, total force here) survive that way, not
+the full per-module/per-thruster JSON breakdown. Read the JSON snapshot
+(or the log, if it's already gone) before making any further calls to
+the same command, if the current contents might be needed later.
 
 ---
 
@@ -2829,13 +2943,27 @@ public double GetTerrainHeightAtAngle(double angleRadians, bool clampToWater)   
     => GetTerrainHeightAtAngles(new[] { angleRadians }, clampToWater)[0];
 ```
 
-**Terrain is real per-angle geometry, not a single bound.**
+**Terrain is real per-angle geometry, not a single bound. [CONFIRMED-LIVE]**
 `maxTerrainHeight` is only a fast-reject radius; the actual surface comes
 from `GetTerrainHeightAtAngles(double[] angleRadians, bool clampToWater)`
 @148458, which is **batched by design** — the single-angle form allocates
 a one-element array and calls it. For any sweep (landing-site search,
 terrain profile), call the array form once rather than looping the scalar
 one.
+
+Live-validated 2026-08-30 via the new `terrain` probe command (Earth,
+landed near a small coastal landmass): a 13-point angular sweep
+(±30° in steps) showed genuine per-angle variation — real land values
+around 45-52m right where the craft sat, dropping to deep underwater
+terrain (down to -3557m with `clampToWater=false`, correctly clamped to
+0 with `clampToWater=true`) just a few degrees either side. `maxTerrainHeight`
+for Earth reported 261.4m at the same time — well above the real local
+surface, confirming it's just the fast-reject bound and not usable as an
+actual height. Cross-check also passed exactly: `Location.Height` (61.72m)
+minus `Location.GetTerrainHeight(true)` (13.72m groundClearance) equals
+the swept value at offset 0 (48.0m) to full precision, confirming
+`Location.GetTerrainHeight` and `Planet.GetTerrainHeightAtAngle` read the
+same underlying function.
 
 This corrects the impression in `sfs_physics_reference.md` §5 that
 "`maxTerrainHeight` is a single bound per body, not real terrain
@@ -2851,11 +2979,124 @@ Color     GetTerrainColor(Double2 position)               @149756
 int       GetMaxLOD()                                     @148158
 ```
 
-**[OPEN]** — `GetTerrainHeightAtAngles`' body (the actual height
-function: noise, heightmap sampling, `FlatZone` handling) was not read.
-`SFS.World.Terrain` (`DynamicTerrain` @27m/30f, `TerrainColliderModule`,
-`TerrainPoints`, `Chunk`) is entirely **[OPEN]** — that namespace is
-about mesh/collider generation, not the height query above.
+**[CONFIRMED-LIVE]** — 2026-08-30, via the new `terraingeo` probe command
+(v0.46.0). `IsInsideTerrain` was exercised at three points on Earth: the
+real craft position (`false`, correctly not embedded), a synthetic point
+constructed 5m below the local surface at the same angle (`true`,
+confirming the real surface-comparison branch), and a synthetic point
+1000m above `maxTerrainHeight` at the same angle (`false`, confirming the
+fast-reject branch). `GetTerrainColor` returned a plausible grass green
+(`r=0.272 g=0.403 b=0.245 a=1`) matching the landmass the craft sat on.
+`GetMaxLOD()` returned `12`.
+
+**`GetTerrainNormal` is misnamed — it returns a TANGENT, not a normal.
+[CONFIRMED]**, IL body read 2026-08-30:
+
+```csharp
+Double2 GetTerrainNormal(Double2 globalPosition)
+{
+    double angle = globalPosition.AngleRadians;
+    double delta = 0.1 / SurfaceArea;
+    Double2 p1 = Double2.CosSin(angle + delta,
+                     Radius + GetTerrainHeightAtAngle(angle + delta, clampToWater: false));
+    Double2 p2 = Double2.CosSin(angle - delta,
+                     Radius + GetTerrainHeightAtAngle(angle - delta, clampToWater: false));
+    return (p2 - p1).normalized;   // note: p2 - p1, not p1 - p2
+}
+```
+
+`Double2.CosSin(angleRadians, radius)` (confirmed two-arg overload,
+param order angle-then-radius) builds a point in the same **global XY**
+frame as `Location.position` — so this is a central-difference secant
+between two nearby points on the real terrain surface, normalized. It is
+a **tangent** direction along the surface profile, not a perpendicular
+surface normal, and it lives in global XY, not a local frame.
+
+This matches the live v0.46.0 reading exactly: at
+`currentAngleDeg≈89.93°` (≈π/2), the tangent direction (in the `-θ`
+sense used here) of a circle is `(sinθ, -cosθ) ≈ (1, 0)` — precisely
+matching the observed `(0.99999933, -0.00115861)`, with the tiny
+nonzero y-component directly encoding the real local slope (consistent
+with the gently-varying 45-52m land patch the `terrain` sweep found
+across ±2°). Both earlier working theories (global-radial, local
+tangent-frame) are now superseded by this direct IL read — it's simply
+a global-frame tangent vector.
+
+**`GetTerrainHeightAtAngles` body. [CONFIRMED]**, IL body read
+2026-08-30 (RVA 0x37740):
+
+```csharp
+double[] GetTerrainHeightAtAngles(double[] angleRadians, bool clampToWater)
+{
+    double[] normAngles = angleRadians.Select(Kepler.PositiveAngle).ToArray();  // -> [0, 2π)
+
+    if (!data.hasTerrain)
+        return new double[angleRadians.Length];   // all zeros -- airless/no-surface bodies
+
+    double[] samples = TerrainSampler.GetTerrainSamples(this, normAngles, 0.0, 2 * Math.PI);
+
+    if (data.hasWater && clampToWater)
+        for (int i = 0; i < samples.Length; i++)
+            if (samples[i] < 0) samples[i] = 0;    // floor negative (underwater) to 0
+
+    return samples;
+}
+```
+
+Confirms the live `terrain` sweep exactly: `clampToWater` only floors
+negative values, never affects positive land heights; a body with
+`hasTerrain == false` (gas giants, no solid surface) silently returns an
+all-zero array rather than erroring — worth remembering so a future
+flight controller doesn't mistake that `0` for "at sea level."
+
+`TerrainSampler.GetTerrainSamples(Planet, angles, angleMin, angleMax)`
+(IL read 2026-08-30) does three things in order:
+1. Calls `TerrainModule.terrainSampler.Calculate(angles, planetRadius)`
+   — the actual noise/heightmap evaluation. **[OPEN, deprioritized]**:
+   `Executor.Calculate` (IL read) is a **command pipeline** — it builds
+   one shared `TerrainSample` object and invokes an ordered
+   `List<SampleCommand>` of delegates on it, almost certainly a
+   per-planet configured chain of noise layers (octaves, ridges, domain
+   warping) set up once at planet load. Genuinely deep and
+   planet-specific; not traced further since the wrapper API above is
+   already fully validated and callable — reimplementing SFS's own
+   noise generator isn't needed for using its output.
+2. If `hasWater && water.lowerTerrain`: further **lowers** underwater
+   samples using a water-color-driven depth adjustment (`GetWaterColor`
+   sampled at a texture-rotated angle, scaled by `oceanDepth`, plus a
+   flat +50 base) — this is why the live sweep's unclamped underwater
+   readings were so deep (down to -3557m) rather than a simple
+   continuation of the land noise: ocean floors are actively pushed
+   deeper by this step, not just naturally negative.
+3. **Flat-zone blending**: for the current world difficulty, looks up
+   `TerrainModule.flatZonesDifficulties[difficulty]` (falling back to
+   `flatZones`), and for each `FlatZone` whose angular range (plus a
+   transition band) overlaps the sample angle, blends the raw sample
+   toward that zone's target `height` via `InverseLerp`/`Lerp` — this is
+   the mechanism behind guaranteed flat landing sites near launchpads.
+
+### D4.4b `SFS.World.Terrain` namespace — scoped, not traced further
+
+**[CONFIRMED-SCOPED]** — IL read 2026-08-30 confirmed this namespace is
+Unity rendering/physics-collider plumbing, separate from the height-query
+API above, and out of scope for the design-phase/reflex-controller work
+(the game handles real collision automatically; the agent only needs the
+math query API, which is fully validated):
+
+- **`DynamicTerrain`** (`MonoBehaviour`, `BaseChunkCount = 8`): a
+  quadtree-style LOD mesh chunking system (`allChunks`/`activeChunks`,
+  `bestSplit`/`bestMerge`, `loadDistanceMultiplier`) that generates and
+  splits/merges terrain mesh chunks near the camera/craft as it moves —
+  purely visual. Matches the live `GetMaxLOD()=12` reading from
+  `terraingeo`.
+- **`TerrainColliderModule`** (`MonoBehaviour`): subscribes to the
+  player's `location.position` change event and to world-load events,
+  calling `UpdateChunks()` to spawn/move real Unity physics colliders
+  (`chunkIndexes`) near the craft. This is what makes actual ground
+  collision work — handled automatically by the engine, not something
+  the agent calls into directly.
+- `TerrainPoints`, `Chunk` — not traced; supporting data structures for
+  the two systems above.
 
 ### D4.5 Timewarp radius
 
@@ -2934,10 +3175,13 @@ Gotchas:
 | `IsOutsideSOI` / `IsInsideSOI` semantics and frames | **[CONFIRMED]** |
 | **SOI crossing in physics mode forces rails** | **[CONFIRMED]** in IL, **[UNTESTED-LIVE]** |
 | Satellite scan is one level deep (patched conic) | **[CONFIRMED]** |
-| Real per-angle terrain height is queryable | **[CONFIRMED]** — corrects "single bound" impression |
-| `GetTerrainHeightAtAngles` body | **[OPEN]** |
+| Real per-angle terrain height is queryable | **[CONFIRMED-LIVE]** — 2026-08-30, corrects "single bound" impression |
+| `IsInsideTerrain` / `GetTerrainColor` / `GetMaxLOD` | **[CONFIRMED-LIVE]** — 2026-08-30, both true/false branches of `IsInsideTerrain` exercised |
+| `GetTerrainNormal` is a tangent, not a normal, in global XY | **[CONFIRMED]** — 2026-08-30 IL read, matches live reading precisely |
+| `GetTerrainHeightAtAngles` body (wrapper) | **[CONFIRMED]** — 2026-08-30 IL read: normalize angles, zero-array if no terrain, delegate to `TerrainSampler`, clamp underwater to 0 |
+| `TerrainSampler.Executor.Calculate` noise internals | **[OPEN, deprioritized]** — confirmed to be a per-planet `SampleCommand` pipeline; not traced further, not needed to use the API |
+| `SFS.World.Terrain` namespace (`DynamicTerrain`, `TerrainColliderModule`) | **[CONFIRMED-SCOPED]** — 2026-08-30, Unity mesh/collider plumbing, out of scope for the agent |
 | `Trajectory.CheckEncounters` / `CalculatePaths` | **[OPEN]** |
-| `SFS.World.Terrain` namespace | **[OPEN]** |
 | Timewarp radius formula | **[CONFIRMED]** — feeds the open ceiling decision |
 
 ---
