@@ -1528,6 +1528,144 @@ case "dragarea":
 | `ApplyParachuteDrag` body | **[OPEN]** |
 | The probe `dragarea` command | **[UNTESTED-LIVE]** — applied in v0.27.0, built, not yet run live |
 
+### C1.10 Aerodynamic torque — [CONFIRMED], live-validated 2026-08-31
+
+The torque itself needed no new IL — every piece was already confirmed
+above. What it needed was actually wiring two of those pieces together
+correctly, which nothing in the probe had done before this session.
+
+```csharp
+// TryComputeAeroTorque, sfsprobe/SFSProbe.cs v0.49.0
+float localToWorldInput = (float)(velocityAngle - Math.PI / 2.0);   // the NON-negated angle
+object localToWorldMatrix = Matrix2x2.Angle(localToWorldInput);
+Vector2 copWorld = localToWorldMatrix * new Vector2(dragCopVelX, dragCopVelY);
+
+float copAppliedX = comX + (copWorld.x - comX) * 0.2f;              // confirmed §2.3 Lerp
+float copAppliedY = comY + (copWorld.y - comY) * 0.2f;
+
+float torqueZ = (copAppliedX - comX) * forceY - (copAppliedY - comY) * forceX;  // r x F, 2D
+float alphaPred = torqueZ / rb2d.inertia;
+```
+
+**Bug found and fixed:** `dragCopX`/`dragCopY` in `truth.jsonl` (sampled
+every tick since v0.28.0) are the raw `centerOfDrag` output of
+`CalculateDragForce` (§C1.4) — which is in **velocity-aligned space**,
+not real world/scene coordinates. The rotation needed to convert it —
+the non-negated `Matrix2x2.Angle(velocityAngle - π/2)`, opposite sign
+from the `rotate` matrix `GetDragSurfaces` uses to build the
+velocity-aligned surfaces in the first place — was confirmed via IL in
+§C1.2's gotchas list long before this session, but nothing had ever
+actually applied it. Any CoM-relative use of the telemetry field before
+now (there wasn't one) would have silently used the wrong frame.
+
+**`rb2d.inertia`** — a stock `UnityEngine.Rigidbody2D` property, not
+game-specific IL — was read live for the first time this session. It's
+required because aero force is applied via the real
+`Rigidbody2D.AddForceAtPosition` (§C1.5's `ApplyForce`), which is genuine
+Unity rotational physics; this is unlike player-commanded rotation
+(§B1.3), which writes `angularVelocity` directly and never touches
+inertia at all. Two different rotation mechanisms in the same game,
+confirmed to behave completely differently.
+
+**Live validation** (real capsule+heat-shield reentry, hands off all
+controls, engine/RCS off): 12,174 clean ticks (stable `rb2d.inertia`,
+`output_TurnAxisTorque == 0` on both tick endpoints) gave **correlation
+0.9986** between predicted and real finite-differenced angular
+acceleration; on the 117 ticks with |real α| > 5°/s², **100% sign
+agreement**, magnitude ratio 0.985–1.011 at the largest swings, median
+error 4.66%.
+
+**The confound, and why three earlier flights failed:** SAS
+auto-stabilization (§B1.3's `GetStopRotationTurnAxis`, deadbeat
+damping) engages whenever `hasControl && !IsOnSurface` and
+`arrowkeys.turnAxis == 0` — i.e. exactly whenever nothing else is
+commanding rotation. It writes `angularVelocity` directly through the
+same code path as manual input (§B1.3's `ApplyTorque`), so it completely
+bypasses `rb2d.inertia` and the aero-torque model above, and it does so
+silently — there is no in-game SAS toggle or indicator. "Hands off
+controls" turns out to be precisely SAS's trigger condition, not the
+absence of it. **Filtering on raw `arrowkeys.turnAxis == 0` is not
+enough** to isolate pure aero torque; the correct signal is
+`Rocket.output_TurnAxisTorque` — the value `ApplyTorque` actually applies
+that tick, from either source. On the successful validation flight,
+`output_TurnAxisTorque` was nonzero on 12,532 of 25,491 ticks; of those,
+11,575 had zero manual input, i.e. SAS alone. Three prior flights (all
+filtered on raw `turnAxis`) showed near-zero or contradictory
+correlation for exactly this reason — not a flaw in the formula.
+
+**Known caveat, deliberately not handled:** invalid mid-parachute-
+deployment, since `ApplyParachuteDrag` (§C1.9's status table, §2.3)
+mutates force and CoP by reference and that mutation is not replicated
+here.
+
+Probe support: `aerotorque` command (on-demand) and
+`computed:aeroTorque` scoped-telemetry field, both v0.49.0.
+
+### C1.11 `ApplyParachuteDrag` — [CONFIRMED]
+
+Small, self-contained, fully decoded. Called from within `ApplyForce`
+(§C1.5) right after the normal `Lerp(worldCenterOfMass, cop_world, 0.2)`
+has already run — **corrects an earlier claim** (2026-08-27 source-doc
+pass) that this method bypasses that Lerp; confirmed via the real call
+site that it doesn't, it blends further on top of the already-Lerp'd cop.
+
+```csharp
+void Aero_Rocket.ApplyParachuteDrag(ref float force, ref Vector2 cop)
+{
+    foreach (ParachuteModule chute in rocket.partHolder.GetModules<ParachuteModule>())
+    {
+        if (chute.targetState.Value != 1f && chute.targetState.Value != 2f)
+            continue;   // 0 = stowed, contributes nothing
+
+        Double2 chuteVel = WorldView.ToGlobalVelocity(
+            rb2d.GetPointVelocity(chute.parachute.transform.position));
+        float chuteDrag = (float)chuteVel.sqrMagnitude * chute.drag.Evaluate(chute.state.Value);
+
+        cop = (cop * force + (Vector2)chute.parachute.transform.position * chuteDrag)
+              / (force + chuteDrag);
+        force = force + chuteDrag;
+    }
+}
+```
+
+`ParachuteModule` fields involved: `state`/`targetState`
+(`Float_Reference`, no named enum — `targetState` 1/2 inferred from the
+adjacent `deploySound_Partial`/`deploySound_Fully` fields as
+partial/full deployment, 0 presumably stowed), `drag`
+(`AnimationCurve`, keyed by `state.Value` — confirms "partial deployment
+is a curve lookup" exactly), `parachute` (`Transform`, the chute's own
+world position).
+
+**`rb2d.GetPointVelocity` is genuinely rotation-aware** — true local
+velocity at the chute's position (bulk + ω×r). This is the one place in
+the entire confirmed aero/torque chain that accounts for the craft's
+spin; everywhere else (§C1.4's `CalculateDragForce`, §C1.5's
+`ApplyForce`, §B1.10's gimbal chain) uses a single whole-craft
+`location.velocity` with zero ω-dependence.
+
+**`chuteDrag` carries no density term of its own** — it's added
+directly into the shared pre-density `force` scalar (the same `force`
+as §C1.5's `f = dragArea * 1.5f * speedSq`, before direction/density are
+applied). Density gets multiplied in exactly once, uniformly, on the
+combined total after this method returns — so the chute's contribution
+is density-scaled indirectly, not explicitly. A reimplementation that
+multiplies `chuteDrag` by density itself before adding it in would
+double-apply density to the chute's share.
+
+**Multiple deployed chutes compound sequentially, not independently**
+— each loop iteration's weighted-average `cop` blend uses `force` as
+updated by the *previous* chute in the same call, not the original
+pre-parachute value. This is an ordinary incremental weighted-position
+update (same shape as an incremental center-of-mass computation), not a
+batch average.
+
+Not yet live-validated — no probe support yet either (`aerotorque`/
+`computed:aeroTorque` explicitly do NOT replicate this path, per their
+own caveat above). Next step for either: extend the probe to read
+`ParachuteModule.state`/`targetState` and replicate this exact
+compounding logic, then a real flight with a deployed chute comparing
+predicted vs. real force/torque.
+
 ---
 
 ## D1. Heat and destruction
@@ -4129,7 +4267,114 @@ docking) without synthesising touch input — `Rocket.ClickPart` /
 `UsePartData` and `PolygonData` are unexamined and `CanUsePart` @188347
 has an unread gate that likely rejects parts of unowned DLC.
 
-### B1.10 Status
+### B1.10 Gimbal timing — the commanded-steering to angle chain [CONFIRMED, keyframe shape UNTESTED-LIVE]
+
+Three methods, read together 2026-08-31, form a complete pipeline from
+player/SAS steering input to the actual visual/physical gimbal angle.
+None of the three needed Harmony or anything exotic — all three are
+plain reflection reads once located.
+
+**1. `EngineModule.RecalculateGimbal()`** — sets the *target*, every tick:
+
+```csharp
+if (!hasGimbal) return;
+if (!gimbalOn.Value) return;
+gimbal.targetTime.Value = (throttle_Out.Value > 0)
+    ? turnAxis_Input.Value * Transform_Utility.RotationDirection(transform)
+    : 0f;
+```
+
+`gimbal` is a public `MoveModule` field on `EngineModule` (there's also
+a `gimbalOn : Bool_Reference` enable flag, both confirmed via the same
+read as `hasGimbal`). `RotationDirection(transform)` is a sign flip
+(almost certainly ±1 depending on which side of the rocket the engine
+sits) — not yet read itself, but its effect is fully visible in the
+live `gimbalinfo` output regardless of what it does internally.
+
+**2. `MoveModule.Update()`** — chases that target, every tick:
+
+```csharp
+float dt = unscaledTime ? Time.unscaledDeltaTime : Time.deltaTime;
+if (dt == 0f) return;
+float speed = animationTime > 0f ? dt / animationTime : 10000f;
+time.Value = Mathf.MoveTowards(time.Value, targetTime.Value, speed);
+if (time.Value == targetTime.Value) this.enabled = false;
+```
+
+**Linear, not eased or spring-damped.** `Mathf.MoveTowards` moves by a
+fixed max step per call, so `time` reaches `targetTime` in exactly
+`animationTime` seconds flat (or effectively one frame if
+`animationTime <= 0`, since `speed` becomes huge). This is a genuinely
+different mechanism from player-commanded body rotation (§B1.3, which
+writes `angularVelocity` directly and has no timing lag at all) — gimbal
+response has a real, predictable, constant-rate lag baked in.
+
+**3. `MoveModule.ApplyAnimation()`** — turns `time` into the real angle.
+This method is actually a 14-case generic animation dispatcher keyed on
+`MoveData.Type` (rotation, position, scale, sprite/UI color, audio
+volume, arbitrary float/bool variables — cases 3 and 4 are dead,
+fall through to a no-op). The 2D-gimbal-relevant case is index 0:
+
+```csharp
+transform.localEulerAngles = new Vector3(0f, 0f, X.Evaluate(time.Value - offset));
+```
+
+`X` is a `UnityEngine.AnimationCurve` (a keyframe/Hermite spline, not
+necessarily linear), `offset` staggers the curve per animated element
+(`MoveData` also carries `transform`, `Y`, `spriteRenderer`, `image`,
+`gradient`, `audioSource`, `floatVariable`, `boolVariable` — all public
+fields, all trivially reflectable if another `MoveData.Type` is ever
+needed).
+
+**The one thing this IL read cannot answer:** whether a real engine's
+`X` curve is a plain 2-key linear ramp (angle directly proportional to
+`time`) or has easing baked into the keyframe tangents. `AnimationCurve`
+is a stock Unity type — `.keys` returns a `Keyframe[]`, each with
+`time`/`value`/`inTangent`/`outTangent`, all public, all reflectable —
+but nobody has read a real engine's curve yet.
+
+**LIVE-CONFIRMED 2026-08-31/09-01, same session.** A real 3-engine
+craft's rotate curve: two keyframes, `(t=-1, v=-3, in=3, out=3)` →
+`(t=1, v=3, in=3, out=3)`. Both tangents (3) exactly equal the chord
+slope `(3-(-3))/(1-(-1))=3` — a Hermite spline with matching in/out
+tangents equal to its own chord slope degenerates to a straight line.
+**Confirmed linear, no easing.** Gimbal range ±3°; `time` itself ranges
+−1..1, not 0..1. Also visible in the same dump: `RotationDirection`
+(the sign flip in `RecalculateGimbal`, body still unread) genuinely
+differs per engine on this craft — one of the three engines showed a
+negated `targetTime` relative to the other two's identical
+`turnAxisInput`, consistent with that engine being mounted opposite the
+other two so all three still steer the same rotational sense.
+
+**Also confirmed and live-validated: where `turnAxis_Input` itself
+comes from.** `EngineModule` implements `Rocket.INJ_TurnAxisTorque`;
+`Rocket.Inject_TurnAxisTorque()` reads `output_TurnAxisTorque.Value`
+**once** and broadcasts that exact value to every module implementing
+the interface via `set_TurnAxis`. `EngineModule`'s implementation is a
+bare passthrough — `turnAxis_Input.Value = value`, no scaling, no
+clamp. So `EngineModule.turnAxis_Input` **is**
+`Rocket.output_TurnAxisTorque`, exactly, every tick — the identical
+signal that drives body rotation (§B1.3). This is *why* gimbal engines
+visibly counter-steer the instant SAS engages (observed live
+2026-09-01): SAS's saturated ±1 deadbeat correction and the gimbal
+target are not two systems that happen to correlate, they're two
+readers of one broadcast value. **Live-validated same session:** 6,513
+samples, `gimbalTurnAxisInput` vs. `output_TurnAxisTorque` — **0.0000%
+error, max absolute difference exactly 0**, spanning both manual-hold
+saturation (±1.00, ~1,569 samples) and SAS's full proportional settling
+curve down to 0 (~3,577 samples at rest, plus the full spread in
+between as angular velocity decayed). Tighter than any formula-based
+result elsewhere in this project, which tracks — it isn't a formula,
+it's a literal value copy.
+
+Probe support: `gimbalinfo` command (v0.50.0, one-shot, curve
+keyframes) and `computed:gimbal` scoped-telemetry field (v0.51.0,
+per-tick `gimbalOn`/`throttleOut`/`turnAxisInput`/`time`/`targetTime`).
+The live validation above used `computed:gimbal` alongside the
+already-existing `output_TurnAxisTorque` telemetry path — no new probe
+code needed for the validation itself.
+
+### B1.11 Status
 
 | Item | Status |
 |---|---|
@@ -4150,6 +4395,11 @@ has an unread gate that likely rejects parts of unowned DLC.
 | Timewarp limits 0.1 / 3.0 m/s | **[CONFIRMED]** |
 | `GetSizeRadius` 1 s cache, `+3` pad | **[CONFIRMED]** |
 | `Inject_*` ↔ nested `INJ_*` interface mechanism | **[CONFIRMED]** |
+| Gimbal: `RecalculateGimbal` target-setting | **[CONFIRMED]** |
+| Gimbal: `MoveModule.Update` timing (linear `MoveTowards`) | **[CONFIRMED]** |
+| Gimbal: `ApplyAnimation` angle from `AnimationCurve` | **[CONFIRMED]** |
+| Gimbal: real curve keyframe shape (linear vs. eased) | **[CONFIRMED LIVE]** — linear, tangents = chord slope |
+| Gimbal: `turnAxis_Input` == `output_TurnAxisTorque` | **[CONFIRMED LIVE]** — 0.0000% error, 6,513 samples |
 | `UseParts` / `SetParts` bodies | **[PARTIAL]** — signatures only |
 | `CanUsePart` gate | **[OPEN]** |
 | Rotation model verified against live flight | **[UNTESTED-LIVE]** |

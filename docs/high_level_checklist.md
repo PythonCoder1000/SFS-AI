@@ -8,6 +8,60 @@ behind any confirmed item.
 
 ---
 
+## Current focus (2026-08-31 evening): forward integrator, closing physics for good
+
+Goal: a genuine forward integrator that can answer "where will this
+rocket be in N seconds" — then move on to the rest of the to-do (design
+decisions, blueprint tooling) with physics no longer an open question.
+
+**Fixed-thrust-direction trajectory prediction is fully unblocked right
+now** — translation (gravity + drag + thrust) and body rotation
+(player/SAS-commanded + aero torque, both confirmed) cover every
+physics input a fixed-thrust integrator needs.
+
+**Two specific gaps are what's left before physics is closed for
+good — both are IL reads, not open-ended research:**
+
+- [x] **Gimbal timing — fully closed 2026-08-31/09-01.** IL read
+      complete: `EngineModule.RecalculateGimbal` sets the target from
+      steering input every tick; `MoveModule.Update` chases it
+      **linearly** (`Mathf.MoveTowards`, no easing) at rate
+      `1/animationTime`; `MoveModule.ApplyAnimation` turns that into the
+      real angle via `X.Evaluate(time - offset)` on a Unity
+      `AnimationCurve`. **Both live-only pieces now confirmed too:** a
+      real engine's curve is genuinely linear (keyframe tangents exactly
+      equal the chord slope — confirmed via `gimbalinfo`), and
+      `turnAxis_Input` is a bare passthrough of
+      `Rocket.output_TurnAxisTorque` — confirmed both via IL
+      (`Inject_TurnAxisTorque` broadcasts one value to every
+      `INJ_TurnAxisTorque` module) and live (**0.0000% error, 6,513
+      samples**, spanning manual-hold saturation and SAS's full settling
+      curve). This is also why gimbaling engines visibly counter-steer
+      the instant SAS engages — gimbal target and body rotation share
+      one upstream signal, not two correlated systems. See
+      `sfs_source_reference.md` §B1.10.
+- [x] **Parachute drag — IL read complete 2026-09-01.**
+      `Aero_Rocket.ApplyParachuteDrag` runs AFTER the normal
+      `Lerp(CoM, CoP, 0.2)` (corrects the 2026-08-27 note that it
+      bypasses it — it doesn't, it blends further on top). For each
+      deployed chute (`targetState` 1=partial/2=full, 0=stowed skipped):
+      `chuteDrag = GetPointVelocity(chute.position).sqrMagnitude *
+      chute.drag.Evaluate(chute.state)` (rotation-aware, unlike
+      everywhere else in the aero chain), then `cop` and `force` update
+      via a force-weighted average — multiple chutes compound
+      sequentially, not independently. `chuteDrag` has no density term
+      of its own; density applies once, uniformly, to the combined
+      total afterward. **Not yet live-validated** — no probe support
+      yet either. See `sfs_source_reference.md` §C1.11,
+      `sfs_physics_reference.md` §2.8.
+
+With both gaps now IL-confirmed, Tier 1 physics has nothing left
+unread. Two items remain purely on the live-validation side (gimbal's
+core chain has this; parachute drag doesn't yet) — see revised "What
+done looks like" at the bottom of this file.
+
+---
+
 ## Physics — confirmed
 
 - [x] **Gravity** — 0.008–0.13% error, both radial and tangential cases
@@ -51,12 +105,26 @@ behind any confirmed item.
       explicit instruction — see `flights_log.jsonl`
       (`drag_validation_full_ascent_reentry`) for full notes.
 
-## Physics — was blocked, now has a path
+## Physics — confirmed live 2026-08-31
 
-- [ ] **Aerodynamic torque (magnitude)** — geometry access is now
-      unblocked (dragArea confirmed live, above), but the actual torque
-      computation (`force × (CoP − CoM) offset`) hasn't been done yet.
-      Next concrete step once picked back up.
+- [x] **Aerodynamic torque (magnitude)** — CONFIRMED and live-validated.
+      `τ = (cop_applied − worldCenterOfMass) × F_drag`, using the
+      already-confirmed drag force law and CoP, correctly rotated into
+      world space (a real bug fix — `dragCopX/Y` in telemetry was still
+      velocity-frame, never actually converted before now) and Unity's
+      own `rb2d.inertia` (read for the first time this session). Real
+      capsule+heat-shield reentry, 12,174 clean ticks: correlation
+      0.9986; on meaningful-torque ticks, 100% sign agreement, magnitude
+      within 1.5% at the largest swings, median error 4.66%. **The real
+      finding was that SAS auto-engages whenever hands are off controls**
+      (`hasControl && !IsOnSurface && no manual input`) and writes
+      `angularVelocity` directly, swamping the much subtler aero signal
+      — three earlier attempts were invalidated by this before it was
+      caught. Filtering on `Rocket.output_TurnAxisTorque == 0` (not raw
+      `arrowkeys.turnAxis`) is required to isolate pure aero torque. New
+      `aerotorque` probe command + `computed:aeroTorque` telemetry field,
+      v0.49.0. See `sfs_physics_reference.md` §2.5,
+      `sfs_source_reference.md` §C1.10.
 
 ## Physics — was "still open, no path yet"; now read from code, awaiting live validation
 
@@ -520,21 +588,26 @@ the relevant section of `sfs_physics_reference.md`.
 
 ## What "done" with Tier 1 actually looks like
 
-Materially: aero torque magnitude computed from the now-confirmed
-dragArea geometry, plus a decision (not necessarily research) on each of
-the items in "Design decisions owed."
+**REVISED (2026-09-01).** Materially: gimbal timing is now fully closed
+(IL + live), parachute drag is IL-confirmed but not yet live-validated
+(no probe support built for it), plus a decision (not necessarily
+research) on each item in "Design decisions owed." Everything else is
+done. The only remaining research-shaped work in all of Tier 1 is a
+single live-validation flight for parachute drag — no more IL reads
+needed anywhere.
 
-**REVISED (2026-08-31).** All four items the old framing called out as
-deferrable-but-unknown — heat, multi-engine, terrain, RCS — are now
+All five items the old framing called out as deferrable-but-unknown —
+heat, multi-engine, terrain, RCS, and now aerodynamic torque — are
 **fully closed**: confirmed from IL *and* live-validated against real
 flight data (heat 0.18% mean peak error; multi-engine 0.14% median
 error; terrain height/surface queries + `GetTerrainNormal`/
 `GetTerrainHeightAtAngles` bodies all confirmed and live-checked; RCS
-selection gate 99.63% live match plus force magnitude 0.06% live match).
-None of them are research items anymore, deferred or otherwise — there's
-nothing left to look up. The earlier note that "picking any of them up
+selection gate 99.63% live match plus force magnitude 0.06% live match;
+aero torque correlation 0.9986, 100% sign agreement on meaningful
+ticks, 4.66% median error). None of them are research items anymore,
+deferred or otherwise — there's nothing left to look up. The earlier note that "picking any of them up
 is a flight-test, not a research project" turned out to be exactly
-right, and all four flight-tests are now done.
+right, and all five flight-tests are now done.
 
 Two things did get *added* to Tier 1 by this pass, both decisions rather
 than research:

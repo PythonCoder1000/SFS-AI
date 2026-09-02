@@ -9,6 +9,97 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.51.0 — 2026-08-31
+
+- Added **gimbal telemetry**: new `computed:gimbal` scoped-telemetry
+  field records `gimbalOn`, `throttleOut`, `turnAxisInput`, `time`,
+  `targetTime` every tick for the first `hasGimbal` engine found on the
+  active rocket. Deliberately split from `gimbalinfo` (v0.50.0): curve
+  keyframes are static per engine and don't belong in per-tick data,
+  but the target-setting + `MoveTowards` timing genuinely change every
+  tick, so a real flight now shows the confirmed linear response ramp
+  automatically. Usage: `telemetry on
+  arrowkeys.turnAxis,computed:gimbal`. New shared helper
+  `TryGetPrimaryGimbal` (single-gimbal rockets only — first match wins,
+  no per-engine scoping yet). See `sfs_source_reference.md` §B1.10.
+
+## v0.50.0 — 2026-08-31
+
+- Added **gimbal timing** support: new `gimbalinfo` command reads the
+  full commanded-steering-to-angle chain for every gimbaling engine on
+  the active rocket. Confirms and exposes, live, all three pieces read
+  via IL this session:
+  1. `EngineModule.RecalculateGimbal` — sets `gimbal.targetTime =
+     turnAxis_Input * RotationDirection(transform)` every tick the
+     engine has thrust (else 0).
+  2. `MoveModule.Update` — chases that target via `Mathf.MoveTowards`
+     at a constant rate of `1/animationTime` — **linear, not eased or
+     spring-damped**, reaches target in exactly `animationTime`
+     seconds.
+  3. `MoveModule.ApplyAnimation` — the real angle is
+     `X.Evaluate(time - offset)`, where `X` is a Unity `AnimationCurve`
+     (keyframe spline) on the type==0 (Rotate) `animationElements`
+     entry.
+  **One thing IL alone can't answer, and what this command is actually
+  for:** whether a real engine's `X` curve is a plain linear ramp or
+  has easing baked into the keyframe tangents. Dumps `gimbalOn`,
+  `throttleOut`, `turnAxisInput`, `time`, `targetTime`, `animationTime`,
+  `unscaledTime`, and every keyframe (`time`/`value`/`inTangent`/
+  `outTangent`) of the rotate curve, for every gimbaling engine found.
+  Built, **not yet run live** — next step is a real flight with a
+  gimbaling engine and active steering input. See
+  `sfs_source_reference.md` §B1.10.
+
+## v0.49.0 — 2026-08-31
+
+- Added **aerodynamic torque magnitude** support: new `aerotorque` command
+  (on-demand) and `computed:aeroTorque` scoped-telemetry field (for
+  continuous per-tick recording during a validation flight). Predicts
+  torque and angular acceleration from formulas confirmed in earlier
+  sessions (`sfs_physics_reference.md` §2.3/§2.5,
+  `sfs_source_reference.md` C1.5) — this was assembly, not new physics
+  research, but two real gaps had to be closed to actually wire it up:
+  1. `dragCopX`/`dragCopY` (already sampled every tick since v0.28.0) are
+     in **velocity-aligned space**, not real world/scene coordinates —
+     confirmed via IL long ago (the "multiply by the non-negated
+     `Matrix2x2.Angle`" gotcha, C1.2) but never actually applied anywhere
+     in the probe until now. `TryComputeAeroTorque` rotates centerOfDrag
+     into real world space via the correctly-signed `localToWorld` matrix
+     before using it for anything CoM-relative.
+  2. Player-commanded rotation writes `angularVelocity` directly and
+     ignores moment of inertia entirely (confirmed, B1.3) — but real aero
+     force goes through Unity's own `AddForceAtPosition`, so predicting
+     the resulting angular acceleration needs `rb2d.inertia`, a stock
+     Unity `Rigidbody2D` property never read by this probe before. Now
+     read directly (no game-specific IL needed — it's a plain Unity API).
+  Computes: `F_drag = -v̂·(dragArea·1.5·|v|²·ρ(h))` (matches
+  `AeroModule.ApplyForce`'s body exactly), `cop_applied =
+  Lerp(worldCenterOfMass, cop_world, 0.2)` (confirmed 20% damping), then
+  `torque = (cop_applied − worldCenterOfMass) × F_drag` (2D cross
+  product). **KNOWN CAVEAT, deliberately not handled:** if a parachute is
+  deployed, `Aero_Rocket.ApplyParachuteDrag` mutates both force and cop by
+  reference (confirmed, C1.5/E6.1) — this is not replicated, so a
+  validation flight for this must keep the chute stowed. Built, **not yet
+  run live** — next step is a real engines-off/RCS-off atmospheric coast
+  flight (parachute stowed) comparing predicted `aeroAlphaDeg` against the
+  real `angularVelocity` finite difference, same validation pattern as
+  RCS force (v0.47.0).
+
+**LIVE-VALIDATED 2026-08-31, same day.** Real capsule+heat-shield reentry
+flight, hands off controls. Across 12,174 clean ticks (stable inertia,
+`output_TurnAxisTorque == 0` on both endpoints): correlation 0.9986
+between predicted and real finite-differenced angular acceleration; on
+the 117 ticks with meaningful torque, 100% sign agreement, magnitude
+within 1.5% at the largest swings, median error 4.66%. **Took three
+flights to get a clean read** — SAS auto-engages whenever
+`hasControl && !IsOnSurface` and there's no manual turn input, writing
+`angularVelocity` directly and swamping the aero signal. "Hands off
+controls" is exactly SAS's trigger condition, not the absence of it.
+Filtering on raw `arrowkeys.turnAxis == 0` isn't enough; the fix was
+adding `output_TurnAxisTorque` to telemetry and filtering on that
+instead (the real applied value each tick, from either source). See
+`sfs_physics_reference.md` §2.5 for the full writeup.
+
 ## v0.48.0 — 2026-08-30 (later same day)
 
 **New player-assignable key bindings** — `assignkey`/`unassignkey`/

@@ -229,16 +229,61 @@ mid-window noise consistent with ordinary integration noise.
 > turn key is held, while `hasControl` is false, or while `IsOnSurface`,
 > and damped to 10% in water. See `sfs_source_reference.md` §B1.3.
 
-### 2.5 Aerodynamic torque — existence [CONFIRMED], magnitude [OPEN, but
-geometry access is now unblocked — see §4]
+### 2.5 Aerodynamic torque — [CONFIRMED], live-validated 2026-08-31
 
-A rocket with engine off (zero fuel burn) and RCS off in real atmosphere
-shows `angularVelocity` decaying smoothly to exactly zero after a
-steering release, then holding at a stable non-zero angle — weathercock
-stability's real signature. Mechanism (force applied at CoP, offset from
-CoM) known; magnitude still needs the actual torque computation
-(`force × (CoP − CoM) offset`) done against the now-live `dragArea`
-data — not yet performed, but no longer blocked on anything.
+```
+τ = (cop_applied − worldCenterOfMass) × F_drag        (2D cross product)
+cop_applied = Lerp(worldCenterOfMass, cop_world, 0.2)  (same 20% damping as §2.3)
+```
+Where `cop_world` is `centerOfDrag` (§4/§2.3) rotated out of
+velocity-aligned space into real world/scene coordinates via the
+non-negated `Matrix2x2.Angle(velocityAngle − π/2)` — a rotation that was
+confirmed via IL early in this project but never actually applied
+anywhere in the probe until this validation (`dragCopX`/`Y` in
+`truth.jsonl` are still raw velocity-frame values, not world space).
+Unlike player-commanded rotation (§2.4), aero torque goes through
+Unity's real `AddForceAtPosition`, so predicting the resulting angular
+acceleration needs `rb2d.inertia` — Unity's own computed moment of
+inertia, a stock property never read by this project before now.
+
+**Live-validated 2026-08-31** on a real capsule+heat-shield reentry
+(post-separation, hands off all manual controls). Across 12,174 clean
+ticks (`inertia` stable, `output_TurnAxisTorque == 0` on both
+endpoints): **correlation 0.9986** between predicted and real
+finite-differenced angular acceleration. On the 117 ticks with
+meaningful torque (|real α| > 5°/s²): **100% sign agreement**, magnitude
+ratio (predicted/real) **0.985–1.011** at the largest swings, **median
+error 4.66%**. Not quite this project's sub-1%-error gold standard, but a
+real, solid confirmation — direction and magnitude both track.
+
+> **The real finding of this validation wasn't the formula — it was what
+> was fighting it.** Three earlier attempts (rows of chaotic, seemingly
+> uncorrelated data) all had the same root cause: **SAS auto-engages
+> the instant `hasControl && !IsOnSurface` and there's no manual turn
+> input** (§2.4's deadbeat damping), which writes `angularVelocity`
+> **directly**, completely bypassing inertia and the aero-torque model.
+> "Hands off controls" is exactly the trigger condition for SAS, not the
+> absence of it — releasing Q/E to get a clean aero-only test walks
+> straight into the one condition that turns the game's own
+> auto-stabilizer on. Filtering on raw `arrowkeys.turnAxis == 0` (what
+> the player touched) is not sufficient; the correct filter is
+> `Rocket.output_TurnAxisTorque == 0` — the actual applied value each
+> tick, whichever source (player or SAS) produced it. On the validation
+> flight, `output_TurnAxisTorque` was nonzero on 12,532 of 25,491 ticks;
+> of those, 11,575 had zero manual input — i.e. SAS alone accounted for
+> the overwhelming majority of non-aero angular acceleration in the
+> data. This is not visible or labeled in-game (no SAS toggle exists in
+> SFS the way it does in KSP-likes) — it's silent unless you're reading
+> the field directly.
+
+Probe support: `aerotorque` command (on-demand) and
+`computed:aeroTorque` scoped-telemetry field, both added v0.49.0. See
+`sfs_source_reference.md` §C1.10 for the reflection chain and
+`TryComputeAeroTorque`.
+
+**Known caveat, not yet handled:** invalid mid-parachute-deployment,
+since `ApplyParachuteDrag` mutates force/cop by reference (§2.3) and
+that mutation isn't replicated.
 
 ### 2.6 Mass model — [CONFIRMED], sub-gram precision
 
@@ -294,6 +339,51 @@ at the instant of the split.
 > stack-based flood fill over its adjacency index and counts connected
 > components; no physics, geometry or distance test is involved. See
 > `sfs_source_reference.md` §E3.2 and §E3.4.
+
+### 2.8 Parachute drag — [CONFIRMED]
+
+```
+Aero_Rocket.ApplyParachuteDrag(ref float force, ref Vector2 cop):
+  // force/cop arrive already computed by the normal path:
+  //   force = dragArea * 1.5f * speedSq        (pre-direction, pre-density)
+  //   cop   = Lerp(worldCenterOfMass, cop_world, 0.2f)   -- normal §2.3 Lerp,
+  //           ALREADY applied before this runs (does NOT bypass it)
+  foreach chute in rocket.GetModules<ParachuteModule>():
+    if chute.targetState.Value not in {1, 2}: continue   // 0=stowed, no contribution
+    chuteVel = ToGlobalVelocity(rb2d.GetPointVelocity(chute.parachute.position))
+    chuteDrag = chuteVel.sqrMagnitude * chute.drag.Evaluate(chute.state.Value)
+    cop = (cop * force + chute.parachute.position * chuteDrag) / (force + chuteDrag)
+    force = force + chuteDrag
+```
+
+**One real correction to an earlier note:** the 2026-08-27 source-doc
+pass said this "bypasses the §2.3 `Lerp(CoM, CoP, 0.2)` damping." That
+was wrong — confirmed via the actual call site: the normal Lerp runs
+FIRST, and this method further blends on top of that already-Lerp'd cop,
+it doesn't skip it.
+
+**Two things easy to get wrong in a reimplementation:**
+1. **Rotation-aware, unlike everything else in the aero model.**
+   `rb2d.GetPointVelocity` gives the true local velocity at the chute's
+   own position (bulk velocity + ω×r), the one place in the whole
+   confirmed aero chain that accounts for the craft's spin. The main
+   body force/torque (§2.3/§2.5) never does — confirmed to have zero
+   ω-dependence anywhere else.
+2. **No density term of its own.** `chuteDrag` never gets multiplied by
+   atmospheric density directly — it's added straight into the shared
+   pre-density `force` scalar, which then gets density applied ONCE,
+   uniformly, to the combined total back in `ApplyForce`. So the
+   chute's contribution does end up density-scaled, just indirectly.
+
+**Multiple deployed chutes compound sequentially** — each iteration's
+weighted-average cop blend uses the *already-updated* `force` from the
+previous chute in the loop, not the original pre-parachute value.
+`targetState` values (1=partial/"safe", 2=full) inferred from the
+adjacent `deploySound_Partial`/`deploySound_Fully` fields, not from a
+named enum — `state`/`targetState` are both plain `Float_Reference`s.
+
+Not yet live-validated — see `sfs_source_reference.md` §C1.11 for the
+full IL and status.
 
 ---
 
@@ -391,10 +481,7 @@ reference, so the §2.3 formula does not hold as-is for a
 parachute-carrying rocket — found during a separate documentation pass,
 not yet independently live-verified here.
 
-**What this unblocks:** aerodynamic torque magnitude (§2.5, computation
-still to be done), realistic atmospheric ascent prediction, and
-validation of the already-built Python lower-envelope solver against the
-game's own numbers directly (rather than only synthetic test cases).
+**What this unblocked:** aerodynamic torque magnitude (§2.5, now confirmed and live-validated), realistic atmospheric ascent prediction, and validation of the already-built Python lower-envelope solver against the game's own numbers directly (rather than only synthetic test cases).
 
 ---
 
@@ -608,8 +695,6 @@ means `periapsis > Planet.OrbitRadius`, not `ecc < 1`. See
 
 ## 6. Still genuinely open
 
-- **Aerodynamic torque magnitude** (§2.5) — geometry unblocked, the
-  computation still has not been done.
 - **`AeroFormula` coefficients** (§5.1) — location known, values not read.
 - **The heat sentinel sign mismatch** — `DissipateHeat` writes **+∞** when
   a module finishes cooling, but `ApplyHeat` and `HeatPart` both test

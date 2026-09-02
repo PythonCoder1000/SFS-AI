@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.48.0";
+        public const string VersionString = "0.52.1";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (RCS live-validation prep: new 'rcsinfo' command reads directionAngleThreshold/torqueAngleThreshold/thrust/ISP/thrustPosition/per-thruster-normal live for every RcsModule on the rocket; new 'directionalAxisX/Y' inputs.jsonl fields read the real Rocket.output_DirectionalAxis, confirmed via IL to be the actual DirectionalAxis source (not on arrowkeys) -- needed to reconstruct DirectionThrust's firing decision; realAirTemp diagnostic from v0.43.0; heat fully closed in v0.41.0; geometry capture below is the abandoned Harmony path, kept for reference) ===");
+            Log("=== v" + VersionString + " loaded (parachute drag validation prep: computed:parachuteDrag now also exposes parachuteForceX/Y -- the torque-side validation on the first descent flight was inconclusive (chute stabilizes the craft, too little rotation signal), so the real test is the LINEAR deceleration the flight actually showed (100->30 m/s near-instantly); combine parachuteForceX/Y with plain rb2d.velocity.x/y,rb2d.mass telemetry paths for a direct predicted-vs-real deceleration check, same methodology as the original 0.098% drag validation; gimbal timing (v0.50.0/0.51.0) fully closed IL+live 2026-08-31/09-01; Tier 1 physics has no unread IL left anywhere as of this build) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -2264,6 +2264,208 @@ namespace SFSProbe
                     break;
                 }
 
+                case "aerotorque":
+                {
+                    // On-demand version of TryComputeAeroTorque -- see that
+                    // function's own header comment (right above GetHeatPartsArray
+                    // below) for the two things it does that no earlier command did:
+                    // rotating centerOfDrag into real world/scene space, and reading
+                    // rb2d.inertia for the first time. NOT valid mid-parachute-
+                    // deployment (see that same comment) -- for a real validation
+                    // flight, keep the chute stowed.
+                    object rAT2 = ActiveRocket();
+                    if (rAT2 == null) { ProbeMod.Result("aerotorque: no active rocket"); break; }
+
+                    float torqueZ, alphaPred, fX, fY, copWX, copWY, copAX, copAY, comXo, comYo, inertiaO, dragAO;
+                    double densityO;
+                    bool torqueOk = TryComputeAeroTorque(rAT2, out torqueZ, out alphaPred, out fX, out fY,
+                        out copWX, out copWY, out copAX, out copAY, out comXo, out comYo, out inertiaO, out dragAO, out densityO);
+
+                    if (!torqueOk)
+                    {
+                        ProbeMod.Result("aerotorque: FAILED (no drag surfaces exposed, near-zero speed, or a reflection call failed -- see probe.log)");
+                        break;
+                    }
+
+                    var atsb = new StringBuilder();
+                    atsb.Append("{\"dragArea\":").Append(Num(dragAO));
+                    atsb.Append(",\"density\":").Append(Num(densityO));
+                    atsb.Append(",\"force\":{\"x\":").Append(Num(fX)).Append(",\"y\":").Append(Num(fY)).Append("}");
+                    atsb.Append(",\"copWorld\":{\"x\":").Append(Num(copWX)).Append(",\"y\":").Append(Num(copWY)).Append("}");
+                    atsb.Append(",\"copApplied\":{\"x\":").Append(Num(copAX)).Append(",\"y\":").Append(Num(copAY)).Append("}");
+                    atsb.Append(",\"worldCenterOfMass\":{\"x\":").Append(Num(comXo)).Append(",\"y\":").Append(Num(comYo)).Append("}");
+                    atsb.Append(",\"inertia\":").Append(Num(inertiaO));
+                    atsb.Append(",\"predictedTorque\":").Append(Num(torqueZ));
+                    atsb.Append(",\"predictedAngularAccelDegPerSec2\":").Append(Num(alphaPred * 57.29578f));
+                    atsb.Append("}");
+                    Write("sfs_probe_aerotorque.json", atsb, "aerotorque dump");
+                    ProbeMod.Result("aerotorque: torque=" + torqueZ + " inertia=" + inertiaO +
+                                     " predAlpha=" + (alphaPred * 57.29578f) + "deg/s^2 -> sfs_probe_aerotorque.json");
+                    break;
+                }
+
+                case "gimbalinfo":
+                {
+                    // Confirms the full commanded-steering -> gimbal-angle chain
+                    // (all three pieces read via IL 2026-08-31):
+                    //   EngineModule.RecalculateGimbal writes
+                    //     gimbal.targetTime = turnAxis_Input * RotationDirection(transform)
+                    //     every frame the engine has thrust > 0 (else 0).
+                    //   MoveModule.Update chases that target LINEARLY via
+                    //     Mathf.MoveTowards at rate 1/animationTime -- no easing,
+                    //     no spring-damping, reaches target in exactly
+                    //     animationTime seconds.
+                    //   MoveModule.ApplyAnimation sets the real angle from
+                    //     transform.localEulerAngles.z = X.Evaluate(time - offset)
+                    //     for the type==0 (Rotate) animationElements entry, where
+                    //     X is a Unity AnimationCurve (keyframe spline).
+                    // The one thing IL alone can't answer: whether a REAL engine's
+                    // X curve is a plain 2-key linear ramp or has easing baked in.
+                    // This command dumps the live curve keyframes so that's
+                    // answerable directly, plus every other piece of the chain in
+                    // one place for a real steering-input validation flight.
+                    object rGI = ActiveRocket();
+                    if (rGI == null) { ProbeMod.Result("gimbalinfo: no active rocket"); break; }
+                    object holderGI = Get(rGI, "partHolder");
+                    object partsGI = Get(holderGI, "parts");
+                    var enGI = partsGI as System.Collections.IEnumerable;
+                    var gimbalResults = new List<string>();
+                    if (enGI != null)
+                    {
+                        foreach (object part in enGI)
+                        {
+                            string pname = "?";
+                            try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+                            foreach (object mv in ModuleValues(part))
+                            {
+                                if (mv.GetType().Name != "EngineModule") continue;
+                                try
+                                {
+                                    bool hasGimbal = ToB(Get(mv, "hasGimbal"));
+                                    if (!hasGimbal) continue;
+
+                                    bool gimbalOn = ToB(GetWrapped2(Get(mv, "gimbalOn")));
+                                    float throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
+                                    float turnAxisInput = ToF(GetWrapped2(Get(mv, "turnAxis_Input")));
+
+                                    object gimbal = Get(mv, "gimbal");   // the MoveModule
+                                    float timeVal = ToF(GetWrapped2(Get(gimbal, "time")));
+                                    float targetTimeVal = ToF(GetWrapped2(Get(gimbal, "targetTime")));
+                                    float animationTime = ToF(Get(gimbal, "animationTime"));
+                                    bool unscaledTime = ToB(Get(gimbal, "unscaledTime"));
+
+                                    var gsb = new StringBuilder();
+                                    gsb.Append("{\"part\":").Append(Q(pname));
+                                    gsb.Append(",\"gimbalOn\":").Append(gimbalOn ? "true" : "false");
+                                    gsb.Append(",\"throttleOut\":").Append(Num(throttleOut));
+                                    gsb.Append(",\"turnAxisInput\":").Append(Num(turnAxisInput));
+                                    gsb.Append(",\"time\":").Append(Num(timeVal));
+                                    gsb.Append(",\"targetTime\":").Append(Num(targetTimeVal));
+                                    gsb.Append(",\"animationTime\":").Append(Num(animationTime));
+                                    gsb.Append(",\"unscaledTime\":").Append(unscaledTime ? "true" : "false");
+
+                                    // Dump the rotate-type (type==0) curve's keyframes, if any --
+                                    // confirmed as index 0 in MoveModule.ApplyAnimation's switch.
+                                    object elements = Get(gimbal, "animationElements");
+                                    var elEn = elements as System.Collections.IEnumerable;
+                                    var curveKeys = new List<string>();
+                                    if (elEn != null)
+                                    {
+                                        foreach (object el in elEn)
+                                        {
+                                            object typeObj = Get(el, "type");
+                                            int typeIdx = typeObj == null ? -1 : Convert.ToInt32(typeObj);
+                                            if (typeIdx != 0) continue;
+                                            float offset = ToF(Get(el, "offset"));
+                                            object curve = Get(el, "X");
+                                            if (curve == null) continue;
+                                            object keysObj = Get(curve, "keys");
+                                            var keysArr = keysObj as System.Collections.IEnumerable;
+                                            if (keysArr == null) continue;
+                                            var ksb = new StringBuilder();
+                                            ksb.Append("{\"offset\":").Append(Num(offset)).Append(",\"keys\":[");
+                                            bool first = true;
+                                            foreach (object kf in keysArr)
+                                            {
+                                                if (!first) ksb.Append(",");
+                                                first = false;
+                                                float kt = ToF(Get(kf, "time"));
+                                                float kv = ToF(Get(kf, "value"));
+                                                float kin = ToF(Get(kf, "inTangent"));
+                                                float kout = ToF(Get(kf, "outTangent"));
+                                                ksb.Append("{\"t\":").Append(Num(kt))
+                                                   .Append(",\"v\":").Append(Num(kv))
+                                                   .Append(",\"in\":").Append(Num(kin))
+                                                   .Append(",\"out\":").Append(Num(kout))
+                                                   .Append("}");
+                                            }
+                                            ksb.Append("]}");
+                                            curveKeys.Add(ksb.ToString());
+                                        }
+                                    }
+                                    gsb.Append(",\"rotateCurves\":[").Append(string.Join(",", curveKeys.ToArray())).Append("]");
+                                    gsb.Append("}");
+                                    gimbalResults.Add(gsb.ToString());
+                                }
+                                catch (Exception e)
+                                {
+                                    ProbeMod.Log("[gimbalinfo] EngineModule read error on part \"" + pname + "\": " + e.Message);
+                                    gimbalResults.Add("{\"part\":" + Q(pname) + ",\"error\":" + Q(e.Message) + "}");
+                                }
+                            }
+                        }
+                    }
+                    if (gimbalResults.Count == 0)
+                    {
+                        ProbeMod.Result("gimbalinfo: no gimbaling engines found on active rocket (hasGimbal false on all engines)");
+                        break;
+                    }
+                    var gAll = new StringBuilder();
+                    gAll.Append("[").Append(string.Join(",", gimbalResults.ToArray())).Append("]");
+                    Write("sfs_probe_gimbalinfo.json", gAll, "gimbalinfo dump");
+                    ProbeMod.Result("gimbalinfo: " + gimbalResults.Count + " gimbaling engine(s) -> sfs_probe_gimbalinfo.json");
+                    break;
+                }
+
+                case "parachutedrag":
+                {
+                    // On-demand version of TryComputeParachuteDrag -- see that
+                    // function's header comment for the confirmed compounding
+                    // logic. Returns 'chutesActive:0' harmlessly if no chute is
+                    // currently deployed (targetState 1 or 2) -- the prediction
+                    // then just reduces to the plain aero-torque case.
+                    object rPD = ActiveRocket();
+                    if (rPD == null) { ProbeMod.Result("parachutedrag: no active rocket"); break; }
+
+                    float pdTorque, pdAlpha, pdFx, pdFy, pdCopX, pdCopY, pdComX, pdComY, pdInertia, pdDragArea, pdChuteDrag;
+                    int pdNumChutes;
+                    bool pdOk = TryComputeParachuteDrag(rPD, out pdTorque, out pdAlpha, out pdFx, out pdFy,
+                        out pdCopX, out pdCopY, out pdComX, out pdComY, out pdInertia, out pdDragArea,
+                        out pdChuteDrag, out pdNumChutes);
+
+                    if (!pdOk)
+                    {
+                        ProbeMod.Result("parachutedrag: FAILED (no drag surfaces exposed, near-zero speed, or a reflection call failed -- see probe.log)");
+                        break;
+                    }
+
+                    var pdsb = new StringBuilder();
+                    pdsb.Append("{\"dragArea\":").Append(Num(pdDragArea));
+                    pdsb.Append(",\"chutesActive\":").Append(pdNumChutes);
+                    pdsb.Append(",\"chuteDragTotal\":").Append(Num(pdChuteDrag));
+                    pdsb.Append(",\"force\":{\"x\":").Append(Num(pdFx)).Append(",\"y\":").Append(Num(pdFy)).Append("}");
+                    pdsb.Append(",\"copApplied\":{\"x\":").Append(Num(pdCopX)).Append(",\"y\":").Append(Num(pdCopY)).Append("}");
+                    pdsb.Append(",\"worldCenterOfMass\":{\"x\":").Append(Num(pdComX)).Append(",\"y\":").Append(Num(pdComY)).Append("}");
+                    pdsb.Append(",\"inertia\":").Append(Num(pdInertia));
+                    pdsb.Append(",\"predictedTorque\":").Append(Num(pdTorque));
+                    pdsb.Append(",\"predictedAngularAccelDegPerSec2\":").Append(Num(pdAlpha * 57.29578f));
+                    pdsb.Append("}");
+                    Write("sfs_probe_parachutedrag.json", pdsb, "parachutedrag dump");
+                    ProbeMod.Result("parachutedrag: chutesActive=" + pdNumChutes + " chuteDrag=" + pdChuteDrag +
+                                     " torque=" + pdTorque + " predAlpha=" + (pdAlpha * 57.29578f) + "deg/s^2 -> sfs_probe_parachutedrag.json");
+                    break;
+                }
+
                 case "assignkey":
                 {
                     // "assignkey <key> <command...>" -- binds a key so the
@@ -3506,6 +3708,296 @@ namespace SFSProbe
             catch { return false; }
         }
 
+        // Aerodynamic torque magnitude (2026-08-31). Two things needed doing
+        // that hadn't been done anywhere else in this file yet:
+        //   1. dragCopX/Y in truth.jsonl is in VELOCITY-ALIGNED space, not real
+        //      world/scene coordinates -- confirmed via IL long ago (the
+        //      "multiply by the non-negated Matrix2x2.Angle" gotcha, C1.2) but
+        //      never actually wired into any command. Fixed here: the real
+        //      localToWorld rotation is applied before centerOfDrag is used for
+        //      anything CoM-relative.
+        //   2. Unlike player-commanded rotation (writes angularVelocity DIRECTLY,
+        //      ignores moment of inertia entirely -- confirmed, B1.3), real aero
+        //      force goes through Unity's own AddForceAtPosition, so predicting
+        //      the resulting angular acceleration needs rb2d.inertia -- a stock
+        //      Unity Rigidbody2D property, never read by this probe before.
+        // KNOWN CAVEAT, not yet handled: if a parachute is deployed,
+        // Aero_Rocket.ApplyParachuteDrag mutates BOTH force and cop by reference
+        // (confirmed, C1.5/E6.1) -- this does NOT replicate that path, so any
+        // validation flight for this must keep the parachute stowed.
+        static bool TryComputeAeroTorque(object rocket, out float torqueZ, out float alphaPred,
+            out float forceX, out float forceY, out float copWorldX, out float copWorldY,
+            out float copAppliedX, out float copAppliedY, out float comX, out float comY,
+            out float inertia, out float dragAreaOut, out double densityOut)
+        {
+            torqueZ = 0f; alphaPred = 0f; forceX = 0f; forceY = 0f;
+            copWorldX = 0f; copWorldY = 0f; copAppliedX = 0f; copAppliedY = 0f;
+            comX = 0f; comY = 0f; inertia = 0f; dragAreaOut = 0f; densityOut = 0.0;
+            try
+            {
+                object rb2d = Get(rocket, "rb2d");
+                if (rb2d == null) return false;
+                object worldCoMObj = Get(rb2d, "worldCenterOfMass");
+                if (worldCoMObj == null) return false;
+                comX = ToF(Get(worldCoMObj, "x"));
+                comY = ToF(Get(worldCoMObj, "y"));
+                inertia = ToF(Get(rb2d, "inertia"));
+
+                float dragCopVelX, dragCopVelY;
+                int allC, expC;
+                bool dragOk = TryComputeDragArea(rocket, out dragAreaOut, out dragCopVelX, out dragCopVelY, out allC, out expC);
+                if (!dragOk) return false;
+
+                object dloc = Unwrap(Get(rocket, "location"));
+                object velocity = GetWrapped(dloc, "velocity");
+                double vx = ToD(Get(velocity, "x"));
+                double vy = ToD(Get(velocity, "y"));
+                double speedSq = vx * vx + vy * vy;
+                double speed = Math.Sqrt(speedSq);
+                if (speed < 1e-6) return false;   // no meaningful direction -- drag is ~0 anyway
+                double vhatX = vx / speed, vhatY = vy / speed;
+                double velocityAngle = ToD(Get(velocity, "AngleRadians"));
+
+                Type matrixType = FindType("Matrix2x2");
+                if (matrixType == null) return false;
+                // localToWorld is the NON-negated angle -- opposite sign from the
+                // "rotate" matrix TryComputeDragArea/GetDragSurfaces uses to build
+                // velocity-aligned surfaces in the first place.
+                float localToWorldInput = (float)(velocityAngle - Math.PI / 2.0);
+                object localToWorldMatrix = InvokeStatic(matrixType, "Angle", new Type[] { typeof(float) }, new object[] { localToWorldInput });
+                if (localToWorldMatrix == null) return false;
+
+                MethodInfo mulMethod = matrixType.GetMethod("op_Multiply", BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { matrixType, typeof(Vector2) }, null);
+                if (mulMethod == null) return false;
+                object copWorldObj = mulMethod.Invoke(null, new object[] { localToWorldMatrix, new Vector2(dragCopVelX, dragCopVelY) });
+                if (!(copWorldObj is Vector2)) return false;
+                Vector2 copWorld = (Vector2)copWorldObj;
+                copWorldX = copWorld.x; copWorldY = copWorld.y;
+
+                object planet = Unwrap(Get(dloc, "planet"));
+                double height = ToD(Get(dloc, "Height"));
+                object densityObj = InvokeReturn(planet, "GetAtmosphericDensity", new object[] { height });
+                double density = densityObj != null ? ToD(densityObj) : 0.0;
+                densityOut = density;
+
+                // Matches AeroModule.ApplyForce's own body exactly (C1.5, confirmed).
+                float f = dragAreaOut * 1.5f * (float)speedSq;
+                forceX = -(float)vhatX * (f * (float)density);
+                forceY = -(float)vhatY * (f * (float)density);
+
+                // Confirmed 20% Lerp toward true CoP (sfs_physics_reference.md 2.3 /
+                // sfs_source_reference.md C1.5) -- NOT the full CoP.
+                copAppliedX = comX + (copWorldX - comX) * 0.2f;
+                copAppliedY = comY + (copWorldY - comY) * 0.2f;
+
+                float rX = copAppliedX - comX;
+                float rY = copAppliedY - comY;
+                torqueZ = rX * forceY - rY * forceX;              // 2D cross product, r x F
+                alphaPred = inertia != 0f ? torqueZ / inertia : float.NaN;
+                return true;
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[aerotorque] compute error: " + e.Message);
+                return false;
+            }
+        }
+
+        // Lightweight per-tick counterpart to the 'gimbalinfo' command
+        // (2026-08-31). Curve keyframes (linear vs. eased -- the actual open
+        // question) are STATIC per engine, so they don't belong in per-tick
+        // telemetry; this only reads the parts of the confirmed chain that
+        // genuinely change every tick (target-setting + MoveTowards timing),
+        // so a real flight gives the response ramp automatically without
+        // needing 'gimbalinfo' pressed repeatedly. Finds the first engine with
+        // hasGimbal==true on the active rocket -- fine for a single-gimbal
+        // test craft; multi-gimbal rockets would need per-engine scoping this
+        // doesn't attempt yet.
+        static bool TryGetPrimaryGimbal(object rocket, out bool gimbalOn, out float throttleOut,
+            out float turnAxisInput, out float timeVal, out float targetTimeVal)
+        {
+            gimbalOn = false; throttleOut = 0f; turnAxisInput = 0f; timeVal = 0f; targetTimeVal = 0f;
+            try
+            {
+                object holder = Get(rocket, "partHolder");
+                object parts = Get(holder, "parts");
+                var en = parts as System.Collections.IEnumerable;
+                if (en == null) return false;
+                foreach (object part in en)
+                {
+                    foreach (object mv in ModuleValues(part))
+                    {
+                        if (mv.GetType().Name != "EngineModule") continue;
+                        bool hasGimbal = ToB(Get(mv, "hasGimbal"));
+                        if (!hasGimbal) continue;
+
+                        gimbalOn = ToB(GetWrapped2(Get(mv, "gimbalOn")));
+                        throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
+                        turnAxisInput = ToF(GetWrapped2(Get(mv, "turnAxis_Input")));
+                        object gimbal = Get(mv, "gimbal");
+                        timeVal = ToF(GetWrapped2(Get(gimbal, "time")));
+                        targetTimeVal = ToF(GetWrapped2(Get(gimbal, "targetTime")));
+                        return true;   // first gimbaling engine found
+                    }
+                }
+                return false;
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[gimbal-telemetry] compute error: " + e.Message);
+                return false;
+            }
+        }
+
+        // Parachute drag (2026-09-01). Extends TryComputeAeroTorque's exact
+        // logic (same matrix rotation, same Lerp) with the confirmed
+        // Aero_Rocket.ApplyParachuteDrag compounding step, run AFTER the
+        // normal Lerp -- NOT a bypass, confirmed via the real call site
+        // (sfs_source_reference.md C1.11). For each deployed chute
+        // (targetState 1=partial/2=full, 0=stowed skipped): chuteDrag =
+        // GetPointVelocity(chute.position).sqrMagnitude * chute.drag.Evaluate
+        // (chute.state) -- the ONE rotation-aware path in the whole aero
+        // chain -- then cop/force update via a force-weighted average,
+        // compounding sequentially across multiple chutes. chuteDrag has no
+        // density term of its own; density is applied once, uniformly, to
+        // the combined total at the end (matching the real order of
+        // operations).
+        static bool TryComputeParachuteDrag(object rocket, out float torqueZ, out float alphaPred,
+            out float forceX, out float forceY, out float copAppliedX, out float copAppliedY,
+            out float comX, out float comY, out float inertia, out float dragAreaOut,
+            out float chuteDragTotal, out int numChutesActive)
+        {
+            torqueZ = 0f; alphaPred = 0f; forceX = 0f; forceY = 0f;
+            copAppliedX = 0f; copAppliedY = 0f; comX = 0f; comY = 0f;
+            inertia = 0f; dragAreaOut = 0f; chuteDragTotal = 0f; numChutesActive = 0;
+            try
+            {
+                object rb2d = Get(rocket, "rb2d");
+                if (rb2d == null) return false;
+                object worldCoMObj = Get(rb2d, "worldCenterOfMass");
+                if (worldCoMObj == null) return false;
+                comX = ToF(Get(worldCoMObj, "x"));
+                comY = ToF(Get(worldCoMObj, "y"));
+                inertia = ToF(Get(rb2d, "inertia"));
+
+                float dragCopVelX, dragCopVelY;
+                int allC, expC;
+                bool dragOk = TryComputeDragArea(rocket, out dragAreaOut, out dragCopVelX, out dragCopVelY, out allC, out expC);
+                if (!dragOk) return false;
+
+                object dloc = Unwrap(Get(rocket, "location"));
+                object velocity = GetWrapped(dloc, "velocity");
+                double vx = ToD(Get(velocity, "x"));
+                double vy = ToD(Get(velocity, "y"));
+                double speedSq = vx * vx + vy * vy;
+                double speed = Math.Sqrt(speedSq);
+                if (speed < 1e-6) return false;
+                double vhatX = vx / speed, vhatY = vy / speed;
+                double velocityAngle = ToD(Get(velocity, "AngleRadians"));
+
+                Type matrixType = FindType("Matrix2x2");
+                if (matrixType == null) return false;
+                float localToWorldInput = (float)(velocityAngle - Math.PI / 2.0);
+                object localToWorldMatrix = InvokeStatic(matrixType, "Angle", new Type[] { typeof(float) }, new object[] { localToWorldInput });
+                if (localToWorldMatrix == null) return false;
+
+                MethodInfo mulMethod = matrixType.GetMethod("op_Multiply", BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { matrixType, typeof(Vector2) }, null);
+                if (mulMethod == null) return false;
+                object copWorldObj = mulMethod.Invoke(null, new object[] { localToWorldMatrix, new Vector2(dragCopVelX, dragCopVelY) });
+                if (!(copWorldObj is Vector2)) return false;
+                Vector2 copWorld = (Vector2)copWorldObj;
+
+                object planet = Unwrap(Get(dloc, "planet"));
+                double height = ToD(Get(dloc, "Height"));
+                object densityObj = InvokeReturn(planet, "GetAtmosphericDensity", new object[] { height });
+                double density = densityObj != null ? ToD(densityObj) : 0.0;
+
+                // f: the shared pre-direction, pre-density magnitude scalar --
+                // confirmed identical to the 'force' ref-param ApplyParachuteDrag
+                // receives and mutates.
+                float f = dragAreaOut * 1.5f * (float)speedSq;
+
+                // Normal §2.3 Lerp -- confirmed to run BEFORE the parachute call,
+                // not bypassed by it.
+                float copX = comX + (copWorld.x - comX) * 0.2f;
+                float copY = comY + (copWorld.y - comY) * 0.2f;
+
+                // -- ApplyParachuteDrag, confirmed compounding logic --
+                Type worldViewType = FindType("SFS.World.WorldView");
+                object mainView = worldViewType != null ? Get(worldViewType, "main") : null;
+                object velOffsetWrapped = mainView != null ? Get(mainView, "velocityOffset") : null;
+                object velOffsetVal = velOffsetWrapped != null ? GetWrapped2(velOffsetWrapped) : null;
+                double offX = velOffsetVal != null ? ToD(Get(velOffsetVal, "x")) : 0.0;
+                double offY = velOffsetVal != null ? ToD(Get(velOffsetVal, "y")) : 0.0;
+
+                object holder = Get(rocket, "partHolder");
+                object parts = Get(holder, "parts");
+                var partsEn = parts as System.Collections.IEnumerable;
+                if (partsEn != null)
+                {
+                    foreach (object part in partsEn)
+                    {
+                        foreach (object mv in ModuleValues(part))
+                        {
+                            if (mv.GetType().Name != "ParachuteModule") continue;
+                            float targetState = ToF(GetWrapped2(Get(mv, "targetState")));
+                            if (targetState != 1f && targetState != 2f) continue;   // 0 = stowed
+
+                            object chuteTransform = Get(mv, "parachute");
+                            if (chuteTransform == null) continue;
+                            object posObj = Get(chuteTransform, "position");
+                            if (posObj == null) continue;
+                            float chutePosX = ToF(Get(posObj, "x"));
+                            float chutePosY = ToF(Get(posObj, "y"));
+
+                            MethodInfo gpvMethod = rb2d.GetType().GetMethod("GetPointVelocity", new Type[] { typeof(Vector2) });
+                            if (gpvMethod == null) continue;
+                            object localVelObj = gpvMethod.Invoke(rb2d, new object[] { new Vector2(chutePosX, chutePosY) });
+                            if (!(localVelObj is Vector2)) continue;
+                            Vector2 localVel = (Vector2)localVelObj;
+
+                            // WorldView.ToGlobalVelocity(local) = velocityOffset + local (Double2 + Vector2)
+                            double gVelX = offX + localVel.x;
+                            double gVelY = offY + localVel.y;
+                            double chuteSqrMag = gVelX * gVelX + gVelY * gVelY;
+
+                            object curveObj = Get(mv, "drag");
+                            if (curveObj == null) continue;
+                            float stateVal = ToF(GetWrapped2(Get(mv, "state")));
+                            object evalResult = InvokeReturn(curveObj, "Evaluate", new object[] { stateVal });
+                            float curveVal = evalResult != null ? ToF(evalResult) : 0f;
+
+                            float chuteDrag = (float)chuteSqrMag * curveVal;
+                            if (chuteDrag <= 0f) continue;
+
+                            copX = (copX * f + chutePosX * chuteDrag) / (f + chuteDrag);
+                            copY = (copY * f + chutePosY * chuteDrag) / (f + chuteDrag);
+                            f = f + chuteDrag;
+                            chuteDragTotal += chuteDrag;
+                            numChutesActive++;
+                        }
+                    }
+                }
+
+                forceX = -(float)vhatX * (f * (float)density);
+                forceY = -(float)vhatY * (f * (float)density);
+                copAppliedX = copX; copAppliedY = copY;
+
+                float rX = copAppliedX - comX;
+                float rY = copAppliedY - comY;
+                torqueZ = rX * forceY - rY * forceX;
+                alphaPred = inertia != 0f ? torqueZ / inertia : float.NaN;
+                return true;
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("[parachutedrag] compute error: " + e.Message);
+                return false;
+            }
+        }
+
         // Item 1/2 from the heat gap list (2026-08-30): per-part ExposedSurface
         // and real per-part Temperature/HeatTolerance/IsHeatShield, every tick.
         // Recomputes GetDragSurfaces->GetExposedSurfaces independently of
@@ -3730,6 +4222,64 @@ namespace SFSProbe
                 case "heatParts":
                 {
                     sb.Append(",\"heatParts\":").Append(GetHeatPartsArray(rocket));
+                    return true;
+                }
+                case "aeroTorque":
+                {
+                    // For a real validation flight: "telemetry on computed:aeroTorque"
+                    // (or combined with rot/angv via their own plain reflection paths,
+                    // e.g. "telemetry on rb2d.rotation,rb2d.angularVelocity,computed:aeroTorque")
+                    // records predicted torque/alpha every tick, to compare against the
+                    // REAL angularVelocity finite-difference afterward -- same pattern as
+                    // the RCS force validation. Engine off + RCS off + no parachute
+                    // deployed is required to isolate aero torque cleanly (see
+                    // TryComputeAeroTorque's header comment for the parachute caveat).
+                    float torqueZ, alphaPred, fX, fY, copWX, copWY, copAX, copAY, comXo, comYo, inertiaO, dragAO;
+                    double densityO;
+                    bool ok = TryComputeAeroTorque(rocket, out torqueZ, out alphaPred, out fX, out fY,
+                        out copWX, out copWY, out copAX, out copAY, out comXo, out comYo, out inertiaO, out dragAO, out densityO);
+                    sb.Append(",\"aeroTorque\":").Append(ok ? Num(torqueZ) : "null");
+                    sb.Append(",\"aeroAlphaDeg\":").Append(ok ? Num(alphaPred * 57.29578f) : "null");
+                    sb.Append(",\"rbInertia\":").Append(ok ? Num(inertiaO) : "null");
+                    return true;
+                }
+                case "gimbal":
+                {
+                    // "telemetry on computed:gimbal" (combine with turnAxis for
+                    // the commanded input, e.g. "telemetry on
+                    // arrowkeys.turnAxis,computed:gimbal"). Records the confirmed
+                    // target-setting + MoveTowards timing (sfs_source_reference.md
+                    // §B1.10) every tick -- the response ramp should show time
+                    // reaching targetTime in exactly animationTime seconds, linearly.
+                    // Curve shape (linear vs eased) is NOT here -- that's static, use
+                    // the one-shot 'gimbalinfo' command for that.
+                    bool gOn; float gThrOut, gTurnIn, gTime, gTarget;
+                    bool gok = TryGetPrimaryGimbal(rocket, out gOn, out gThrOut, out gTurnIn, out gTime, out gTarget);
+                    sb.Append(",\"gimbalOn\":").Append(gok ? (gOn ? "true" : "false") : "null");
+                    sb.Append(",\"gimbalThrottleOut\":").Append(gok ? Num(gThrOut) : "null");
+                    sb.Append(",\"gimbalTurnAxisInput\":").Append(gok ? Num(gTurnIn) : "null");
+                    sb.Append(",\"gimbalTime\":").Append(gok ? Num(gTime) : "null");
+                    sb.Append(",\"gimbalTargetTime\":").Append(gok ? Num(gTarget) : "null");
+                    return true;
+                }
+                case "parachuteDrag":
+                {
+                    // "telemetry on rb2d.angularVelocity,computed:parachuteDrag"
+                    // for a real deployed-chute validation flight, same pattern as
+                    // aeroTorque. chutesActive lets you filter to exactly the ticks
+                    // where a chute was actually contributing (0 = harmlessly
+                    // reduces to plain aero torque, still useful as a control).
+                    float pdTorque, pdAlpha, pdFx, pdFy, pdCopX, pdCopY, pdComX, pdComY, pdInertia, pdDragArea, pdChuteDrag;
+                    int pdNumChutes;
+                    bool pdOk = TryComputeParachuteDrag(rocket, out pdTorque, out pdAlpha, out pdFx, out pdFy,
+                        out pdCopX, out pdCopY, out pdComX, out pdComY, out pdInertia, out pdDragArea,
+                        out pdChuteDrag, out pdNumChutes);
+                    sb.Append(",\"parachuteTorque\":").Append(pdOk ? Num(pdTorque) : "null");
+                    sb.Append(",\"parachuteAlphaDeg\":").Append(pdOk ? Num(pdAlpha * 57.29578f) : "null");
+                    sb.Append(",\"parachuteChutesActive\":").Append(pdOk ? pdNumChutes.ToString() : "null");
+                    sb.Append(",\"parachuteRbInertia\":").Append(pdOk ? Num(pdInertia) : "null");
+                    sb.Append(",\"parachuteForceX\":").Append(pdOk ? Num(pdFx) : "null");
+                    sb.Append(",\"parachuteForceY\":").Append(pdOk ? Num(pdFy) : "null");
                     return true;
                 }
                 default:
