@@ -6,6 +6,311 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-09-02 — AoA -> dragArea empirical lookup table (`aoa_dragarea.py`)
+
+- **Built `analysis/aoa_dragarea.py`**, replacing `forward_sim.py`'s
+  frozen-starting-value `dragArea` with a per-craft angle-of-attack
+  lookup, per the plan recorded in `active_state.md`'s "Immediate next
+  experiment". `dragArea` is a deterministic function of AoA alone for
+  a fixed rigid craft design — this builds an empirical table straight
+  from real telemetry rather than porting live per-part geometry
+  (still blocked on the surface-mount-part gap).
+- **AoA convention**: `heading = rot + 90` (matches
+  `sfs_source_reference.md` §B1.4's `GetRotation()` `ControlModule`
+  fallback path, same `atan2(y,x)` frame as velocity heading); `AoA =
+  wrap(heading - velocity_heading)` to `[-180, 180]`.
+- **No fresh calibration flight needed** — checked the existing
+  2026-08-31 aero-torque validation flight
+  (`flight01_truth_2026-08-31_19-57-17.jsonl`, 4,969 samples,
+  `partCount` stable at 19 throughout) first, per the plan, and it
+  already sweeps the full `-180..+180` deg range with a physically
+  sensible pattern (`dragArea` minimal `~3.5` near 0 deg AoA, rising to
+  `~9-10` i.e. `~2.5-2.8x` at high AoA).
+- **Table**: 2-degree bins (180 total), median `dragArea` per bin, 0
+  empty bins, 13/180 low-confidence (<5 samples). Saved to
+  `analysis/aoa_dragarea_table_capsule_reentry.json`.
+- **Held-out validation** (train on even-indexed samples, test on
+  odd-indexed, 2,484 test pairs, genuinely unseen during table
+  construction): **median error 0.25%, mean 0.31%, p90 0.67%, max
+  2.01%** — tight, in the same range as several of this project's other
+  confirmed physics formulas.
+- **Table is per-craft-design specific**, not general — encodes one
+  part list/geometry via a `craft_signature` fingerprint (`heatParts`
+  names + `partCount`). Reusing it for a different rocket is invalid; a
+  different design needs its own table built the same way.
+- **Not yet done**: wiring `lookup_dragarea()` into `forward_sim.py`'s
+  `accel()`. That also requires adding rotation state (`theta`,
+  angular velocity) to the integrator, plus the confirmed rotation
+  formula and aero-torque formula — `dragArea` alone isn't enough
+  without the integrator tracking its own evolving orientation.
+
+---
+
+## 2026-09-02 (continued) — wired AoA→dragArea into forward_sim.py; rotation state added; coordinate-frame gotcha found
+
+- **`forward_sim.py` rewritten** with a rotating-state integrator:
+  state now includes `theta` (orientation, deg) and `omega` (angular
+  velocity, deg/s) alongside the original `px,py,vx,vy,m`. `dragArea`
+  is looked up from the AoA table at every RK4 sub-step instead of
+  staying frozen at the starting sample's value — the translational
+  wiring asked for is fully working and requires no extra live data
+  (dragArea is pure geometry, zero altitude/density dependency,
+  confirmed via IL).
+- **Old frozen-dragArea/no-rotation behavior preserved** as a fallback
+  when no `aoa_table` is passed (`forward_simulate(..., aoa_table=None)`)
+  — verified byte-for-byte equivalent to the pre-rewrite version on a
+  synthetic test case.
+- **Aero-torque model implemented** (`compute_aero_torque()`), following
+  `sfs_source_reference.md` §C1.10's confirmed formula exactly:
+  `torqueZ = (cop_applied - com_local) × F_drag`,
+  `alpha_deg = (torqueZ / inertia) * 57.29578`. **Verified numerically**
+  against the real live-read snapshot in `sfs_probe_aerotorque.json`:
+  reproduced `torqueZ=11.018437336` against the probe's own
+  `11.018437386` (float32 rounding only), and
+  `alpha_deg=1.5770399538` against `1.5770399570`. The `*57.29578`
+  rad→deg factor is **not explicit in the doc's pseudocode but is
+  required** — confirmed here for the first time; `sfs_source_reference.md`
+  §C1.10 should get a one-line addition noting this.
+- **Coordinate-frame gotcha found and documented, not previously
+  flagged anywhere:** `dragCopX`/`dragCopY` and `worldCenterOfMass`
+  (needed for the torque formula) live in Unity's small-scale LOCAL
+  physics frame (floating-origin-relative, order ~10^2–10^3) — **not**
+  the same frame as `Location.position` (`px,py`, order ~10^5–10^6,
+  used everywhere else in this project for gravity/translation).
+  Mixing them (e.g. treating `px,py` as `worldCenterOfMass`) silently
+  produces a nonsense torque — caught only because a first attempt at
+  computing torque from archived flight data returned exactly 0.0 for
+  every single tick, which traced back to this, not (as first
+  suspected) to the flight being in vacuum (see below — that was also
+  true, but a separate issue).
+- **`inertia` and `com_local` are required parameters, deliberately
+  not fabricated or defaulted.** A `sfs_probe_aerotorque.json` snapshot
+  existed with a real `inertia` value (400.313232421875), but its
+  `craft_signature` does NOT match the AoA table's craft (verified via
+  `aoa_dragarea.craft_signature` on both flights' first samples) —
+  reusing a different craft's inertia would be worse than not modeling
+  torque at all, so it was not used. If `inertia`/`com_local` aren't
+  supplied, `theta` still advances kinematically from the starting
+  `angv`, but `omega` stays frozen (zero-torque assumption) rather than
+  silently guessing.
+- **Found the AoA table's source flight is entirely above the
+  atmosphere** (h=81,510–91,078m, ceiling is 30,000m) — confirmed by
+  checking every sample's `h`. The wide AoA sweep used to build the
+  table is the craft freely tumbling in vacuum from momentum
+  conservation after stage separation, not atmosphere-driven
+  weathercocking. Doesn't affect `dragArea`/`centerOfDrag` validity
+  (pure geometry, no altitude dependency) but means this flight cannot
+  be used to derive or validate real aero-torque magnitude or a
+  craft's `rb2d.inertia` — a genuinely different flight (real
+  atmospheric descent, h<30,000m) or a fresh live `aerotorque` read is
+  needed for that.
+- **`aoa_dragarea.py` extended** to bin `dragCopX`/`dragCopY` alongside
+  `dragArea` (generalized `build_table`/`lookup_field`, kept
+  `lookup_dragarea` as a backward-compatible wrapper). Table rebuilt;
+  held-out validation unchanged (median 0.25%, mean 0.31%, p90 0.67%).
+- **End-to-end validation against real flight data:**
+  - Translational (position/altitude) prediction: mean **0.001% error**
+    over four 10s forward-sims from different points in the flight —
+    matches the project's established noise floor, confirms the new
+    integrator introduces no regressions.
+  - Rotation (`theta`) prediction, zero-torque fallback: **works
+    exactly where the assumption holds, fails informatively where it
+    doesn't.** Real `angv` is nonzero (active tumbling/SAS correction)
+    for samples 215–2230, then drops to exactly 0 and stays there
+    (SAS-locked steady state) for the rest of the flight. Forward-sims
+    started inside the locked window matched real `theta` exactly
+    (0.00° error); forward-sims started inside the active window
+    diverged substantially (49.7°, 178.5° error at 10s) — expected and
+    correct behavior, since the zero-torque model doesn't (and isn't
+    meant to) capture SAS's active correction or real time-varying
+    torque. Not a bug; documents exactly what this fallback does and
+    doesn't cover.
+- **Not yet done:** a live `aerotorque` read (`inertia` + `worldCenterOfMass`)
+  for the AoA table's actual craft, taken while it's in real atmosphere,
+  to activate and validate the full torque model end to end. Also not
+  done: modeling SAS itself (fully confirmed, §B1.3/§2.4 — deadbeat
+  controller nulling `angularVelocity` within one tick's authority
+  whenever `hasControl && !IsOnSurface` and no manual input), which
+  would be needed to match real hands-off flight behavior beyond pure
+  aero torque.
+
+---
+
+## 2026-09-02 (continued) — SAS added to forward_sim.py; found and documented the RCS torque-damping gap
+
+- **`apply_sas()` added** to `forward_sim.py`, implementing the
+  confirmed deadbeat SAS formula
+  (`sfs_source_reference.md` §B1.3 / `sfs_physics_reference.md` §2.4)
+  exactly: `omega -= torque_effective*57.29578/mass*clamp(omega/delta,-1,1)*dt`.
+  Applied once per RK4 outer step (not a fine-grained inner tick loop) --
+  **proved mathematically, then confirmed empirically, that a single
+  big-step application is EXACT for the pure-SAS mechanism** (chaining
+  the real per-tick formula many times over the same window gives an
+  identical result, differing only in the 17th decimal place).
+- **Validated against this exact craft's own real flight data**
+  (same flight the AoA table was built from -- entirely vacuum, so no
+  aero-torque confound): using the craft's own real `torque=5` field
+  (`SumEnabledTorque`, confirmed via `SFSProbe.cs`) and real per-tick
+  mass, single-tick predictions across all 4,168 real hands-off
+  (`turnAxis==0`) ticks: **median error exactly 0.0 deg/s**, mean 0.15,
+  p90 0.61, max 0.75.
+- **Found and documented a real, honest gap, not swept under the rug:**
+  the near-zero aggregate error hides that it's concentrated almost
+  entirely in low-`|omega|` ticks. Digging into where the larger errors
+  cluster: stretches with `|omega| >= 2 deg/s` show a consistent
+  ~0.45-0.61 deg/s UNDER-prediction of real deceleration PER TICK,
+  compounding to ~30+ deg/s of error over a 1-second window. Root cause
+  identified and confirmed, not just suspected: `RcsModule.TorqueThrust`
+  (`sfs_source_reference.md` §D3.2) fires RCS thrusters for rotational
+  damping whenever `|angularVelocity| >= 2` deg/s -- exactly the regime
+  where the gap appears -- and this craft's own recorded `rcsFiring`
+  field confirms 5 of 6 RCS thrusters were actively firing throughout
+  the high-omega stretches checked. RCS's torque contribution is a
+  SEPARATE mechanism (real `AddForceAtPosition` physics, needing
+  per-thruster position + `rb2d.inertia` -- same class of missing
+  ingredient as the aero-torque model) and is **not modeled**. Net:
+  `apply_sas()` is accurate under ~2 deg/s or on any RCS-disabled craft;
+  under-predicts real hands-off damping on a spinning RCS-equipped craft.
+- **`torque_effective` required as an explicit parameter**, same
+  treatment as `inertia`/`com_local` -- never fabricated. For this
+  specific craft it's legitimately available from the same flight's own
+  `inputs.jsonl` (`torque=5`), not borrowed from a different craft.
+- **Also found in passing, while investigating an initial apparent
+  discrepancy that turned out not to be a bug:** a low-`|omega|` window
+  (angv~0.3 deg/s) where SAS's confirmed formula predicts an immediate
+  null but the real craft's angv stayed completely flat for a full
+  second. Most likely explanation: `hasControl` was false during that
+  window (e.g. camera/focus elsewhere) -- SAS's gate
+  (`hasControl && !IsOnSurface`) requires it, and we have no
+  per-tick `hasControl` telemetry to confirm either way. Documented as
+  an open unknown, not resolved.
+- **Regression-checked:** translational (position/altitude) accuracy
+  unchanged (0.001% mean error, same four-point test as the dragArea
+  wiring); backward-compatible frozen-dragArea path still works
+  unmodified.
+
+---
+
+## 2026-09-02 (continued) — isolation flags added to forward_sim.py
+
+- **`flags` parameter added** to `forward_simulate()`/`accel()`/`_rk4_step()`:
+  `{"gravity", "drag", "aero_torque", "sas"}`, each defaulting to `True`.
+  Lets a divergence between predicted and real be narrowed to ONE
+  physics component (e.g. `flags={"drag": False}`) instead of guessed
+  at, without needing to strip out the corresponding data
+  (`aoa_table`/`inertia`/`com_local`/`torque_effective`) to test it --
+  "I have the data but want this off for a test" is now separate from
+  "I don't have this data" (the pre-existing `None`-means-off
+  behavior); both work independently.
+- Unknown flag names raise `ValueError` immediately (fails loud, not
+  silently ignored).
+- **Verified**: all-flags-off reduces to exact constant-velocity
+  straight-line motion (analytic check, not just "looks plausible").
+  `flags={"sas": False}` on a real validated case correctly freezes
+  omega at its starting value instead of nulling to 0, isolating
+  exactly what the flag claims to isolate. Default flags (all `True`)
+  reproduce byte-identical results to the pre-flags code on every
+  existing regression check (0.001% mean h error, 0.0 deg/s SAS median
+  error) -- adding the flag layer introduced no behavior change when
+  left at defaults.
+
+---
+
+## 2026-09-02 (continued) — Bucket A fully integrated into forward_sim.py (INTEGRATION-ONLY PASS, no flight validation)
+
+**Scope: every remaining Bucket A item from active_state.md's physics
+status list wired into the predictor** -- thrust, fuel burn, gimbal,
+RCS (force + torque), parachute drag, staging separation, heat
+accumulation, terrain collision. Explicitly NOT validated against any
+real flight in this pass -- that was out of scope for the task this was
+written under. Backup of the pre-integration file saved as
+`forward_sim.py.bak-pre-bucketA`.
+
+**State model expanded**: continuous RK4-integrated state grew from
+(px,py,vx,vy,m,theta,omega) to (px,py,vx,vy,m,theta,omega,heat_temp) --
+mass is now a real integrated state (was frozen), heat_temp is new.
+Discrete post-step state added: gimbal_times (one per gimbaled engine).
+SAS/gimbal/RCS/staging/terrain are all DISCRETE post-step corrections
+(operator splitting), not blended into the continuous derivative --
+matches how SAS was already handled, extended to the new mechanisms for
+the same reason (all are genuinely discrete/gated/rate-limited, not
+smooth ODEs).
+
+**Formulas used, all pulled directly from sfs_physics_reference.md /
+sfs_source_reference.md, re-read this session rather than assumed from
+memory:**
+- Thrust (section 2.2), fuel-flow rate incl. the `scale` term
+  (section 1.3), multi-engine as N independent forces not a resultant
+  (section 5.2)
+- Gimbal (section B1.10): target = turnAxis_Input * rotation_direction
+  = the SAME signal SAS uses (compute_turn_axis() extracted so both
+  reuse one implementation); MoveTowards rate-limited chase, confirmed
+  linear on the one real engine read live
+- RCS (section 5.3): gate is `|turn_axis| >= 0.95 OR |omega| >= 2` --
+  **caught and fixed during design, not left in**: an earlier draft
+  used `|omega| >= 2` alone and would have MISSED the common case where
+  SAS saturates turn_axis to +-1 well before omega reaches 2 deg/s on a
+  weak-torque craft. Force per-module (not pooled -- the ~6x
+  overstatement mistake already caught once in this project, guarded
+  against again here).
+- Parachute drag (section 2.8): refactored `_aero_force_and_cop()` to
+  match the confirmed pseudocode's pre-density/pre-direction
+  intermediate `force` scalar exactly, so base drag and parachute
+  blending share ONE implementation (previously would have been
+  duplicated between the translation and torque call sites).
+- Staging (section 2.7): momentum conservation; angular velocity
+  confirmed to carry over unchanged, not touched by a staging event here
+- Heat (section 5.1): reused sfs_telemetry.py's ALREADY-VALIDATED
+  (0.18% mean peak error) absorb/dissipate rates verbatim rather than
+  re-deriving from the formula text, specifically to avoid re-risking
+  the additive-vs-multiplicative bug already found and fixed once in
+  this project's air-temperature formula
+- Terrain (section 5.4): flat-datum fallback when no live
+  `terrain_lookup` supplied
+
+**Integration-only validation performed (NOT flight validation)**: syntax
+check, then 15 targeted crash/edge-case checks (all-flags-off reduces to
+an exact analytic straight line; inertia=0, isp=0, mass->0 without a dry
+mass floor, gimbal animation_time=0, r->0 degenerate case, empty
+engines/rcs/parachutes lists, unknown flag names, staging ejecting more
+mass than exists, terrain collision early-stop, backward-compat frozen
+path) plus 40 randomized-parameter trials checking every output field
+stays finite (no NaN/Inf) across random combinations of engines/RCS/
+parachutes/staging/inertia-presence/terrain. All passed. Built and
+syntax/crash-tested in an isolated sandbox first, transferred only after
+passing, to avoid leaving a broken file on a real machine mid-session.
+
+**Known deviations/assumptions, honestly flagged, not silently
+buried -- see the integration report for the full writeup:**
+1. Body-fixed vector rotation convention (CCW-positive, standard Unity
+   default) is ASSUMED, not independently IL-confirmed for arbitrary
+   part positions specifically.
+2. RCS/SAS/gimbal execution order within one step is a REASONED,
+   defensible choice (matches the confirmed pseudocode's described
+   order), not proven to exactly match Unity's actual per-tick script
+   execution order (which this project's own docs note is NOT a
+   guaranteed call chain elsewhere).
+3. Heat is a single representative "hottest part" scalar, not full
+   per-part tracking (a real scope limit, not an approximation
+   presented as complete).
+4. Parachute drag_curve uses linear interpolation, not the real Hermite
+   AnimationCurve (no real chute keyframes have been read live, unlike
+   the one gimbal curve that was).
+5. Gimbal's discrete big-step timing has NOT been proven exact under
+   RK4 operator splitting the way SAS's deadbeat law was (SAS's
+   telescoping proof doesn't extend to gimbal's different, rate-limited-
+   toward-a-moving-target mechanism).
+6. Staging's velocity-kick term (`eject_delta_v_local`) has no source of
+   real values -- `separationForce` is an unread parametric expression
+   for any specific craft; defaults to zero (pure mass drop) unless the
+   caller supplies real data.
+7. `position_local` for engines/RCS/parachutes is defined here as
+   CoM-relative by this module's own convention, not something
+   IL-confirmed to be suppliable directly in that frame -- caller's job
+   to get this right.
+
+---
+
 ## 2026-08-30 (later same day) — heat formula bug found and fixed via direct live comparison; HEAT FULLY CLOSED
 
 - **Root-caused and fixed a real transcription bug** in

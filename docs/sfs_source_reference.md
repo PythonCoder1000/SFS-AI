@@ -1547,6 +1547,24 @@ float torqueZ = (copAppliedX - comX) * forceY - (copAppliedY - comY) * forceX;  
 float alphaPred = torqueZ / rb2d.inertia;
 ```
 
+> **ADDITION (2026-09-02, forward_sim.py wiring session) -- alphaPred
+> above is in rad/s^2, not deg/s^2.** Not called out when this section
+> was first written. Confirmed by reproducing sfs_probe_aerotorque.json's
+> predictedAngularAccelDegPerSec2 field by hand: torqueZ / inertia alone
+> gives 0.027524539..., matching neither the snapshot's predictedTorque
+> (that is torqueZ itself, already matched) nor
+> predictedAngularAccelDegPerSec2 (1.5770399570465088) directly --
+> multiplying by 57.29578 (rad->deg, the same constant B1.3's ApplyTorque
+> uses) closes the gap exactly: 0.027524539... * 57.29578 = 1.5770399538,
+> matching the snapshot to float32 rounding. Consistent with this being
+> genuine Unity rotational physics (AddForceAtPosition, radian-based
+> internally) unlike player-commanded rotation, which writes
+> angularVelocity (deg/s) directly and needs no such conversion at the
+> call site (the 57.29578 there converts torque/mass, a different
+> quantity, at a different point in the calculation).
+> Reimplementations should use
+> alphaPred_degPerSec2 = (torqueZ / rb2d.inertia) * 57.29578f.
+
 **Bug found and fixed:** `dragCopX`/`dragCopY` in `truth.jsonl` (sampled
 every tick since v0.28.0) are the raw `centerOfDrag` output of
 `CalculateDragForce` (§C1.4) — which is in **velocity-aligned space**,
