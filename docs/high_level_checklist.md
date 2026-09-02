@@ -40,7 +40,8 @@ good — both are IL reads, not open-ended research:**
       the instant SAS engages — gimbal target and body rotation share
       one upstream signal, not two correlated systems. See
       `sfs_source_reference.md` §B1.10.
-- [x] **Parachute drag — IL read complete 2026-09-01.**
+- [x] **Parachute drag — IL read complete 2026-09-01, live validation
+      attempted, inconclusive.**
       `Aero_Rocket.ApplyParachuteDrag` runs AFTER the normal
       `Lerp(CoM, CoP, 0.2)` (corrects the 2026-08-27 note that it
       bypasses it — it doesn't, it blends further on top). For each
@@ -51,14 +52,35 @@ good — both are IL reads, not open-ended research:**
       via a force-weighted average — multiple chutes compound
       sequentially, not independently. `chuteDrag` has no density term
       of its own; density applies once, uniformly, to the combined
-      total afterward. **Not yet live-validated** — no probe support
-      yet either. See `sfs_source_reference.md` §C1.11,
+      total afterward. Probe support built (`parachutedrag` command +
+      `computed:parachuteDrag` field, v0.52.0/0.52.1, includes
+      `parachuteForceX/Y`). **Four real flights attempted, all
+      inconclusive, four different genuine causes** — not a formula
+      problem, a data-quality problem each time: (1) chute-active window
+      had almost no rotation signal (craft stabilizes, as expected);
+      (2) chute-active window was already near-zero speed, nothing to
+      measure; (3) a `+1220 m/s²` single-tick jump strongly suggests
+      `ActiveRocket()` briefly tracked a different physical object
+      (debris from a nearby separation), same artifact class seen
+      elsewhere in this project; (4) a genuinely clean single-object
+      flight (debris explicitly destroyed first) revealed the real gap —
+      predicted was drag-only, real included gravity, and near terminal
+      velocity under a chute the two roughly cancel, so real net accel
+      goes small while drag-only predicted stays large. Calibrating
+      local gravity from a same-flight "freefall" stretch didn't work
+      either — that stretch still had real aero drag on it (fast,
+      pre-chute), not gravity alone. **Fix identified, not yet done:**
+      record `location.position.x/y` (+planet) alongside everything
+      else so the already-confirmed gravity formula can be subtracted
+      from real acceleration before comparing to predicted drag-only
+      acceleration. See `sfs_source_reference.md` §C1.11,
       `sfs_physics_reference.md` §2.8.
 
 With both gaps now IL-confirmed, Tier 1 physics has nothing left
-unread. Two items remain purely on the live-validation side (gimbal's
-core chain has this; parachute drag doesn't yet) — see revised "What
-done looks like" at the bottom of this file.
+unread. Parachute drag remains open purely on the live-validation side
+(gimbal's core chain has this closed; parachute drag doesn't yet, see
+above for exactly why four attempts didn't land it) — see revised
+"What done looks like" at the bottom of this file.
 
 ---
 
@@ -506,11 +528,16 @@ the relevant section of `sfs_physics_reference.md`.
       a single-difficulty snapshot and the doc did not say which.
 - [x] **`CalculateDragForce` culls `dx < 0.01f` segments** — a
       reimplementation needs that exact threshold.
-- [x] **`ApplyParachuteDrag` bypasses the `Lerp(CoM, CoP, 0.2)` damping**
-      and mutates force *and* application point by reference, so the §2.3
-      drag formula does not hold for a parachute-carrying rocket. It is
-      also the one rotation-aware path (per-chute `GetPointVelocity`) and
-      uses an `AnimationCurve`, so partial deployment is a curve lookup.
+- [x] **`ApplyParachuteDrag`'s force/CoP mutation** — mutates force *and*
+      application point by reference, so the §2.3 drag formula does not
+      hold as-is for a parachute-carrying rocket. It is also the one
+      rotation-aware path (per-chute `GetPointVelocity`) and uses an
+      `AnimationCurve`, so partial deployment is a curve lookup.
+      **CORRECTION (2026-09-01):** the "bypasses the `Lerp(CoM, CoP,
+      0.2)` damping" half of this entry was wrong — confirmed via the
+      real call site that the Lerp runs FIRST and this method blends
+      further on top of it, not around it. See §2.8/§C1.11 for the full
+      corrected read.
 - [x] **Control gates live in the UI layer, not the model** — see the new
       decision item above.
 - [x] **The two timewarp modes scale different quantities** — see the
@@ -589,11 +616,13 @@ the relevant section of `sfs_physics_reference.md`.
 ## What "done" with Tier 1 actually looks like
 
 **REVISED (2026-09-01).** Materially: gimbal timing is now fully closed
-(IL + live), parachute drag is IL-confirmed but not yet live-validated
-(no probe support built for it), plus a decision (not necessarily
-research) on each item in "Design decisions owed." Everything else is
-done. The only remaining research-shaped work in all of Tier 1 is a
-single live-validation flight for parachute drag — no more IL reads
+(IL + live), parachute drag is IL-confirmed with probe support built
+and four live-validation flights attempted (all inconclusive, real
+causes documented above — not a formula problem), plus a decision (not
+necessarily research) on each item in "Design decisions owed."
+Everything else is done. The only remaining research-shaped work in
+all of Tier 1 is landing one clean parachute-drag validation flight
+with position recorded (for gravity subtraction) — no more IL reads
 needed anywhere.
 
 All five items the old framing called out as deferrable-but-unknown —
