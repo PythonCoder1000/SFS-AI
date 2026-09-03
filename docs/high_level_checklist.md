@@ -394,20 +394,19 @@ flagged here so whoever next touches that claim knows it's stale.
       real part geometry (`surfacesFast`), which is itself gated behind
       `Part.InitializePart()` (safe on placed instances only, per the
       existing geometry-capture gotcha).
-- [ ] **Surface-mount positioning formula — NOT solved, deliberately
-      deferred.** Real separator positions from the reference build
-      (`x=11/8.5, y=0.5/-2.5` around a tank centered at x=10) don't fit
-      a simple offset rule from the data gathered so far. Needs either
-      (a) real geometry data from placed instances (`surfacesFast` via
-      `InitializePart()`, same pattern already proven safe for placed
-      parts elsewhere in this project), or (b) calling the game's own
-      `HoldGrid.CollectSurfaceSnaps`/`ProcessSurfaceSnap` directly via
-      reflection rather than reimplementing edge-matching in Python.
-      Scoped out of the v1 magnet-based stacking tool (see
-      `python/blueprint_builder.py`) — v1 covers stack/structural parts
-      (tanks, capsules, engines, adapters) correctly; surface-mount
-      parts (parachutes, separators, RCS, solar panels) are a known,
-      documented v2 gap, not silently wrong.
+- [x] **Surface-mount positioning formula — IL-CONFIRMED 2026-09-02** (was
+      "NOT solved, deliberately deferred"). Real mechanism read end to
+      end: `HoldGrid.CollectSurfaceSnaps`/`ProcessSurfaceSnap` — edge-to-
+      edge matching (parallel gate, overlap gate, proximity gate, then a
+      0.25-unit-quantized offset + rotation delta), NOT a fixed
+      per-part-type offset, which is exactly why the earlier attempt to
+      fit one to the reference separator positions failed. Full algorithm
+      in `sfs_source_reference.md` §E8.1. **One open piece**: the exact
+      anchor-end (start vs. end) branch selection was traced but not
+      live-cross-checked — needs one real test placement before
+      `blueprint_builder.py` v2 trusts it blind. Still needs real edge
+      geometry (`surfacesFast`) for both parts either way, same gotcha as
+      before (gated behind `Part.InitializePart()` on placed instances).
 - [ ] **Minor, low-priority tooling bug (not yet fixed):**
       `sfsprobe`'s `getplacedmagnets` command reads part names via
       `displayName.TranslatableName`, which returns a shared
@@ -427,6 +426,66 @@ flagged here so whoever next touches that claim knows it's stale.
       the final loaded blueprint actually matches the confirmed manual
       chaining math, and whether the post-load connectivity check
       (`occupied` flags) reports clean.
+
+## Forward integrator — end-to-end calibration, NOT done
+
+**Added 2026-09-02, after tonight's error-compounding discussion.** All
+individual physics formulas are confirmed and validated in isolation
+(see above), and the integrator already supports active RCS/thrust
+command sequences via `ControlSchedule`/REPLAY mode — dynamic
+what-if simulation, not just passive-force prediction, is architecturally
+done. What's genuinely missing is knowing how error actually compounds
+over a real multi-minute mission with real maneuvering, as opposed to
+assumed from a model.
+
+- [ ] **Run `--test_against_run` end to end against a real mission for
+      the first time.** First attempt 2026-09-02 failed immediately
+      (`KeyError: 'location.position.x'` — telemetry field list was
+      missing position/mass/rotation/angularVelocity). Corrected field
+      list and re-flight plan already written up in
+      `bookkeeping/active_state.md`'s "Immediate next experiment" — this
+      item just formally tracks it at the Tier 1 level, since it's a
+      real prerequisite for calling the integrator done, not an optional
+      nice-to-have.
+- [ ] **Determine actual error-compounding behavior empirically, not by
+      assumed model.** The only real data point so far: four 10-second
+      BLIND-mode (no control replay) forward-sims from an earlier
+      session, mean **0.001% error** in translational/altitude
+      prediction — but that was a calm window. The SAME test's rotation
+      prediction ranged from **0.00° error** (started inside a
+      SAS-locked steady state) to **49.7° and 178.5° error at just 10s**
+      (started during active tumbling/correction) — a completely
+      different failure mode, not just "faster compounding." One
+      calm-window data point is not enough to know how the REPLAY-mode
+      integrator (with real control input, not the zero-torque
+      fallback that produced those rotation numbers) behaves over a full
+      mission under real maneuvering. This needs the corrected re-flight
+      above, analyzed across both calm AND actively-maneuvering windows
+      separately — position and rotation likely need separate
+      compounding characterizations, not one blended number.
+- [ ] **Only after the above: revisit the divergence-threshold design
+      decision** (see below) with real data instead of the two
+      illustrative compounding models (linear worst-case / random-walk)
+      used in tonight's exploratory tool. Likely two separate thresholds
+      — translational/altitude vs. rotation — not one blended number,
+      per the asymmetry above.
+- [ ] **Address the six documented simplifying assumptions** in the
+      Bucket-A integration (discrete-mechanism execution order, heat
+      single-representative-part, parachute curve linear not Hermite,
+      gimbal operator-splitting not proven exact, staging velocity-kick
+      defaults to zero, single-engine-scoped throttle applied uniformly)
+      — full list in `analysis/python_changelog.md`'s Bucket-A entry.
+      Each is a real, bounded gap between "physics is confirmed" and
+      "the integrator's predictions are trustworthy," separate from the
+      compounding question above.
+
+**Bottom line for what "done" looks like**: finishing every remaining
+item below (design decisions, minor tooling fixes, zero-game
+prototyping) does NOT by itself produce a calibrated, trustworthy
+forward integrator — it resolves process and scope questions. This
+section is the actual remaining work toward the accuracy question
+itself, and is currently emptier than the rest of this file might
+suggest.
 
 ## Design decisions owed — not blocked on research, pure decisions
 
@@ -495,10 +554,15 @@ flagged here so whoever next touches that claim knows it's stale.
 - [x] **Achievements: Steam-only?** No — `SFS.Logs.Challenge`, in-game
       state, fully reflectable, not gated behind Steamworks at all.
       `achievements` probe command built (v0.24), correct, not yet run live.
-      (Source-doc pass: `Challenge.CollectChallenges()` is also public
-      static and reaches the same catalogue. The
-      `Base.worldBase.challengesArray` path the probe uses was **not**
-      re-verified against IL in that pass — marked `[PARTIAL]`.)
+      **`Base.worldBase.challengesArray` path fully IL-CONFIRMED 2026-09-02**
+      (was `[PARTIAL]`, never re-verified since the source-doc pass).
+      `SFS.Base::worldBase` is a static `WorldBaseManager` field; `challengesArray`
+      is a real public field on it, populated by
+      `challengesArray = Challenge.CollectChallenges().ToArray()` at world load
+      (and nulled on unload) — the exact same `CollectChallenges()` already
+      confirmed public/static. It's also the same array the game's own
+      `ChallengeRecorder.UpdateEligibleSteps()` reads for real achievement
+      tracking, not a side path. The probe's read is correct end to end.
 - [x] **`Part.InitializePart()` signature** — corrected: zero arguments,
       not `InitializePart(bool)` as an earlier pass claimed.
 

@@ -7109,3 +7109,85 @@ real time rather than world time, so its behaviour under timewarp
 | Which parts set `unscaledTime` | **[OPEN]** |
 
 ---
+
+## E8. Blueprint construction — surface-mount attachment (`HoldGrid`)
+
+### E8.1 `HoldGrid.CollectSurfaceSnaps` / `ProcessSurfaceSnap` [CONFIRMED mechanism, PARTIAL branch-sign detail]
+
+IL-read 2026-09-02, resolving the "surface-mount positioning formula — NOT
+solved" gap flagged in `docs/high_level_checklist.md`'s blueprint section.
+The magnet-chain formula (§ elsewhere, confirmed 2026-08-29) only covers
+parts with a `MagnetModule` (stack parts: tanks, engines, capsules).
+`Parachute`, `Parachute Side`, and `Side Separator` have no `MagnetModule`
+at all (`magnetPoints: null`) — they attach via a genuinely different,
+edge-to-edge mechanism, confirmed here.
+
+**`CollectSurfaceSnaps(moves)`** — for the part being placed ("build"
+side) and the existing structure ("hold" side), pulls each side's
+`SurfaceData` modules, converts each into world-space edge segments
+(`Surfaces.GetSurfacesWorld()` → `Line2[]`), and uses a spatial-hash grid
+(`GetCollisionsDictionary`, cell size 2, tolerance 1.4/2.0) to find
+candidate hold-side edges near each build-side edge (checking both the
+edge and its `Flip()`), deduplicated per build-edge index
+(`GridPointData.checkIndex`). Each candidate pair is passed to
+`ProcessSurfaceSnap`.
+
+**`ProcessSurfaceSnap(moves, line_Build, line_Hold)`** — for one build
+edge vs. one candidate hold edge:
+
+1. **Parallel gate**: `Dot(line_Build.dir.normalized, line_Hold.dir.normalized) ≥ 0.9`
+   (~26° max angle) — abort (no snap) if the edges aren't nearly parallel.
+2. **Overlap gate**: project `line_Hold`'s two endpoints onto
+   `line_Build`'s own parametric axis via `Math_Utility.GetClosestPointOnLine`
+   (returns 0-1 param, scaled by `line_Build`'s length) to get a 1D range
+   `hold = Line(t0, t1)` in build-local coordinates; intersect with
+   `build = Line(0, len)` to get `overlap`. Abort if `overlap.Size ≤ 0.125`.
+3. **Proximity gate**: at `overlap.Center`, compute the real world position
+   on both edges (`GetPosOnBuildLine`/`GetPosOnHoldLine`, see below) and
+   abort if they're more than 0.7 units apart
+   (`(buildPos - holdPos).sqrMagnitude > 0.49`).
+4. **Offset + quantization**: `centerDelta = overlap.Center - hold.Center`
+   (sign determines which side of the hold edge the overlap sits on);
+   combined with a check of whether the hold or build edge is longer, this
+   picks which end of the *unclamped* hold-projection (`hold.start` or
+   `hold.end`) to measure from, producing a raw offset that gets
+   **quantized to the nearest 0.25-unit step** via `Math_Utility.Round(x, 0.25)`.
+   **[PARTIAL]** — the exact sign/side branch selecting which end is used
+   as the anchor was traced through the IL but not independently
+   cross-checked against a live placement; treat the quantization step
+   size (0.25) and the overall shape of the algorithm as CONFIRMED, but
+   verify the anchor-end choice with a real test placement before trusting
+   it blind.
+5. **Local helper functions** (all confirmed, simple):
+   - `GetPosOnBuildLine(x) = line_Build.start + line_Build.Size.normalized * x`
+     — world position at build-local parameter `x`.
+   - `GetPosOnHoldLine(x) = Line2.LerpUnclamped(InverseLerpUnclamped(hold.start, hold.end, x), line_Hold)`
+     — maps a build-local parameter back onto the real world-space hold
+     edge via the same (start,end) range used for the projection.
+   - `GetAngle() = AngleDegrees(line_Build.Size) - AngleDegrees(line_Hold.Size)`
+     — the rotation delta to apply to the part being placed so its edge
+     direction matches the existing edge's direction.
+6. **Result**: `Data(buildAnchorPoint, holdAnchorPoint, angleOffset)` is
+   appended to `moves` — the placement is "rotate the new part by
+   `angleOffset`, then translate so `buildAnchorPoint` on the new part's
+   edge coincides with `holdAnchorPoint` on the existing structure's edge."
+
+**Practical implication for `python/blueprint_builder.py` v2 (surface-mount
+parts)**: this is NOT a fixed per-part-type offset (which is why the
+earlier attempt to fit one to the reference build's separator positions
+failed) — it depends on both parts' real edge geometry (`surfacesFast`,
+gated behind `Part.InitializePart()` on placed instances, per the existing
+geometry-capture gotcha) and how their edges overlap. A v2 implementation
+needs real edge data for both parts, not a lookup table.
+
+| Claim | Status |
+|---|---|
+| Surface-mount uses `HoldGrid.CollectSurfaceSnaps`/`ProcessSurfaceSnap`, not magnet chaining | **[CONFIRMED]** |
+| Parallel-edge gate (dot ≥ 0.9) | **[CONFIRMED]** |
+| Overlap gate (> 0.125 units) | **[CONFIRMED]** |
+| Proximity gate (≤ 0.7 units) | **[CONFIRMED]** |
+| Offset quantized to 0.25-unit steps | **[CONFIRMED]** |
+| `GetPosOnBuildLine`/`GetPosOnHoldLine`/`GetAngle` formulas | **[CONFIRMED]** |
+| Exact anchor-end (start vs. end) branch selection | **[PARTIAL]** — needs live cross-check |
+
+---
