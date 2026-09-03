@@ -40,8 +40,7 @@ good — both are IL reads, not open-ended research:**
       the instant SAS engages — gimbal target and body rotation share
       one upstream signal, not two correlated systems. See
       `sfs_source_reference.md` §B1.10.
-- [x] **Parachute drag — IL read complete 2026-09-01, live validation
-      attempted, inconclusive.**
+- [x] **Parachute drag — fully closed 2026-09-02 (IL 2026-09-01, live-validated 2026-09-02).**
       `Aero_Rocket.ApplyParachuteDrag` runs AFTER the normal
       `Lerp(CoM, CoP, 0.2)` (corrects the 2026-08-27 note that it
       bypasses it — it doesn't, it blends further on top). For each
@@ -52,35 +51,40 @@ good — both are IL reads, not open-ended research:**
       via a force-weighted average — multiple chutes compound
       sequentially, not independently. `chuteDrag` has no density term
       of its own; density applies once, uniformly, to the combined
-      total afterward. Probe support built (`parachutedrag` command +
-      `computed:parachuteDrag` field, v0.52.0/0.52.1, includes
-      `parachuteForceX/Y`). **Four real flights attempted, all
-      inconclusive, four different genuine causes** — not a formula
-      problem, a data-quality problem each time: (1) chute-active window
-      had almost no rotation signal (craft stabilizes, as expected);
-      (2) chute-active window was already near-zero speed, nothing to
-      measure; (3) a `+1220 m/s²` single-tick jump strongly suggests
-      `ActiveRocket()` briefly tracked a different physical object
-      (debris from a nearby separation), same artifact class seen
-      elsewhere in this project; (4) a genuinely clean single-object
-      flight (debris explicitly destroyed first) revealed the real gap —
-      predicted was drag-only, real included gravity, and near terminal
-      velocity under a chute the two roughly cancel, so real net accel
-      goes small while drag-only predicted stays large. Calibrating
-      local gravity from a same-flight "freefall" stretch didn't work
-      either — that stretch still had real aero drag on it (fast,
-      pre-chute), not gravity alone. **Fix identified, not yet done:**
-      record `location.position.x/y` (+planet) alongside everything
-      else so the already-confirmed gravity formula can be subtracted
-      from real acceleration before comparing to predicted drag-only
-      acceleration. See `sfs_source_reference.md` §C1.11,
-      `sfs_physics_reference.md` §2.8.
+      total afterward. **LIVE-VALIDATED 2026-09-02, attempt #6, correlation
+      1.000, 100% sign agreement, median error 0.015%** (90th percentile
+      0.040%) — matches or beats every other confirmed formula in this
+      project. Real cause of the previous 5 inconclusive attempts, now
+      fully understood: (1) chute-active window had almost no rotation
+      signal; (2) chute-active window was already near-zero speed,
+      nothing to measure; (3) a debris-tracking artifact (a different
+      physical object briefly tracked after a nearby separation); (4) a
+      real methodology gap — predicted was drag-only, real included
+      gravity, fixed 2026-09-02 by subtracting the confirmed gravity
+      formula from real acceleration; (5) unmodeled RCS translational
+      thrust — `output_DirectionalAxis` (fed by
+      `arrowkeys.horizontalAxis`/`verticalAxis`/`rcs`) drives a SECOND,
+      independent RCS selection path (`DirectionThrust`) alongside the
+      rotational one (`TorqueThrust`), and a window filtered only on
+      zero rotational signal can still have real unmodeled translational
+      RCS thrust throughout — caught by Christian, not Claude, and fixed
+      by adding `output_DirectionalAxis.x/y` to telemetry and filtering
+      on both. **The (6th, final) remaining wrinkle, also resolved same
+      day:** even with attempts 1-5's causes all fixed, a first pass on
+      a genuinely clean window still showed ~0 correlation — that
+      window happened to be near terminal velocity, where real net
+      acceleration is a small residual (gravity and drag nearly cancel),
+      too small to resolve by double-differencing noisy 60Hz position
+      data. Fixed by differentiating the directly-measured
+      `location.VerticalVelocity` ONCE instead of double-differencing
+      position — a generalizable lesson for any future near-equilibrium
+      validation, not parachute-specific. Probe support:
+      `parachutedrag` command + `computed:parachuteDrag` field
+      (v0.52.0/0.52.1, includes `parachuteForceX/Y`). See
+      `sfs_source_reference.md` §C1.11, `sfs_physics_reference.md` §2.8.
 
-With both gaps now IL-confirmed, Tier 1 physics has nothing left
-unread. Parachute drag remains open purely on the live-validation side
-(gimbal's core chain has this closed; parachute drag doesn't yet, see
-above for exactly why four attempts didn't land it) — see revised
-"What done looks like" at the bottom of this file.
+Both gaps are now closed — IL-confirmed and live-validated. Tier 1
+physics has nothing left unread or unvalidated anywhere.
 
 ---
 
@@ -615,15 +619,14 @@ the relevant section of `sfs_physics_reference.md`.
 
 ## What "done" with Tier 1 actually looks like
 
-**REVISED (2026-09-01).** Materially: gimbal timing is now fully closed
-(IL + live), parachute drag is IL-confirmed with probe support built
-and four live-validation flights attempted (all inconclusive, real
-causes documented above — not a formula problem), plus a decision (not
-necessarily research) on each item in "Design decisions owed."
-Everything else is done. The only remaining research-shaped work in
-all of Tier 1 is landing one clean parachute-drag validation flight
-with position recorded (for gravity subtraction) — no more IL reads
-needed anywhere.
+**REVISED (2026-09-02).** Tier 1 physics is now fully closed: gimbal
+timing and parachute drag (the two remaining gaps as of 2026-09-01) are
+both IL-confirmed AND live-validated (parachute drag: 6 attempts, final
+median error 0.015%, correlation 1.000 — see the parachute drag entry
+above for the full story). Every physics item in this file is now
+confirmed from IL and validated against real flight data. The only
+remaining work in Tier 1 is a decision (not research) on each item in
+"Design decisions owed."
 
 All five items the old framing called out as deferrable-but-unknown —
 heat, multi-engine, terrain, RCS, and now aerodynamic torque — are

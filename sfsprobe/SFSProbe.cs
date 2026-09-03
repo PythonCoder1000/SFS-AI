@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.52.1";
+        public const string VersionString = "0.54.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -242,6 +242,111 @@ namespace SFSProbe
         // helper (e.g. "computed:dragArea") dispatched via AppendComputedField.
         // See Command()'s "telemetry" case for the command syntax.
         static string[] telemetryFields;
+
+        // Auxiliary conditional triggers for scoped telemetry (v0.53.0+).
+        // General "what/when/how often" control on top of the plain field
+        // list: while <cond> is true, <command> fires -- once immediately,
+        // then again every <intervalSeconds> (0 = only ever fires once per
+        // recording). <cond> is evaluated via the exact same grammar/fields
+        // "script" steps already use (GetScriptFieldValue + EvalOp), plus
+        // two new pseudo-fields recognized there for this purpose:
+        // "gimbaling" (1/0, true while any engine reports hasGimbal &&
+        // gimbalOn) and "rcsfiring" (the live CountFiringThrusters count,
+        // >0 while EITHER RCS selection path -- rotational or translational
+        // -- is actually firing). Parsed by LoadTelemetryTriggers, checked
+        // every scoped-telemetry tick by CheckTelemetryTriggers (see below,
+        // near ScriptStep/CheckScript, the closest existing analog). See the
+        // "telemetry" command case for the on-the-wire syntax.
+        public class TelemetryTrigger
+        {
+            public string Field;
+            public string Op;
+            public double Value;
+            public string Command;
+            public double IntervalSeconds;
+            public bool FiredOnce;
+            public double NextAllowedTime;
+        }
+        static List<TelemetryTrigger> telemetryTriggers = new List<TelemetryTrigger>();
+
+        // Zero-config default when "telemetry on <fields>" is given with no
+        // "| ..." trigger block at all, or explicitly "| auto": the three
+        // snapshots that used to need a manually-timed assignkey press, now
+        // self-triggering and repeating on a slow cooldown instead of a
+        // single shot, so a late-arriving condition (e.g. RCS engaging after
+        // an earlier stage already separated) is never simply missed.
+        const string DefaultTelemetryTriggerSpec =
+            "gimbaling==1@3:gimbalinfo;rcsfiring>0@2:rcsforce;h<500@3:terrain";
+
+        static void LoadTelemetryTriggers(string spec)
+        {
+            telemetryTriggers = new List<TelemetryTrigger>();
+            string s = spec == null ? null : spec.Trim();
+            if (string.IsNullOrEmpty(s) || s.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                s = DefaultTelemetryTriggerSpec;
+            else if (s.Equals("none", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            foreach (string rawStep in s.Split(';'))
+            {
+                string step = rawStep.Trim();
+                if (step.Length == 0) continue;
+                int colon = step.IndexOf(':');
+                if (colon < 0) { ProbeMod.Log("[telemetry-trigger] bad step, missing ':': \"" + step + "\""); continue; }
+                string condAndInterval = step.Substring(0, colon).Trim();
+                string cmd = step.Substring(colon + 1).Trim();
+                if (cmd.Length == 0) { ProbeMod.Log("[telemetry-trigger] bad step, empty command: \"" + step + "\""); continue; }
+
+                double interval = 0;
+                string condStr = condAndInterval;
+                int at = condAndInterval.IndexOf('@');
+                if (at >= 0)
+                {
+                    condStr = condAndInterval.Substring(0, at).Trim();
+                    double.TryParse(condAndInterval.Substring(at + 1).Trim(),
+                        NumberStyles.Float, CultureInfo.InvariantCulture, out interval);
+                }
+
+                string field, op; double value;
+                if (!TryParseCondition(condStr, out field, out op, out value))
+                { ProbeMod.Log("[telemetry-trigger] bad condition: \"" + condStr + "\""); continue; }
+
+                telemetryTriggers.Add(new TelemetryTrigger
+                {
+                    Field = field, Op = op, Value = value,
+                    Command = cmd, IntervalSeconds = interval
+                });
+            }
+            ProbeMod.Log("[telemetry-trigger] loaded " + telemetryTriggers.Count + " trigger(s) from: " + s);
+        }
+
+        // Checked every scoped-telemetry tick (see Sample()). Fires via
+        // Command(...) -- the exact same code path assignkey's own hotkey
+        // handler already uses in ProbeRunner.Update() -- so none of
+        // gimbalinfo/rcsforce/terrain/etc.'s own logic is duplicated here.
+        static void CheckTelemetryTriggers(object r, double tNow)
+        {
+            if (telemetryTriggers == null || telemetryTriggers.Count == 0) return;
+            foreach (TelemetryTrigger trig in telemetryTriggers)
+            {
+                double val = GetScriptFieldValue(r, trig.Field);
+                if (double.IsNaN(val) || !EvalOp(trig.Op, val, trig.Value)) continue;
+
+                if (trig.IntervalSeconds <= 0)
+                {
+                    if (trig.FiredOnce) continue;
+                    trig.FiredOnce = true;
+                }
+                else
+                {
+                    if (tNow < trig.NextAllowedTime) continue;
+                    trig.NextAllowedTime = tNow + trig.IntervalSeconds;
+                }
+
+                try { Command(trig.Command); }
+                catch (Exception eAuto) { ProbeMod.Log("[telemetry-trigger] '" + trig.Command + "' threw: " + eAuto.Message); }
+            }
+        }
 
         public static bool AutoStop;
         static string autoStopMode = "turnover";   // "turnover" or "land"
@@ -529,6 +634,15 @@ namespace SFSProbe
                     case "m": return ToD(Get(Get(rocket, "rb2d"), "mass"));
                     case "rot": return ToD(Get(Get(rocket, "rb2d"), "rotation"));
                     case "angv": return ToD(Get(Get(rocket, "rb2d"), "angularVelocity"));
+                    // Two pseudo-fields added for telemetry auxiliary triggers
+                    // (v0.53.0+) -- harmless to expose to "script" steps too,
+                    // same evaluator, no separate code path.
+                    case "gimbaling":
+                    {
+                        bool gOnGSV; float gA, gB, gC, gD;
+                        return (TryGetPrimaryGimbal(rocket, out gOnGSV, out gA, out gB, out gC, out gD) && gOnGSV) ? 1.0 : 0.0;
+                    }
+                    case "rcsfiring": return CountFiringThrusters(rocket);
                     case "v":
                     {
                         object velocity = GetWrapped(loc, "velocity");
@@ -554,7 +668,7 @@ namespace SFSProbe
 
         // ---------- hotkey recording ----------
 
-        public static void StartRecording(string[] fields = null)
+        public static void StartRecording(string[] fields = null, string triggerSpec = null)
         {
             if (Telemetry) return;
             flightNumber++;
@@ -563,6 +677,7 @@ namespace SFSProbe
                                     // separation trigger from leftover debris or
                                     // the previous recording's rocket count
             telemetryFields = fields;
+            LoadTelemetryTriggers(triggerSpec);
             ArchiveTelemetry();
             Telemetry = true;
             string scopeNote = fields == null ? "full" : ("scoped[" + fields.Length + "]: " + string.Join(",", fields));
@@ -613,14 +728,41 @@ namespace SFSProbe
                     //   registered multi-field helper (see AppendComputedField) --
                     //   currently just "dragArea", more can be added there without
                     //   touching this parsing. "telemetry off" stops either mode.
+                    //
+                    // Optional auxiliary-trigger block (v0.53.0+), after a "|":
+                    //   "telemetry on <fields> | <cond1>@<sec1>:<cmd1>; <cond2>@<sec2>:<cmd2>; ..."
+                    //   General "what/when/how often" control: <fields> (before
+                    //   the "|") is WHAT gets recorded every tick, same as
+                    //   always; each "<cond>:<cmd>" entry after the "|" is WHEN
+                    //   an on-demand command (gimbalinfo/rcsforce/terrain/etc.)
+                    //   fires -- while <cond> holds true -- and the optional
+                    //   "@<seconds>" is HOW OFTEN it re-fires while still true
+                    //   (omit "@..." for a single shot). <cond> uses the exact
+                    //   same grammar "script" steps already use
+                    //   (TryParseCondition/GetScriptFieldValue/EvalOp), plus two
+                    //   pseudo-fields added for this purpose: "gimbaling" (1/0)
+                    //   and "rcsfiring" (live firing-thruster count). Omitting
+                    //   the "|" block entirely, or writing "| auto", uses the
+                    //   built-in default (see DefaultTelemetryTriggerSpec):
+                    //   gimbalinfo while gimbaling, every 3s; rcsforce while
+                    //   rcsfiring, every 2s; terrain once h<500 (then every 3s
+                    //   while still under that height). "| none" disables all
+                    //   auxiliary triggers entirely.
                     string[] parts3 = line.Split(new char[] { ' ' }, 3);
                     string mode = parts3.Length > 1 ? parts3[1] : null;
                     if (mode == "on")
                     {
                         string[] fields = null;
+                        string triggerSpec = null;
                         if (parts3.Length > 2 && !string.IsNullOrWhiteSpace(parts3[2]))
-                            fields = parts3[2].Split(',');
-                        StartRecording(fields);
+                        {
+                            string rest = parts3[2];
+                            int pipeIdx = rest.IndexOf('|');
+                            string fieldsPart = (pipeIdx >= 0 ? rest.Substring(0, pipeIdx) : rest).Trim();
+                            if (pipeIdx >= 0) triggerSpec = rest.Substring(pipeIdx + 1).Trim();
+                            if (fieldsPart.Length > 0) fields = fieldsPart.Split(',');
+                        }
+                        StartRecording(fields, triggerSpec);
                     }
                     else
                     {
@@ -2427,6 +2569,340 @@ namespace SFSProbe
                     break;
                 }
 
+                case "getforwardstartinfo":
+                {
+                    // Captures everything forward_sim.py's craft_config needs
+                    // to predict THIS EXACT rocket's future motion from real
+                    // per-part specs (thrust/ISP/geometry/thresholds/curves),
+                    // read live via reflection -- not an empirical fit, the
+                    // same way every other confirmed-formula command in this
+                    // file works. Call this BEFORE ignition (throttle=0,
+                    // gimbal undeflected) for the cleanest read -- engine
+                    // thrustNormal reflects CURRENT gimbal deflection if any
+                    // is active at capture time (backed out below using the
+                    // live gimbal.time reading and the confirmed linear
+                    // MoveModule model, B1.10, but a zero-deflection capture
+                    // needs no backing-out and is strictly more reliable).
+                    //
+                    // KNOWN SCOPE LIMITS, not silently glossed over:
+                    // - dragArea(AoA) is NOT captured here -- that needs
+                    //   either a full flight (analysis/aoa_dragarea.py's
+                    //   existing empirical-table approach) or real per-part
+                    //   exposed-surface geometry this command doesn't read.
+                    //   Use the AoA table tool for that piece separately.
+                    // - Engine "scale" (RecalculateMassFlow's world-transform
+                    //   magnitude term, D2.3) is defaulted to 1.0 here --
+                    //   exact for any unscaled part (the common case). A
+                    //   genuinely scaled engine part would need this read
+                    //   properly; flagged, not silently assumed away.
+                    // - position_local is captured in the rocket's CURRENT
+                    //   configuration -- valid as a body-fixed offset going
+                    //   forward ONLY until the next staging event changes
+                    //   which parts remain. This is a snapshot of the
+                    //   CURRENT config, not a schedule of every future
+                    //   stage's config. Re-run after each real staging event
+                    //   for a multi-stage prediction that spans separations.
+                    object rFS = ActiveRocket();
+                    if (rFS == null) { ProbeMod.Result("getforwardstartinfo: no active rocket"); break; }
+                    object rb2dFS = Get(rFS, "rb2d");
+                    if (rb2dFS == null) { ProbeMod.Result("getforwardstartinfo: no rb2d"); break; }
+                    object comObjFS = Get(rb2dFS, "worldCenterOfMass");
+                    if (comObjFS == null) { ProbeMod.Result("getforwardstartinfo: worldCenterOfMass read failed"); break; }
+                    float comX = ToF(Get(comObjFS, "x"));
+                    float comY = ToF(Get(comObjFS, "y"));
+                    double rocketMassFS = ToD(Get(rb2dFS, "mass"));
+                    float inertiaFS = ToF(Get(rb2dFS, "inertia"));
+                    float rotationDegFS = ToF(Get(rb2dFS, "rotation"));
+
+                    // part -> stageId map, same live mapping FuelByStage uses.
+                    var partStageMap = new Dictionary<object, int>(ReferenceEqualityComparer.Instance);
+                    try
+                    {
+                        object stagingFS = Get(rFS, "staging");
+                        object stagesFS = Get(stagingFS, "stages");
+                        var stagesEn = stagesFS as System.Collections.IEnumerable;
+                        if (stagesEn != null)
+                        {
+                            foreach (object stage in stagesEn)
+                            {
+                                int sid = (int)Get(stage, "stageId");
+                                object stageParts = Get(stage, "parts");
+                                var spEn = stageParts as System.Collections.IEnumerable;
+                                if (spEn == null) continue;
+                                foreach (object p in spEn) partStageMap[p] = sid;
+                            }
+                        }
+                    }
+                    catch (Exception e) { ProbeMod.Log("[getforwardstartinfo] stage map error: " + e.Message); }
+
+                    object holderFS = Get(rFS, "partHolder");
+                    object partsFS = Get(holderFS, "parts");
+                    var partsEnFS = partsFS as System.Collections.IEnumerable;
+
+                    var engineResults = new List<string>();
+                    var rcsResults = new List<string>();
+                    var chuteResults = new List<string>();
+                    var torqueModuleResults = new List<string>();
+                    double torqueEffectiveRaw = 0.0;
+
+                    Type v3CacheFS = null;
+                    MethodInfo vec2to3FS = null;
+                    MethodInfo transformPointFS = null;
+
+                    if (partsEnFS != null)
+                    {
+                        foreach (object part in partsEnFS)
+                        {
+                            string pname = "?";
+                            try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+                            int stageIdFS;
+                            string stageStr = partStageMap.TryGetValue(part, out stageIdFS) ? stageIdFS.ToString() : "null";
+                            object partTransform = null;
+                            try { partTransform = Get(part, "transform"); } catch { }
+
+                            foreach (object mv in ModuleValues(part))
+                            {
+                                string typeName = mv.GetType().Name;
+
+                                if (typeName == "EngineModule")
+                                {
+                                    try
+                                    {
+                                        float thrustTon = ToF(GetWrapped2(Get(mv, "thrust")));
+                                        float ispV = ToF(GetWrapped2(Get(mv, "ISP")));
+                                        object thrustPosRefFS = Get(mv, "thrustPosition");
+                                        float posLocalPartX = ToF(GetWrapped2(Get(thrustPosRefFS, "x")));
+                                        float posLocalPartY = ToF(GetWrapped2(Get(thrustPosRefFS, "y")));
+                                        object thrustNormRefFS = Get(mv, "thrustNormal");
+                                        float dirLocalX = ToF(GetWrapped2(Get(thrustNormRefFS, "x")));
+                                        float dirLocalY = ToF(GetWrapped2(Get(thrustNormRefFS, "y")));
+
+                                        bool hasGimbalFS = ToB(Get(mv, "hasGimbal"));
+                                        float gimbalRangeDeg = 0f;
+                                        float animationTimeS = 0f;
+                                        if (hasGimbalFS)
+                                        {
+                                            object gimbalFS = Get(mv, "gimbal");
+                                            float gimbalTimeNow = ToF(GetWrapped2(Get(gimbalFS, "time")));
+                                            animationTimeS = ToF(Get(gimbalFS, "animationTime"));
+                                            object elementsFS = Get(gimbalFS, "animationElements");
+                                            var elEnFS = elementsFS as System.Collections.IEnumerable;
+                                            float maxAbsV = 0f;
+                                            if (elEnFS != null)
+                                            {
+                                                foreach (object el in elEnFS)
+                                                {
+                                                    object typeObj = Get(el, "type");
+                                                    int typeIdx = typeObj == null ? -1 : Convert.ToInt32(typeObj);
+                                                    if (typeIdx != 0) continue;
+                                                    object curve = Get(el, "X");
+                                                    if (curve == null) continue;
+                                                    object keysObj = Get(curve, "keys");
+                                                    var keysArr = keysObj as System.Collections.IEnumerable;
+                                                    if (keysArr == null) continue;
+                                                    foreach (object kf in keysArr)
+                                                    {
+                                                        float kv = Math.Abs(ToF(Get(kf, "value")));
+                                                        if (kv > maxAbsV) maxAbsV = kv;
+                                                    }
+                                                }
+                                            }
+                                            gimbalRangeDeg = maxAbsV;
+                                            float deflectionNowDeg = gimbalTimeNow * gimbalRangeDeg;
+                                            double undoRad = -deflectionNowDeg * Math.PI / 180.0;
+                                            double cu = Math.Cos(undoRad), su = Math.Sin(undoRad);
+                                            float baseX = (float)(dirLocalX * cu - dirLocalY * su);
+                                            float baseY = (float)(dirLocalX * su + dirLocalY * cu);
+                                            dirLocalX = baseX; dirLocalY = baseY;
+                                        }
+
+                                        object vec2LocalEng = MakeVector2Like(comObjFS, posLocalPartX, posLocalPartY);
+                                        float worldOffX, worldOffY;
+                                        bool posOk = TryTransformPointToWorld(partTransform, vec2LocalEng,
+                                            ref v3CacheFS, ref vec2to3FS, ref transformPointFS, out worldOffX, out worldOffY);
+                                        string posLocalBodyStr = "null";
+                                        if (posOk)
+                                        {
+                                            worldOffX -= comX; worldOffY -= comY;
+                                            float lx, ly;
+                                            WorldOffsetToBodyLocal(worldOffX, worldOffY, rotationDegFS, out lx, out ly);
+                                            posLocalBodyStr = "{\"x\":" + Num(lx) + ",\"y\":" + Num(ly) + "}";
+                                        }
+
+                                        var esb = new StringBuilder();
+                                        esb.Append("{\"part\":").Append(Q(pname));
+                                        esb.Append(",\"stage\":").Append(stageStr);
+                                        esb.Append(",\"thrustTon\":").Append(Num(thrustTon));
+                                        esb.Append(",\"isp\":").Append(Num(ispV));
+                                        esb.Append(",\"scale\":1.0");
+                                        esb.Append(",\"hasGimbal\":").Append(hasGimbalFS ? "true" : "false");
+                                        esb.Append(",\"gimbalRangeDeg\":").Append(hasGimbalFS ? Num(gimbalRangeDeg) : "null");
+                                        esb.Append(",\"animationTimeS\":").Append(hasGimbalFS ? Num(animationTimeS) : "null");
+                                        esb.Append(",\"positionLocalBody\":").Append(posLocalBodyStr);
+                                        esb.Append(",\"baseDirectionLocal\":{\"x\":").Append(Num(dirLocalX)).Append(",\"y\":").Append(Num(dirLocalY)).Append("}");
+                                        esb.Append("}");
+                                        engineResults.Add(esb.ToString());
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        ProbeMod.Log("[getforwardstartinfo] EngineModule error on \"" + pname + "\": " + e.Message);
+                                        engineResults.Add("{\"part\":" + Q(pname) + ",\"error\":" + Q(e.Message) + "}");
+                                    }
+                                }
+                                else if (typeName == "RcsModule")
+                                {
+                                    try
+                                    {
+                                        float thrustTonR = ToF(Get(mv, "thrust"));
+                                        float ispR = ToF(Get(mv, "ISP"));
+                                        float dAngle = ToF(Get(mv, "directionAngleThreshold"));
+                                        float tAngle = ToF(Get(mv, "torqueAngleThreshold"));
+                                        object thrustPosR = Get(mv, "thrustPosition");
+
+                                        float worldOffX, worldOffY;
+                                        bool posOk = TryTransformPointToWorld(partTransform, thrustPosR,
+                                            ref v3CacheFS, ref vec2to3FS, ref transformPointFS, out worldOffX, out worldOffY);
+                                        string posLocalBodyStr = "null";
+                                        if (posOk)
+                                        {
+                                            worldOffX -= comX; worldOffY -= comY;
+                                            float lx, ly;
+                                            WorldOffsetToBodyLocal(worldOffX, worldOffY, rotationDegFS, out lx, out ly);
+                                            posLocalBodyStr = "{\"x\":" + Num(lx) + ",\"y\":" + Num(ly) + "}";
+                                        }
+
+                                        var normalsList = new List<string>();
+                                        object thrustersR = Get(mv, "thrusters");
+                                        var thEnR = thrustersR as System.Collections.IEnumerable;
+                                        int thrusterCountR = 0;
+                                        if (thEnR != null)
+                                        {
+                                            foreach (object th in thEnR)
+                                            {
+                                                thrusterCountR++;
+                                                object normalObj = Get(th, "thrustNormal");
+                                                float nx = ToF(Get(normalObj, "x"));
+                                                float ny = ToF(Get(normalObj, "y"));
+                                                normalsList.Add("{\"x\":" + Num(nx) + ",\"y\":" + Num(ny) + "}");
+                                            }
+                                        }
+
+                                        var rsb = new StringBuilder();
+                                        rsb.Append("{\"part\":").Append(Q(pname));
+                                        rsb.Append(",\"stage\":").Append(stageStr);
+                                        rsb.Append(",\"thrustTon\":").Append(Num(thrustTonR));
+                                        rsb.Append(",\"isp\":").Append(Num(ispR));
+                                        rsb.Append(",\"directionAngleThreshold\":").Append(Num(dAngle));
+                                        rsb.Append(",\"torqueAngleThreshold\":").Append(Num(tAngle));
+                                        rsb.Append(",\"positionLocalBody\":").Append(posLocalBodyStr);
+                                        rsb.Append(",\"thrusterCount\":").Append(thrusterCountR);
+                                        rsb.Append(",\"thrusterNormals\":[").Append(string.Join(",", normalsList.ToArray())).Append("]");
+                                        rsb.Append("}");
+                                        rcsResults.Add(rsb.ToString());
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        ProbeMod.Log("[getforwardstartinfo] RcsModule error on \"" + pname + "\": " + e.Message);
+                                        rcsResults.Add("{\"part\":" + Q(pname) + ",\"error\":" + Q(e.Message) + "}");
+                                    }
+                                }
+                                else if (typeName == "ParachuteModule")
+                                {
+                                    try
+                                    {
+                                        double maxDeployH = ToD(GetWrapped2(Get(mv, "maxDeployHeight")));
+                                        double maxDeployV = ToD(GetWrapped2(Get(mv, "maxDeployVelocity")));
+                                        object chuteTransform = Get(mv, "parachute");
+                                        float posLocalBodyX = 0f, posLocalBodyY = 0f;
+                                        bool posOk = false;
+                                        if (chuteTransform != null)
+                                        {
+                                            object worldPosObj = Get(chuteTransform, "position");
+                                            if (worldPosObj != null)
+                                            {
+                                                float wx = ToF(Get(worldPosObj, "x"));
+                                                float wy = ToF(Get(worldPosObj, "y"));
+                                                wx -= comX; wy -= comY;
+                                                WorldOffsetToBodyLocal(wx, wy, rotationDegFS, out posLocalBodyX, out posLocalBodyY);
+                                                posOk = true;
+                                            }
+                                        }
+
+                                        var curveKeys = new List<string>();
+                                        object curveObj = Get(mv, "drag");
+                                        if (curveObj != null)
+                                        {
+                                            object keysObj = Get(curveObj, "keys");
+                                            var keysArr = keysObj as System.Collections.IEnumerable;
+                                            if (keysArr != null)
+                                            {
+                                                foreach (object kf in keysArr)
+                                                {
+                                                    float kt = ToF(Get(kf, "time"));
+                                                    float kv = ToF(Get(kf, "value"));
+                                                    float kin = ToF(Get(kf, "inTangent"));
+                                                    float kout = ToF(Get(kf, "outTangent"));
+                                                    curveKeys.Add("{\"t\":" + Num(kt) + ",\"v\":" + Num(kv) + ",\"in\":" + Num(kin) + ",\"out\":" + Num(kout) + "}");
+                                                }
+                                            }
+                                        }
+
+                                        var psb = new StringBuilder();
+                                        psb.Append("{\"part\":").Append(Q(pname));
+                                        psb.Append(",\"stage\":").Append(stageStr);
+                                        psb.Append(",\"maxDeployHeight\":").Append(Num(maxDeployH));
+                                        psb.Append(",\"maxDeployVelocity\":").Append(Num(maxDeployV));
+                                        psb.Append(",\"positionLocalBody\":").Append(posOk ? ("{\"x\":" + Num(posLocalBodyX) + ",\"y\":" + Num(posLocalBodyY) + "}") : "null");
+                                        psb.Append(",\"dragCurveKeys\":[").Append(string.Join(",", curveKeys.ToArray())).Append("]");
+                                        psb.Append("}");
+                                        chuteResults.Add(psb.ToString());
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        ProbeMod.Log("[getforwardstartinfo] ParachuteModule error on \"" + pname + "\": " + e.Message);
+                                        chuteResults.Add("{\"part\":" + Q(pname) + ",\"error\":" + Q(e.Message) + "}");
+                                    }
+                                }
+                                else if (typeName == "TorqueModule")
+                                {
+                                    try
+                                    {
+                                        object enabledRef = Get(mv, "enabled");
+                                        bool isLocal = ToB(Get(enabledRef, "Local"));
+                                        bool valueField = ToB(GetWrapped2(enabledRef));
+                                        bool isEnabledTM = isLocal || valueField;
+                                        float torqueVal = ToF(GetWrapped2(Get(mv, "torque")));
+                                        if (isEnabledTM) torqueEffectiveRaw += torqueVal;
+                                        torqueModuleResults.Add("{\"part\":" + Q(pname) + ",\"stage\":" + stageStr +
+                                            ",\"torque\":" + Num(torqueVal) + ",\"enabled\":" + (isEnabledTM ? "true" : "false") + "}");
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        ProbeMod.Log("[getforwardstartinfo] TorqueModule error on \"" + pname + "\": " + e.Message);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    var fsOut = new StringBuilder();
+                    fsOut.Append("{\"mass\":").Append(Num(rocketMassFS));
+                    fsOut.Append(",\"inertia\":").Append(Num(inertiaFS));
+                    fsOut.Append(",\"worldCenterOfMass\":{\"x\":").Append(Num(comX)).Append(",\"y\":").Append(Num(comY)).Append("}");
+                    fsOut.Append(",\"rotationDeg\":").Append(Num(rotationDegFS));
+                    fsOut.Append(",\"torqueEffectiveRaw\":").Append(Num(torqueEffectiveRaw));
+                    fsOut.Append(",\"torqueModules\":[").Append(string.Join(",", torqueModuleResults.ToArray())).Append("]");
+                    fsOut.Append(",\"engines\":[").Append(string.Join(",", engineResults.ToArray())).Append("]");
+                    fsOut.Append(",\"rcsModules\":[").Append(string.Join(",", rcsResults.ToArray())).Append("]");
+                    fsOut.Append(",\"parachutes\":[").Append(string.Join(",", chuteResults.ToArray())).Append("]");
+                    fsOut.Append("}");
+                    Write("sfs_probe_forwardstartinfo.json", fsOut, "forward-integrator craft config dump");
+                    ProbeMod.Result("getforwardstartinfo: " + engineResults.Count + " engine(s), " + rcsResults.Count +
+                        " RCS module(s), " + chuteResults.Count + " parachute(s), " + torqueModuleResults.Count +
+                        " torque module(s) (raw sum=" + torqueEffectiveRaw + ") -> sfs_probe_forwardstartinfo.json");
+                    break;
+                }
+
                 case "parachutedrag":
                 {
                     // On-demand version of TryComputeParachuteDrag -- see that
@@ -2694,6 +3170,13 @@ namespace SFSProbe
                     // ResolvePath/AppendComputedField below and the "telemetry"
                     // command case above for the spec syntax. inputs.jsonl is
                     // deliberately NOT written in this mode.
+
+                    // Auxiliary conditional triggers (v0.53.0+) -- see the
+                    // telemetryTriggers/LoadTelemetryTriggers/CheckTelemetryTriggers
+                    // comments (top of this class) and the "telemetry" command
+                    // case for the "| <cond>@<sec>:<cmd>; ..." syntax.
+                    CheckTelemetryTriggers(r, t);
+
                     var sb3 = new StringBuilder();
                     sb3.Append("{\"t\":").Append(Num(t));
                     foreach (string rawField in telemetryFields)
@@ -2991,6 +3474,73 @@ namespace SFSProbe
             public static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
             public new bool Equals(object a, object b) { return ReferenceEquals(a, b); }
             public int GetHashCode(object o) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o); }
+        }
+
+        // Shared TransformPoint reflection helper (v0.54.0) -- same
+        // Vector2->Vector3->TransformPoint->Vector2 pattern already used
+        // inline in "rcsforce" (explicit-overload resolution, since
+        // UnityEngine.CoreModule commonly has multiple TransformPoint/
+        // Vector2<->Vector3 overloads that throw AmbiguousMatchException on
+        // a plain GetMethod(name) lookup). Extracted here so
+        // "getforwardstartinfo" doesn't duplicate it a second time; the
+        // rcsforce inline copy is left as-is (additive change, not a
+        // refactor of working code). Cache the three ref params ACROSS
+        // calls within one command (the Vector2 type doesn't change
+        // between parts), not just once per part.
+        static bool TryTransformPointToWorld(object transform, object localPointVec2,
+            ref Type vector3TypeCache, ref MethodInfo vec2ToVec3Method, ref MethodInfo transformPointMethod,
+            out float worldX, out float worldY)
+        {
+            worldX = float.NaN; worldY = float.NaN;
+            if (transform == null || localPointVec2 == null) return false;
+            if (vec2ToVec3Method == null)
+            {
+                Type vector2TypeLocal = localPointVec2.GetType();
+                vec2ToVec3Method = vector2TypeLocal.GetMethod("op_Implicit",
+                    BindingFlags.Public | BindingFlags.Static, null, new Type[] { vector2TypeLocal }, null);
+                if (vec2ToVec3Method == null) return false;
+                vector3TypeCache = vec2ToVec3Method.ReturnType;
+                transformPointMethod = transform.GetType().GetMethod("TransformPoint",
+                    BindingFlags.Public | BindingFlags.Instance, null, new Type[] { vector3TypeCache }, null);
+            }
+            if (transformPointMethod == null) return false;
+            object vec3 = vec2ToVec3Method.Invoke(null, new object[] { localPointVec2 });
+            object worldVec3 = transformPointMethod.Invoke(transform, new object[] { vec3 });
+            worldX = ToF(Get(worldVec3, "x"));
+            worldY = ToF(Get(worldVec3, "y"));
+            return true;
+        }
+
+        // Rotates a WORLD-frame CoM-relative offset into the BODY-LOCAL
+        // frame forward_sim.py's craft_config expects ("position_local",
+        // re-rotated by theta each future timestep via its own
+        // _rotate_body_vector). This is the INVERSE of that function's
+        // rotation (confirmed CCW-positive, matching Unity's
+        // Rigidbody2D.rotation convention) -- passing -rocketRotationDeg
+        // undoes the craft's CURRENT orientation so what's stored is a
+        // pure body-fixed offset, independent of theta at capture time.
+        static void WorldOffsetToBodyLocal(float worldOffX, float worldOffY, float rocketRotationDeg,
+            out float localX, out float localY)
+        {
+            double rad = -rocketRotationDeg * Math.PI / 180.0;
+            double c = Math.Cos(rad), s = Math.Sin(rad);
+            localX = (float)(worldOffX * c - worldOffY * s);
+            localY = (float)(worldOffX * s + worldOffY * c);
+        }
+
+        // Constructs a genuine Vector2-TYPED object at runtime, matching
+        // whatever exact loaded type an ALREADY-OBTAINED Vector2 instance
+        // has (e.g. Rigidbody2D.worldCenterOfMass) -- same pattern rcsforce
+        // already uses for posToComVec2, needed because a Composed_Vector2's
+        // unwrapped x/y are plain floats, not a Vector2, but
+        // TryTransformPointToWorld needs a real Vector2-shaped object to
+        // feed its op_Implicit->Vector3 conversion.
+        static object MakeVector2Like(object templateVec2, float x, float y)
+        {
+            object v = Activator.CreateInstance(templateVec2.GetType());
+            templateVec2.GetType().GetField("x").SetValue(v, x);
+            templateVec2.GetType().GetField("y").SetValue(v, y);
+            return v;
         }
 
         // Returns ONE ENTRY PER ENGINE/BOOSTER MODULE FOUND (regardless of

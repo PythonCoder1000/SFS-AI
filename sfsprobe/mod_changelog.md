@@ -9,6 +9,100 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.54.0 — `getforwardstartinfo`: full craft_config capture for the forward integrator
+
+New command `getforwardstartinfo` captures everything
+`analysis/forward_sim.py`'s `craft_config` needs to predict a specific
+rocket's motion from real per-part specs, not empirical fits or
+hand-entered guesses:
+
+- **Engines:** thrust, ISP, gimbal range/animation time (derived from
+  the rotate curve's keyframes, same pattern as `gimbalinfo`), and a
+  body-fixed `positionLocalBody` (world thrust position minus
+  `worldCenterOfMass`, rotated into body-local frame by the inverse of
+  `rb2d.rotation`). If the engine is currently gimbaling, the live
+  `gimbal.time` reading is used to back out the UNDEFLECTED base
+  thrust direction, not just the current (possibly deflected) one.
+- **RCS modules:** thrust, ISP, `directionAngleThreshold`/
+  `torqueAngleThreshold`, `positionLocalBody`, and the full per-thruster
+  normal list -- everything `forward_sim.py`'s upgraded `_rcs_force`
+  needs to replicate real `TorqueThrust`/`DirectionThrust` selection
+  instead of a precomputed static direction.
+- **Parachutes:** `maxDeployHeight`/`maxDeployVelocity`,
+  `positionLocalBody` (read directly from the chute Transform's world
+  `.position`, simpler than the engine/RCS TransformPoint path since
+  Transform.position is already world-space), and the drag
+  `AnimationCurve`'s keyframes.
+- **TorqueModule:** both the raw `Σ(enabled TorqueModule.torque)` sum
+  (`torqueEffectiveRaw`) and the individual per-part list -- the first
+  live capability this project has had to read this at all; previously
+  only inferable from IL (B1.3) or fitted empirically from telemetry
+  (today's staircase-across-staging-events finding).
+- Every part also gets a **live stage index** from `staging.stages`
+  (same mapping `FuelByStage` already uses), so a caller can in
+  principle recompute post-staging configs without a fresh capture.
+
+Added two small shared reflection helpers (`TryTransformPointToWorld`,
+`MakeVector2Like`) and one geometry helper (`WorldOffsetToBodyLocal`) --
+the first two follow the exact pattern `rcsforce` already uses inline
+(Vector2->Vector3->TransformPoint via `op_Implicit` reflection, not a
+direct cast, matching this codebase's established convention for
+Unity-struct values obtained through the custom `Get()` walker).
+
+**Known scope limits, documented in the command's own comment, not
+silently glossed over:** dragArea(AoA) is NOT captured (use
+`analysis/aoa_dragarea.py`'s empirical-table approach separately);
+engine "scale" (`RecalculateMassFlow`'s world-transform magnitude term)
+is defaulted to 1.0, exact for any unscaled part; `positionLocalBody` is
+a snapshot of the CURRENT configuration only, valid until the next real
+staging event changes which parts remain.
+
+Built and installed clean on the first attempt (exit 0, same 3
+pre-existing unrelated warnings). **Not yet live-tested** -- the game
+wasn't running this session; needs a real in-game read (ideally
+pre-ignition, gimbal undeflected) to confirm the reflection paths
+actually resolve against a live rocket, not just that the C# compiles.
+
+---
+
+## v0.53.0 — 2026-09-02
+
+- **General conditional/rate-controlled auxiliary triggers for scoped
+  telemetry.** `telemetry on <fields>` now accepts an optional trailing
+  `| <cond1>@<sec1>:<cmd1>; <cond2>@<sec2>:<cmd2>; ...` block giving full
+  control over three previously-separate concerns in one command: WHAT gets
+  recorded every tick (the plain field list, unchanged), WHEN an on-demand
+  command like `gimbalinfo`/`rcsforce`/`terrain` fires (the `<cond>`, using
+  the exact same grammar `script` steps already use —
+  `TryParseCondition`/`GetScriptFieldValue`/`EvalOp`, no new parser), and HOW
+  OFTEN it re-fires while that condition stays true (the optional
+  `@<seconds>` cooldown — omit it for a single shot, same as before).
+  Two pseudo-fields added to `GetScriptFieldValue` for this (available to
+  `script` steps too, for free): `gimbaling` (1/0, true while any engine
+  reports `hasGimbal && gimbalOn`) and `rcsfiring` (the live
+  `CountFiringThrusters` count — nonzero while EITHER RCS selection path,
+  rotational `TorqueThrust` or translational `DirectionThrust`, is actually
+  firing). Omitting the `|` block entirely, or writing `| auto`, uses a
+  built-in default (`DefaultTelemetryTriggerSpec`):
+  `gimbaling==1@3:gimbalinfo;rcsfiring>0@2:rcsforce;h<500@3:terrain` —
+  i.e. exactly the three convenience triggers from the first cut of this
+  feature (see superseded description below), now repeating on a slow
+  cooldown instead of firing only once, so a late-arriving condition (RCS
+  engaging after an earlier stage already separated, say) is never simply
+  missed. `| none` disables all auxiliary triggers. Each trigger still fires
+  via a direct `Command(...)` call — the same code path `assignkey`'s own
+  hotkey handler uses — so none of the target commands' own logic is
+  duplicated. New `TelemetryTrigger` class + `telemetryTriggers` list
+  (parsed by `LoadTelemetryTriggers`, checked every scoped-telemetry tick by
+  `CheckTelemetryTriggers`) replace the three standalone one-shot `bool`
+  flags from the first cut of this feature, which shipped internally this
+  same session and was generalized before ever being flight-tested.
+  `StartRecording` gained an optional `triggerSpec` parameter (defaults to
+  `null` → the built-in default spec), so the existing Enter-hotkey
+  recording path is unaffected. Built, **not yet run live** — next step is a
+  real flight with `telemetry on ...` armed to confirm the default triggers
+  fire (and re-fire) at the right moments.
+
 ## v0.51.0 — 2026-08-31
 
 - Added **gimbal telemetry**: new `computed:gimbal` scoped-telemetry

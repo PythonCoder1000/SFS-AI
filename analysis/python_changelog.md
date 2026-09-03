@@ -6,6 +6,96 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-09-02 (latest) — `--test_against_run`: control-input replay, real per-thruster RCS, mass-penalty fix
+
+- **New: `getforwardstartinfo`-driven craft_config.** Added
+  `load_craft_config_from_getforwardstartinfo()`, translating the
+  probe's new `getforwardstartinfo` command (mod v0.54.0) into
+  `forward_simulate`'s `craft_config` -- real per-part thrust/ISP/
+  geometry/thresholds read live from the actual rocket, not empirical
+  fits or hand-entered guesses. This is what "finishes" the forward
+  integrator: it was previously always missing a real data source for
+  this input.
+- **New: `ControlSchedule` / `load_control_schedule()`.** Replays a
+  real flight's REAL recorded control INPUTS
+  (`output_TurnAxisTorque`, `output_DirectionalAxis.x/y`, optionally a
+  throttle field) as t->value step functions (deliberately NOT
+  interpolated -- a real control input is discontinuous between ticks).
+  `forward_simulate` gained a `control_schedule` parameter: when
+  supplied, turn_axis/directional_axis/throttle come from the real
+  recording instead of being predicted (SAS, zero-RCS-input, constant
+  throttle). Separates "does the confirmed physics predict correctly"
+  from "can this module guess pilot behavior."
+- **New: `test_against_run()` + `--test_against_run` CLI flag.** Runs
+  the above end-to-end against a real flight and reports predicted vs
+  actual height/speed/position error, same methodology as
+  `prediction_demo.html`.
+- **Real bug found and fixed during this pass (caught by a smoke test
+  against tonight's actual flight, not by inspection):** the first
+  version of the control_schedule wiring skipped `apply_sas` entirely
+  when a schedule was active (reasoning: turn_axis is already resolved,
+  don't re-predict it via SAS) -- but `apply_sas` was ALSO the only
+  place the confirmed rotation formula's omega UPDATE happened, so
+  skipping it silently stopped integrating rotation at all. Caught via
+  a real-flight smoke test: predicted theta diverged ~39° over 5s.
+  Fixed by splitting `apply_sas` into `compute_turn_axis` (SAS's OWN
+  turn_axis prediction) + a new `apply_rotation_update()` (the actual
+  physics integration step, given ANY turn_axis regardless of source).
+  Re-tested after the fix: predicted theta within **0.029°** of the
+  real recorded value over a 5s control-replay window (wrapped mod
+  360°) -- aero torque was deliberately zeroed in the smoke test's
+  minimal craft_config, which explains the remaining omega-endpoint
+  mismatch, not a code issue.
+- **`_rcs_force` fully rewritten** to replicate REAL per-thruster
+  `TorqueThrust`/`DirectionThrust` selection (confirmed IL, D3.1-D3.3)
+  each call, given real per-thruster geometry + thresholds from
+  `getforwardstartinfo`, instead of a precomputed static
+  `sum_normal_local` direction that could only ever represent rotation,
+  never real translational RCS firing (a genuine gap, confirmed missing
+  during today's earlier RCS validation session, not a known
+  simplification until this rewrite).
+- **`compute_turn_axis`/`apply_sas` mass>200t penalty fix:**
+  previously expected an already-penalized `torque_effective` constant
+  from the caller; now correctly re-derives the penalty from the LIVE
+  (possibly integrated, changing) mass every call. Wrong before for any
+  sim whose mass crosses 200t mid-burn -- moot for any flight logged so
+  far (max mass this project has seen is ~115t), but a real correctness
+  fix for future heavier craft.
+- **`_engine_thrust` gained `throttle_override`** for the same replay
+  mechanism, applied uniformly across all engines (documented
+  approximation -- no flight logged so far captured genuine per-engine
+  throttle, only `gimbalThrottleOut`'s single-representative-engine
+  scoping).
+- Everything above is ADDITIVE and backward-compatible: no
+  `control_schedule` supplied means identical behavior to before this
+  pass (verified via a blind-mode regression check in the same smoke
+  test).
+
+---
+
+## 2026-09-02 (later) — `forward_sim.py` parachute drag + rotation VALIDATED
+
+- **Updated `forward_sim.py`'s top-of-file disclaimer** (previously
+  "NONE of it has been validated") to reflect the real result of a
+  flight this same day: `parachute_drag`'s exact formula as wired into
+  this module (confirmed gravity + `parachuteForceX/Y` / real per-tick
+  mass) checked against real telemetry — correlation 1.000, 100% sign
+  agreement, median error 0.015%. No formula change was needed; the
+  IL-confirmed formula was already implemented correctly, this pass
+  only updates validation status. Also independently reconfirmed the
+  body-fixed rotation formula (theta/omega integration) across 3 real
+  staging events on a different flight — resolves the "rotation sign
+  convention assumed-not-confirmed" item from the 7 documented
+  Bucket-A simplifying assumptions (now 6). See
+  `bookkeeping/active_state.md` and `docs/high_level_checklist.md` for
+  the full 6-attempt parachute-drag story and the staging-event
+  rotation fit. Everything else NEW in the 2026-09-02 Bucket-A
+  integration pass (thrust, fuel_burn, gimbal discrete timing as wired
+  into this module, RCS force+torque, heat, terrain, staging) remains
+  explicitly unvalidated end-to-end in this module.
+
+---
+
 ## 2026-09-02 — AoA -> dragArea empirical lookup table (`aoa_dragarea.py`)
 
 - **Built `analysis/aoa_dragarea.py`**, replacing `forward_sim.py`'s
