@@ -9,6 +9,247 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## MCP overhaul complete (Checkpoints 1-8) — 2026-09-04, no version bump this entry
+
+**Checkpoint 8 (cleanup) done same day, after Christian's explicit
+confirmation the overhaul was complete and working:** the temporary
+implementation prompt (`docs/mcp_overhaul_checkpoint_prompt.md`) was
+deleted -- fully superseded by this entry, v0.57.0/v0.58.0's entries
+below, and `analysis/python_changelog.md`. No mod-side code change
+accompanies Checkpoint 8 either.
+
+Closing summary note for the now-deleted checkpoint prompt's full
+checkpoint sequence, mod-side. No C# change accompanies this entry --
+Checkpoint 7 (the audit pass) is pure verification (a static drift
+check plus a live regression pass, both in `sfsprobe_mcp/server.py`,
+see `analysis/python_changelog.md`) and needed no mod code changes.
+The mod-side work across the whole overhaul is v0.57.0's
+`CommandRegistry`/`FieldRegistry` + `describe` command and v0.58.0's
+`telemetry` mode-validation fix below -- both already individually
+entered at the time. This entry exists only so a reader scanning this
+file top-to-bottom sees the overhaul closed out, not left dangling
+after v0.58.0's entry. **Checkpoint 7's live regression pass
+(2026-09-04, this same session, real game, v0.58.0) re-confirmed two
+previously-fixed bugs did not regress across the overhaul:** a real
+488-sample scoped recording (`partCount`, `computed:gimbal`) against a
+live 38-part rocket showed `partCount=38` with zero nulls (v0.55.0's
+fix) and `gimbalOn=true` consistently (v0.56.1's engine-selection fix).
+**Deferred, not attempted this overhaul:** replacing the file-polling
+`command.txt`/`result.txt` IPC with a real socket protocol -- tracked
+as standing future work in `docs/high_level_checklist.md`.
+
+---
+
+## v0.58.0 — Fix: `telemetry` command silently treated ANY bad second word as "off"
+
+**Bug found 2026-09-04**, during Checkpoint 3 (MCP overhaul) live
+fast-fail-validation testing. Christian's own independent test from a
+separate live MCP session caught what my own testing had missed:
+sending `telemetry snapshot` (a real, exact mistake from earlier this
+session -- the intended command was `telemetrysnapshot`, one word) does
+NOT get caught by leading-word fast-fail validation, because `telemetry`
+IS a real command name. It genuinely reaches the game.
+
+**Root cause:** `case "telemetry":`'s mode check was `if (mode == "on")
+{ StartRecording(...) } else { StopRecording(); }` -- ANY second word
+that wasn't literally `"on"` fell into the `else` and called
+`StopRecording()`, with zero validation of what that word actually was.
+Two silent failure modes, both confirmed:
+  - If a real recording was active, `telemetry snapshot` (or any other
+    typo) silently stopped and archived it -- and reported back as an
+    ordinary success (`"[hotkey] recording STOPPED ..."`), not an
+    error. Nothing anywhere would have flagged this as a mistake.
+  - If recording was already off, `StopRecording()` early-returns
+    (`if (!Telemetry) return;`) before writing any `result.txt` line at
+    all -- producing a client-side timeout that looked like "the
+    command did nothing," when in fact it silently reached this deep
+    into the dispatch logic first.
+
+**Fix:** `case "telemetry":` now requires the second word be exactly
+`"on"`, `"off"`, or omitted (defaults to `"off"`, unchanged). Anything
+else is a real, reported error via `ProbeMod.Result()` -- no recording
+state changes either way. `CommandRegistry`'s `telemetry` entry
+(Checkpoint 1) updated to match; it previously documented the buggy
+behavior as if it were intended ("Any second word other than 'on' stops
+recording").
+
+**Live-tested and confirmed 2026-09-04**, after a fresh build + game
+reload (v0.58.0 confirmed via `ping`). With recording OFF: `telemetry
+snapshot` now returns `"telemetry: unrecognized mode 'snapshot' --
+expected 'on' or 'off' ..."` immediately (0.46s, normal round-trip --
+no more silent no-op + 5s client timeout). With recording ON (started a
+real flight, `flight #1`): sending `telemetry snapshot` mid-recording
+returned the same error and recording continued undisturbed; the
+recording was only actually stopped by a deliberate `telemetry off`
+right after, archiving all 61 samples -- confirming the fix's whole
+point: a bad mode word can no longer silently stop/archive an active
+recording.
+
+---
+
+## v0.57.0 — Add: self-description registry + `describe` command (MCP overhaul Checkpoint 1)
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md` (2026-09-04), Checkpoint 1
+of a broader overhaul moving command/field discovery from regex-parsed
+code comments to a live, structured, self-describing registry — directly
+targeting the class of bug where a telemetry key's name is misleading
+relative to its real unit (e.g. `parachuteAlphaDeg` is an angular
+*acceleration* in deg/s², not an angle).
+
+**Added, purely additive — no existing `case` block's logic touched:**
+- `ProbeCommandInfo`/`ProbeFieldInfo` structs and two static arrays,
+  `CommandRegistry` (41 entries, one per real command in `Command()`'s
+  switch) and `FieldRegistry` (67 entries, covering all four distinct
+  telemetry-field namespaces this mod actually has: script-condition
+  fields from `GetScriptFieldValue`, `computed:<group>` fields from
+  `AppendComputedField`, and the full-schema `truth`/`inputs` fields
+  from `BuildTruthSample`/`BuildInputsSample`).
+- A new `case "describe":` in `Command()` that serializes both arrays
+  to JSON and writes `sfs_probe_describe.json`, following the same
+  `Write()`/`Result()` pattern every other JSON-dumping command uses.
+
+**Every entry was written by reading the actual case-block/field-write
+code, not guessed from names** — the whole point of the exercise.
+Notable findings folded into the registry's `Unit` field:
+`parachuteAlphaDeg`/`aeroAlphaDeg` are deg/s² angular accelerations
+despite the angle-shaped name; `gimbalTime`/`gimbalTargetTime` are
+unitless 0-1 animation-progress fractions, not seconds or degrees;
+`heatParts.exposedSurface` is a summed segment-width (length-like), not
+a literal m² surface area; and `h`/`vv`/`m`/`rot`/`angv`/`partCount`
+exist under the same name in three structurally different code paths
+(script-condition switch, full-schema `truth` builder, and scoped-mode's
+`ResolvePath` fallback) that happen to agree on value but are not the
+same mechanism — each `FieldRegistry` entry's `RequestAs` field says
+explicitly which mechanism actually serves it, rather than letting the
+shared name imply they're interchangeable.
+
+**Known scope gaps, honest:** `getparts`'s per-part `variables`/
+`magnetPoints` schema (from generic `DumpVariablesModule`/
+`DumpMagnetPoints` helpers) was not independently re-verified key-by-key.
+`cheat`'s valid `<arg>` values are not statically enumerable — they're
+whatever `Toggle*` methods exist on the live `SandboxSettings` type at
+runtime; the registry describes the mechanism, not an exhaustive list.
+`heatParts.exposedSurface`'s exact coordinate frame is treated as
+`[PARTIAL]`, not fully confirmed, pending a live cross-check.
+
+**Not yet re-tested live** — needs a fresh game reload, then sending
+the raw `describe` command via `sfsprobe_send_command` and confirming
+well-formed JSON covering every command and computed-field group,
+per Checkpoint 1's verification gate.
+
+---
+
+## v0.56.1 — Correction: `TryGetPrimaryGimbal`'s v0.56.0 fix worked by coincidence, not by checking the right thing
+
+**Christian caught this immediately after v0.56.0 shipped**, from real
+game knowledge: engines don't have independent per-engine throttle in
+SFS. There are exactly three control layers -- "amount" (the shared
+throttle setting), master ignition (the rocket-wide on/off), and
+per-engine `engineOn` (individual activation, e.g. via staging) -- and
+only the last one is genuinely per-engine. The other two are broadcast
+identically to every engine (confirmed via IL,
+`RecalculateEngineThrottle`: `throttle_Out = engineOn ? throttle_Input
+: 0f`).
+
+v0.56.0's fix (compare `throttle_Out` across gimbaling engines, keep
+the highest) happened to produce the right answer, because
+`throttle_Out` only ever differs between engines as a side effect of
+`engineOn` -- but it was checking a derived value for a coincidental
+reason, not the actual thing that varies. If that relationship ever
+changed (e.g. a future engine type with genuinely independent
+throttle), the magnitude-comparison version would have silently broken
+again without any obvious signal.
+
+**Fix:** `TryGetPrimaryGimbal` now reads `engineOn` directly and
+returns the first gimbaling engine that is actually on, falling back
+to the first gimbaling engine found (any state) only if none are on at
+all -- the same between-stages case v0.56.0 also handled, now reached
+for the right reason instead of by accident.
+
+**Not yet re-tested live** -- needs a fresh game reload, then a repeat
+`--test_against_run` on a real multi-engine burn to confirm the fix
+actually resolves the free-fall-prediction error from the v0.55.0/
+v0.56.0 entries below, not just the mechanism.
+
+---
+
+## v0.56.0 — Fix: `TryGetPrimaryGimbal` picked the wrong engine on multi-stage rockets
+
+**Bug found 2026-09-03**, during the very first real-flight run of
+`--test_against_run` (`analysis/forward_sim.py`): the predictor,
+replaying real RCS+gimbal control inputs from a real 6-engine flight
+(4x Hawk + Valiant + Titan) plus a per-craft AoA/drag table built from
+the same flight's own data, predicted the rocket essentially in
+free-fall (height error 100%, speed error 76%, ~2070m position offset
+over a 30s window) despite the real rocket burning fuel hard the whole
+time (mass 247.6→205.5t).
+
+**Root cause:** `TryGetPrimaryGimbal` -- the source of the
+`gimbalThrottleOut` field used as the only throttle-replay signal this
+project has -- returned the FIRST `EngineModule` with `hasGimbal==true`
+walking `partHolder.parts` in order, regardless of whether that engine
+was actually firing. On this rocket, Engine Valiant (almost certainly a
+dormant upper-stage engine) happened to sit first in part order, so
+`gimbalThrottleOut` read 0 every single tick of the burn while the
+Hawks/Titan further down the list did the real thrusting. This was
+already flagged as a known limitation in the function's own old
+comment ("fine for a single-gimbal test craft; multi-gimbal rockets
+would need per-engine scoping this doesn't attempt yet") -- this was
+the first real flight to empirically confirm it actually matters. The
+RCS/rotation side of the same replay (`output_TurnAxisTorque`,
+`output_DirectionalAxis.x/y`) was exercised correctly in this same
+flight and was NOT implicated -- this is specifically a thrust/throttle
+signal gap.
+
+**Fix:** `TryGetPrimaryGimbal` now scans every gimbaling engine on the
+rocket and keeps the one with the highest `throttle_Out`, instead of
+stopping at the first one found. Still a single-engine proxy -- a fully
+correct fix needs real per-engine throttle telemetry, a bigger probe
+change not attempted here -- but it no longer silently prefers a
+dormant engine over a firing one. Ties (including the legitimate
+all-zero case between stages) keep the first engine found, matching
+the old behavior exactly in that case.
+
+**Not yet re-tested live** -- needs a fresh game reload of this build,
+then ideally a repeat of the `--test_against_run` check that caught
+this.
+
+---
+
+## v0.55.0 — Fix: `partCount` returned null in scoped telemetry mode
+
+**Bug found 2026-09-03**, during the pre-flight `telemetrysnapshot` /
+`getforwardstartinfo` checks ahead of the forward-integrator re-flight:
+a 2,730-sample pad-idle scoped recording (`telemetry on <fields>`
+including bare `partCount`) recorded `null` for `partCount` on every
+single tick, even with a real 10-part rocket loaded. Every other field
+in the same list resolved correctly.
+
+**Root cause:** `partCount` was only ever a recognized pseudo-field
+inside `GetScriptFieldValue` (the script/trigger condition evaluator).
+`Sample()`'s scoped-telemetry loop never consulted that switch -- it
+only special-cases `computed:NAME` fields and otherwise sends anything
+else straight to `ResolvePath`, a plain dot-path walker with no bare
+`partCount` property to find on the rocket object. (The real path,
+`partHolder.parts.Count`, would actually have resolved fine through the
+existing `ResolvePath`/`Get`/`GetWrapped2`/`Num` chain untouched -- this
+was confirmed by tracing it, not fixed by changing it -- but that's not
+the name used anywhere else in this codebase or in `active_state.md`'s
+field lists.)
+
+**Fix:** added a dedicated `f == "partCount"` branch in `Sample()`'s
+scoped-field loop, alongside the existing `computed:` branch, resolving
+`partHolder.parts.Count` directly and emitting it under the same
+`"partCount"` key full-schema mode already uses (`BuildTruthSample`).
+Existing field lists that already write bare `partCount` (this
+project's docs, `active_state.md`, prior flight scripts) need no
+changes.
+
+**Not yet re-tested live** -- needs a fresh game reload of this build
+before the next scoped-telemetry flight.
+
+---
+
 ## v0.54.0 — `getforwardstartinfo`: full craft_config capture for the forward integrator
 
 New command `getforwardstartinfo` captures everything

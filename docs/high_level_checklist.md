@@ -330,6 +330,235 @@ multi-engine, terrain, and RCS. Detail in `sfs_physics_reference.md` §5.
       so the real reach is broader than just engines. **Not yet
       re-tested live** — needs a fresh game load.
 
+## Tooling bugs — fixed 2026-09-03/04 (v0.55.0–v0.58.0)
+
+- [x] **`partCount` returned null in scoped telemetry mode (found
+      2026-09-03, fixed v0.55.0).** Root cause: `partCount` was only a
+      recognized pseudo-field inside `GetScriptFieldValue` (the
+      script/trigger condition evaluator) — `Sample()`'s scoped-telemetry
+      loop never consulted that switch, only special-cased `computed:`
+      fields, and otherwise called `ResolvePath` directly, which has no
+      bare `partCount` property to find. Fixed with a dedicated
+      `case "partCount":` special-case in `Sample()`'s scoped loop
+      (`partHolder.parts.Count`, cross-referenced from both the
+      `script-condition` and `truth`-namespace `FieldRegistry` entries so
+      a future reader sees the dual mechanism rather than assuming one
+      case makes the other redundant — see `FieldRegistry`'s two
+      `partCount` entries). **Live-reverified 2026-09-04 during the MCP
+      overhaul's Checkpoint 7 regression pass:** a real 488-sample scoped
+      recording (`fields=["partCount", "computed:gimbal"]`) against a
+      live 38-part rocket returned zero nulls, `partCount=38` on every
+      sample. Unblocks the forward-integrator re-flight's
+      staging-detection plan noted in `bookkeeping/active_state.md`.
+      (This checklist entry itself was found stale during Checkpoint 7 —
+      still listed as "confirmed broken, unfixed" below several sessions
+      after the actual fix shipped; moved here as part of that audit,
+      see the note in the MCP overhaul entry below about this file's
+      one known reversion incident.)
+- [x] **`TryGetPrimaryGimbal` picked the wrong engine on multi-stage
+      rockets (found 2026-09-03, fixed v0.56.0, corrected v0.56.1).**
+      v0.56.0's first fix (compare `throttle_Out` magnitude across
+      gimbaling engines) worked by coincidence, not by checking the
+      actual thing that varies — SFS has exactly three engine control
+      layers (shared throttle "amount", rocket-wide master ignition, and
+      per-engine `engineOn`), and only the last is genuinely per-engine.
+      v0.56.1 fixed it for the right reason: reads `engineOn` directly,
+      returns the first gimbaling engine that's actually on, falling back
+      to the first gimbaling engine found (any state) only if none are
+      on. **Live-reverified 2026-09-04** in the same Checkpoint 7
+      regression recording above: `gimbalOn=true` consistently across
+      all 488 samples on a live multi-part rocket, confirming the
+      engine-selection fix still resolves correctly after every
+      Checkpoint 1–6 change to the surrounding file.
+
+## Tooling — MCP overhaul complete (2026-09-04)
+
+- [x] **MCP overhaul — complete, Checkpoints 1-8 all done.** Originally
+      planned and tracked via a temporary implementation prompt
+      (`docs/mcp_overhaul_checkpoint_prompt.md`, now deleted per its own
+      Checkpoint 8 — its content is fully superseded by this entry plus
+      the real changelog entries it references). **What shipped, vs. the
+      original plan:** every checkpoint shipped as planned, with two
+      honest mid-course corrections neither silently swept under the
+      rug: Checkpoint 3's first "verified" pass was a false positive (it
+      tested a fresh throwaway process, not the actual long-lived
+      `sfsprobe_mcp` subprocess a real client stays connected to — caught
+      independently by Christian via `probe.log`-timestamp matching, not
+      by the tool's own JSON response); Checkpoint 5's first `deep_search`
+      implementation matched type names only, which would have silently
+      returned nothing for the exact queries it exists to answer (IL has
+      no comments/tags, so a query like `"gimbal"` needs to hit a FIELD
+      name, not a type name) — caught and rebuilt into a genuine
+      two-level type+member index before that checkpoint was called done.
+      Both corrections are detailed in full below and in
+      `analysis/python_changelog.md`. Covers: moving command/field discovery from
+      regex-parsed comments to a live C# self-description registry
+      (with units -- directly targets the
+      parachuteAlphaDeg-is-really-angular-acceleration class of bug),
+      a unified `sfsprobe_search` tool superseding the old
+      `sfsprobe_command_search`/`sfsprobe_telemetry_field_search`,
+      fast-fail command validation, physics/source doc indexing folded
+      into the same search tool, and a zero-context agent onboarding
+      resource. **Explicitly deferred within that plan too:** replacing
+      the file-polling command.txt/result.txt IPC with a real socket
+      protocol -- noted as separate future work, not attempted in the
+      overhaul itself, since it's a much larger and riskier change.
+      **Status:** Checkpoint 1 (C# `CommandRegistry`/`FieldRegistry` +
+      `describe` command) done and live-verified. Checkpoint 2
+      (`sfsprobe_search` in the Python MCP, old two tools removed) done
+      and live-verified 2026-09-04 -- both the static-fallback path and
+      the live `describe` registry confirmed correct against the four
+      queries that caused real mistakes this session
+      (`parachuteAlphaDeg`, `gimbalThrottleOut`, `partCount`,
+      `telemetrysnapshot`). Checkpoint 3 (fast-fail leading-word command
+      validation in `sfsprobe_send_command`/`sfsprobe_send_batch`) done
+      and **genuinely** live-verified 2026-09-04, after a false-positive
+      round: my first pass "verified" it against a fresh throwaway
+      Python process, which doesn't reflect the actual long-lived
+      `sfsprobe_mcp` server subprocess a real MCP client stays connected
+      to -- two such processes were still running the pre-Checkpoint-3
+      code, which Christian caught independently from his own session
+      (`ps aux` showed both started 19:32:35, before the checkpoint's
+      edits existed) and confirmed via `probe.log`-timestamp matching,
+      not just the JSON response. After Christian restarted his SFS
+      session and MCP connections, re-verified with the same log-based
+      method: a bad command produces zero trace in `probe.log` and
+      resolves in <1ms once the registry cache is warm. Real, separate
+      bug found and fixed along the way: `SFSProbe.cs`'s `telemetry`
+      case treated ANY non-`"on"` second word as `"off"`, silently
+      stopping+archiving an active recording with no error surfaced
+      (or silently no-op'ing + a client-side timeout if already off) --
+      fixed in mod v0.58.0, built, reloaded, and live-confirmed (an
+      active recording now survives `telemetry snapshot` intact; see
+      `sfsprobe/mod_changelog.md` v0.58.0 and
+      `analysis/python_changelog.md` for full detail). Remaining honest
+      scope note: leading-word-only validation still can't catch a bad
+      SECOND word on an otherwise-valid command in general -- v0.58.0
+      fixes `telemetry` specifically, not that whole class of mistake.
+      Checkpoint 4 (`domain="doc"` indexing of `docs/sfs_physics_
+      reference.md` + `docs/sfs_source_reference.md` into
+      `sfsprobe_search`) done 2026-09-04: both files chunked by Markdown
+      heading (214 chunks total), each tagged with any
+      `CONFIRMED`/`PARTIAL`/`OPEN` markers found in its heading/body,
+      cached `DOC_CACHE_TTL_S`s so edits to either file show up without
+      a server restart. Verified against a fresh import of the real
+      `server.py` module (not `mac-terminal-mcp`/a running MCP
+      connection): `sfsprobe_search("three layer engine control",
+      domain="doc")` correctly surfaces physics-reference §2.2 Thrust
+      (the section that actually contains the throttle/master/engineOn
+      three-layer model); `sfsprobe_search("SOI crossing physics mode",
+      domain="doc")` surfaces both the physics-reference §5.4 and
+      source-reference §D4.3 SOI sections; `domain="all"` returns
+      commands/fields/docs as separate per-domain lists (44/67/214
+      total) rather than one merged ranking, so docs' larger corpus
+      can't drown out commands/fields. **Caveat carried over from the
+      Checkpoint 3 lesson above: this was NOT re-verified through the
+      actual long-lived `sfsprobe_mcp` subprocess a real MCP client
+      stays connected to** (two such processes were already running,
+      started before this checkpoint's edits) — since `domain="doc"` is
+      pure file-parsing with no game-state dependency, a fresh-process
+      test is equally valid for correctness, but the live client
+      connection still won't see this code until it's restarted.
+      Checkpoint 5 (split into `light_search`/`deep_search`) done
+      2026-09-04, **corrected mid-checkpoint after discussing the design
+      with Christian**: `sfsprobe_search` renamed to `light_search` (pure
+      rename, behavior unchanged -- re-verified all of Checkpoints 2/4's
+      queries under the new name, all still correct). First `deep_search`
+      pass matched type names only (via `monodis --typedef`) -- wrong on
+      its own merits: IL has zero comments/tags (decompilation strips
+      them), so a query like `"gimbal"` needed to hit `EngineModule`'s
+      `gimbal` FIELD, not the type name `EngineModule` (which doesn't
+      contain "gimbal" at all). Rebuilt as a genuine two-level
+      type+member index before calling this checkpoint done: reused
+      (not reimplemented) `analysis/il_inventory.py`'s existing
+      `.class`-declaration parser (built for the `docs/sfs_reference/`
+      migration), extending it with a `capture_members=True` flag that
+      also records real method/field names, not just counts -- and
+      refactored its previously-bare module-level code (which wrote
+      `docs/sfs_reference/inventory.json` on *any* import) into an
+      `if __name__ == "__main__"`-guarded CLI so importing it has zero
+      side effects. `deep_search` now tries type names first, then falls
+      through to every method/field name across all types, returning
+      `matched_via` + which specific members matched. Multi-word queries
+      use AND per term against one candidate name -- found necessary when
+      a conceptual sentence query (`"why does thrust ramp up slowly"`)
+      returned noise under OR/max-score (common short words like `"up"`
+      exact-matched an unrelated real field). Verified: `deep_search
+      ("gimbal")` now correctly resolves `EngineModule` via its `gimbal`/
+      `gimbalOn`/`RecalculateGimbal` members; `deep_search
+      ("EngineModule")` still returns real IL containing `hasGimbal`,
+      `engineOn`, `throttle_Out` (matches `sfs_source_reference.md`
+      §D2.1 exactly); `deep_search("parachute")` resolves cleanly to
+      `ParachuteModule`; the exact conceptual-sentence query now
+      correctly returns zero matches with a note pointing at
+      `light_search`'s doc domain instead. Confirmed `docs/sfs_reference/
+      inventory.json` (WIP migration artifact) restored to its exact
+      original state after a regression test, and `scratch/full_il.txt`
+      (Christian's manual-research scratch file) untouched throughout --
+      `deep_search` uses its own cache at `scratch/.deep_search_cache/`.
+      **Honest scope note, now stated in the tool's own docstring too:**
+      `deep_search` can only ever match real identifiers, never concepts
+      or prose -- that job stays with `light_search`. Checkpoint 6
+      (`sfsprobe_onboarding` orientation tool) done 2026-09-04: returns
+      plain-text orientation covering the mod/MCP relationship, the
+      "search before you guess" standing instruction, when to reach for
+      `light_search` vs. `deep_search`, every real error code in current
+      use, and the four telemetry field namespaces (explicitly
+      distinguished from the live registry's separate `truth`/`inputs`
+      namespace tags, a conflation caught and fixed before shipping --
+      see `analysis/python_changelog.md`). Implemented as a `@mcp.tool`
+      rather than an `@mcp.resource` for consistency with every other
+      capability on this server. Verified via a direct function call
+      (no game dependency, pure static text) and a cold read-through as
+      a zero-context AI. **Checkpoint 7 (audit pass) done 2026-09-04.**
+      Added `sfsprobe_registry_audit()` (new tool, no params) -- statically
+      diffs `CommandRegistry`/`FieldRegistry`'s array literals against the
+      real case-block/switch parsers `light_search`'s fallback path
+      already uses (reused, not reimplemented), flagging any command/
+      field present in code but missing a registry entry, or vice versa
+      (stale). Pure source parsing, no game needed. **Result:
+      `"clean": true`** -- 44/44 commands, 6/6 computed-field groups,
+      21/21 computed output keys, and 10/10 script-condition fields all
+      present on both sides; the registry has not drifted since
+      Checkpoint 1 despite the one intervening dispatch-logic change
+      (`telemetry`'s v0.58.0 fix). `partCount`'s dual script-condition/
+      scoped-telemetry validity is deliberately handled via
+      cross-referencing prose in its two registry entries rather than a
+      dedicated namespace tag -- confirmed intentional, not a gap. Full
+      regression pass run live against a real SFS session (v0.58.0,
+      scene `World_PC`, 1 rocket): `sfsprobe_status`/`sfsprobe_ping` both
+      responded correctly; a real 488-sample scoped recording
+      (`partCount`, `computed:gimbal`) confirmed **both tonight's target
+      bugs still fixed** -- zero `partCount` nulls (constant `38` across
+      all samples) and `gimbalOn=true` consistently (the v0.56.1
+      engine-selection fix); a fast-fail bad-command test
+      (`zzznotarealcommand123`) returned `UNKNOWN_COMMAND` in 0.31s via
+      `source: "live_registry"`; `light_search("parachuteAlphaDeg",
+      domain="field")` still correctly resolves the angular-acceleration
+      unit live. **New standing convention, documented here per the
+      plan:** from now on, adding a command or telemetry field means
+      adding BOTH the `case`/`switch` entry in `SFSProbe.cs` AND a
+      matching `CommandRegistry`/`FieldRegistry` entry in the same
+      change -- run `sfsprobe_registry_audit()` after, to confirm before
+      the next session starts relying on stale registry data.
+      **Deferred, not attempted this overhaul:** replacing the
+      file-polling `command.txt`/`result.txt` IPC with a real socket
+      protocol -- larger, riskier change (new C# networking code, full
+      protocol rewrite both sides); noted here as the standing
+      future-work item, not tracked as a bug. **Honest caveat:** the
+      drift auditor's coverage is exactly as good as its regex parsers --
+      if `CommandRegistry`/`FieldRegistry`'s array-literal syntax itself
+      changes shape (e.g. entries reformatted across more lines than the
+      regex expects), the audit could silently under- or over-report
+      rather than erroring; it was verified against the array's current
+      real formatting, not fuzzed against hypothetical reformattings.
+      **Checkpoint 8 (cleanup) done 2026-09-04**, after Christian's
+      explicit confirmation the overhaul was complete and working:
+      `docs/mcp_overhaul_checkpoint_prompt.md` deleted (temporary
+      implementation prompt, superseded by this entry and the
+      per-checkpoint changelog entries); this checklist item moved here
+      and marked done.
+
 ## Tooling bugs — confirmed broken, unfixed
 
 - [ ] `thrOn` — unreliable as a thrust indicator (workaround exists: check
@@ -478,6 +707,41 @@ assumed from a model.
       Each is a real, bounded gap between "physics is confirmed" and
       "the integrator's predictions are trustworthy," separate from the
       compounding question above.
+- [ ] **`gimbalThrottleOut` throttle-replay proxy picks the wrong engine
+      on multi-stage rockets (found 2026-09-03, first real-flight test
+      of `--test_against_run`). FIXED in v0.56.0, not yet re-tested
+      live.** `TryGetPrimaryGimbal` returns the
+      FIRST `EngineModule` with `hasGimbal==true` walking `partHolder.parts`
+      in order -- not necessarily one that's currently firing. On a real
+      6-engine, multi-stage flight (4x Hawk + Valiant + Titan), the first
+      gimbaling engine in part order was Valiant (likely the dormant
+      upper stage), so `gimbalThrottleOut` read 0 every tick for the
+      entire ~30s replay window even though real mass dropped
+      247.6→205.5t (unmistakable full-throttle multi-engine burn from
+      the OTHER engines). Consequence: `--test_against_run` predicted the
+      rocket essentially in free-fall (height error 100%, speed error
+      76%, ~2070m position offset over 30s) even WITH a real per-craft
+      AoA/drag table built from this same flight's own dragArea samples
+      -- not a drag/physics-model failure, a throttle-signal failure.
+      This was already flagged as a known limitation in
+      `TryGetPrimaryGimbal`'s own code comment ("fine for a single-gimbal
+      test craft; multi-gimbal rockets would need per-engine scoping
+      this doesn't attempt yet") -- this is the first real flight to
+      empirically confirm it actually matters. **The RCS/rotation side
+      of control-schedule replay (`output_TurnAxisTorque`,
+      `output_DirectionalAxis.x/y`) was exercised on this same flight
+      (229 samples with translational RCS active, 1,578 with rotational)
+      and is not implicated** -- this is specifically a thrust/throttle
+      gap, not a control-replay gap. **Fix applied v0.56.0, corrected
+      v0.56.1** (see `mod_changelog.md`): v0.56.0 compared throttle_Out
+      magnitudes across gimbaling engines (worked, but only because
+      throttle_Out's only per-engine variation IS the engineOn flag --
+      amount/master ignition are rocket-wide, confirmed via IL); v0.56.1
+      reads engineOn directly instead, the actually-correct signal.
+      Still a single-engine proxy, not real per-engine throttle
+      telemetry -- needs a fresh game reload and a repeat
+      `--test_against_run` on a real multi-engine burn to confirm the
+      fix resolves the prediction error, not just the mechanism.
 
 **Bottom line for what "done" looks like**: finishing every remaining
 item below (design decisions, minor tooling fixes, zero-game

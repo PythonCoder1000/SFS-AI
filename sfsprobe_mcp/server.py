@@ -31,10 +31,12 @@ import sys
 import time
 import asyncio
 import csv
+import difflib
 import re
+import subprocess
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -48,6 +50,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "analysis"))
 import sfs_telemetry as st  # noqa: E402
 import blueprint_builder as bpb  # noqa: E402
+import il_inventory  # noqa: E402  -- deep_search's type/member parser, MCP overhaul Checkpoint 5
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,12 +64,49 @@ DEFAULT_MOD_DIR = (
     "Spaceflight Simulator/SpaceflightSimulatorGame.app/Mods/SFSProbe"
 )
 MOD_DIR = Path(os.environ.get("SFSPROBE_MOD_DIR", DEFAULT_MOD_DIR)).expanduser()
+# The mod's real C# source -- light_search's static_fallback path parses
+# this live, every call, so the command/field list it returns can never
+# drift out of sync with whatever version of the mod is actually
+# installed/built.
+SFSPROBE_CS_PATH = _PROJECT_ROOT / "sfsprobe" / "SFSProbe.cs"
+# Reference docs indexed by light_search's domain="doc" (MCP overhaul
+# Checkpoint 4) -- re-parsed from disk on a short TTL (DOC_CACHE_TTL_S)
+# rather than at import time, so edits to either file show up without
+# restarting the MCP server.
+DOC_PATHS = [
+    _PROJECT_ROOT / "docs" / "sfs_physics_reference.md",
+    _PROJECT_ROOT / "docs" / "sfs_source_reference.md",
+]
+# deep_search (MCP overhaul Checkpoint 5) -- the real decompiled game
+# assembly, for when light_search's doc coverage is missing or its
+# hand-written prose can't be trusted over ground truth. Env-var-overridable
+# following the same SFSPROBE_MOD_DIR pattern, since this is also a
+# machine-specific Steam install path.
+DEFAULT_ASSEMBLY_PATH = (
+    "~/Library/Application Support/Steam/steamapps/common/"
+    "Spaceflight Simulator/SpaceflightSimulatorGame.app/Contents/Resources/"
+    "Data/Managed/Assembly-CSharp.dll"
+)
+ASSEMBLY_PATH = Path(
+    os.environ.get("SFSPROBE_ASSEMBLY_PATH", DEFAULT_ASSEMBLY_PATH)
+).expanduser()
+MONODIS_BIN = os.environ.get("SFSPROBE_MONODIS", "monodis")
+# deep_search's own cache -- deliberately NOT scratch/full_il.txt, which is
+# Christian's manual-research scratch file (see docs/sfs_source_reference.md
+# §A2). A repeatable tool call must never clobber work he's mid-way through.
+DEEP_SEARCH_CACHE_DIR = _PROJECT_ROOT / "scratch" / ".deep_search_cache"
+DEEP_SEARCH_IL_CACHE = DEEP_SEARCH_CACHE_DIR / "assembly_full_il.txt"
+DEEP_SEARCH_IL_META = DEEP_SEARCH_CACHE_DIR / "assembly_full_il.meta.json"
 CMD_FILE = MOD_DIR / "command.txt"
 RESULT_FILE = MOD_DIR / "result.txt"
 PROBE_LOG_FILE = MOD_DIR / "probe.log"
 TRUTH_FILE = MOD_DIR / "truth.jsonl"
 INPUTS_FILE = MOD_DIR / "inputs.jsonl"
 DRAGAREA_JSON_FILE = MOD_DIR / "sfs_probe_dragarea.json"
+# Written by the mod's 'describe' command (v0.57.0+, MCP overhaul Checkpoint
+# 1) -- the live CommandRegistry/FieldRegistry dump that light_search
+# (Checkpoint 2) prefers over the regex-parsed SFSProbe.cs fallback below.
+DESCRIBE_JSON_FILE = MOD_DIR / "sfs_probe_describe.json"
 SNAPSHOT_JSON_FILE = MOD_DIR / "sfs_probe_flight.json"
 PLACED_MAGNETS_JSON_FILE = MOD_DIR / "sfs_probe_placed_magnets.json"
 ARCHIVE_DIR = MOD_DIR / "archive"
@@ -81,6 +121,21 @@ DEFAULT_POLL_INTERVAL_S = 0.15
 # activity" heuristic in sfsprobe_status stops trusting probe.log as a
 # sign the game is currently alive vs. just left over from a past session.
 STALE_LOG_THRESHOLD_S = 30.0
+# How long a fetched 'describe' registry is trusted before light_search
+# re-fetches it -- short enough that a mod rebuilt+relaunched mid-session is
+# picked up quickly, long enough that a rapid sequence of searches doesn't
+# each pay a real game round-trip.
+REGISTRY_CACHE_TTL_S = 5.0
+DESCRIBE_TIMEOUT_S = 3.0
+# How long a parsed doc-chunk index (DOC_PATHS) is cached before re-reading
+# the files -- same rationale as REGISTRY_CACHE_TTL_S, just for disk reads
+# instead of a game round-trip.
+DOC_CACHE_TTL_S = 5.0
+# deep_search: max IL lines returned per matched type (a class summary can
+# run 900+ lines for a large class like EngineModule; this keeps a response
+# reasonable while the returned line_range tells a caller exactly where to
+# look in the cache file for more).
+DEEP_SEARCH_MAX_LINES = 250
 
 mcp = FastMCP("sfsprobe_mcp")
 
@@ -334,6 +389,14 @@ async def sfsprobe_send_command(params: SendCommandInput) -> str:
     'throttle', 'master', 'ignite', 'revert', 'achievements', 'geometry',
     'snapshot', 'diag', 'autostop', 'cheat').
 
+    Fast-fails (MCP overhaul Checkpoint 3) if the command's leading word
+    isn't a known sfsprobe command -- no game round-trip at all, just a
+    known-command-set lookup (milliseconds), returning close-match
+    suggestions via difflib instead of a multi-second wait for the mod's
+    own 'unknown command: ...' response. If the command set itself can't
+    be resolved (game unreachable AND SFSProbe.cs unreadable), this check
+    is skipped entirely -- it fails open, never blocking a real command.
+
     Args:
         params (SendCommandInput): command, timeout_s, poll_interval_s
 
@@ -341,7 +404,12 @@ async def sfsprobe_send_command(params: SendCommandInput) -> str:
         str: JSON with keys: command, response (the new result.txt text),
         elapsed_seconds (float, how long the wait actually took), timed_out
         (always false on success -- a timeout raises instead of returning).
+        On a fast-fail: error_code 'UNKNOWN_COMMAND', error, suggestions
+        (list), source ('live_registry' or 'static_fallback').
     """
+    invalid = await _validate_command_line(params.command)
+    if invalid is not None:
+        return json.dumps(invalid, indent=2)
     try:
         response, elapsed = await asyncio.to_thread(
             send_command, params.command, params.timeout_s, params.poll_interval_s
@@ -362,6 +430,1308 @@ async def sfsprobe_send_command(params: SendCommandInput) -> str:
         }, indent=2)
     except FileNotFoundError as e:
         return json.dumps({"command": params.command, "error_code": "FILE_NOT_FOUND", "error": str(e), "timed_out": False}, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: command search -- parses SFSProbe.cs's real Command() switch
+# directly, every call, so command syntax/usage is looked up instead of
+# guessed from memory (which is exactly how the 'telemetry snapshot' vs
+# 'telemetrysnapshot' mixup happened -- a real command that just doesn't
+# exist). Scoped to the Command() method's brace range specifically (not
+# the whole file) so it doesn't also pick up cases from GetScriptFieldValue's
+# short-name switch or AppendComputedField's computed-field registry --
+# those are real, but they're a different lookup (telemetry field names,
+# not command.txt commands) and mixing them in was more confusing than
+# helpful during prototyping.
+# ---------------------------------------------------------------------------
+
+_COMMAND_METHOD_RE = re.compile(r'static\s+void\s+Command\s*\(\s*string\s+line\s*\)')
+_CASE_RE = re.compile(r'case\s+"([a-zA-Z0-9_]+)"\s*:')
+_MAX_COMMENT_LINES = 20  # cap per-command description length; some blocks (telemetry) run 25+ lines
+
+
+def _find_command_method_bounds(lines: List[str]) -> Optional[tuple[int, int]]:
+    """Locate Command(string line)'s body via brace counting -- returns
+    (start_line_idx, end_line_idx), both inclusive, 0-indexed. None if the
+    method signature isn't found (e.g. it gets renamed someday)."""
+    start = None
+    for i, line in enumerate(lines):
+        if _COMMAND_METHOD_RE.search(line):
+            start = i
+            break
+    if start is None:
+        return None
+    i = start
+    while "{" not in lines[i]:
+        i += 1
+    depth = 0
+    for j in range(i, len(lines)):
+        depth += lines[j].count("{") - lines[j].count("}")
+        if depth == 0:
+            return start, j
+    return None
+
+
+def _parse_probe_commands(cs_path: Path) -> List[Dict[str, Any]]:
+    """Parse every 'case "xxx":' inside Command()'s switch, paired with
+    whatever comment block sits immediately after it in the source --
+    that's where this codebase's own command-syntax documentation
+    actually lives (e.g. 'telemetry on <fields>' is explained in a
+    comment block right after `case "telemetry":`, not in a docstring
+    anywhere). Re-read from disk every call -- deliberately not cached,
+    so a rebuilt/edited mod is reflected immediately, same principle as
+    this project's data-trust rule for live game values."""
+    lines = cs_path.read_text().splitlines()
+    bounds = _find_command_method_bounds(lines)
+    if bounds is None:
+        return []
+    start, end = bounds
+
+    commands = []
+    seen = set()
+    for i in range(start, end + 1):
+        line = lines[i]
+        m = _CASE_RE.search(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name in seen:
+            continue  # duplicate/fallthrough case label -- keep the first
+        seen.add(name)
+
+        j = i + 1
+        if j < len(lines) and lines[j].strip() == "{":
+            j += 1
+        comment_lines: List[str] = []
+        truncated = False
+        while j < len(lines):
+            stripped = lines[j].strip()
+            if stripped.startswith("//"):
+                if len(comment_lines) >= _MAX_COMMENT_LINES:
+                    truncated = True
+                    break
+                comment_lines.append(stripped.lstrip("/ "))
+                j += 1
+            elif stripped == "":
+                # allow a single blank line inside a comment block before giving up
+                if j + 1 < len(lines) and lines[j + 1].strip().startswith("//"):
+                    j += 1
+                    continue
+                break
+            else:
+                break
+        description = " ".join(comment_lines).strip()
+        if truncated:
+            description += " [...]"
+
+        after_colon = line.split(":", 1)[1].strip() if ":" in line else ""
+        commands.append({
+            "command": name,
+            "description": description or None,
+            "inline_body": after_colon or None,  # for one-liner cases like 'snapshot', 'world', 'menu'
+            "source_line": i + 1,
+        })
+    return commands
+
+
+# ---------------------------------------------------------------------------
+# Fallback field-index parser -- the parameter-name counterpart to
+# _parse_probe_commands above, built for the exact same reason: this
+# session independently mis-guessed telemetry field syntax three separate
+# times (bare 'gimbalThrottleOut' instead of 'computed:gimbal'; requesting
+# a field literally called 'parachuteDrag' that has never existed --
+# 'computed:parachuteDrag' expands into six differently-named fields;
+# misreading 'parachuteAlphaDeg' as an angle in degrees when it's actually
+# an angular ACCELERATION in deg/s^2, per its own source name 'alphaPred').
+# All three mistakes share one root cause: nobody -- neither Christian nor
+# Claude -- has reliable knowledge of which of the four genuinely different
+# field namespaces in this codebase a given name belongs to, or how it's
+# actually requested vs. how it appears in output. This tool parses all
+# four straight from SFSProbe.cs, every call, so that's looked up instead
+# of guessed:
+#   1. computed_group       -- 'computed:NAME' groups (AppendComputedField's
+#                               switch). Request via 'computed:NAME'; expands
+#                               into several OUTPUT keys, never named NAME
+#                               itself except by coincidence (e.g. dragArea).
+#   2. computed_output_key  -- one entry per OUTPUT key each group above
+#                               actually writes (e.g. 'parachuteForceX').
+#                               NOT independently requestable -- searching
+#                               one explains which computed: group produces
+#                               it, which is exactly the lookup that was
+#                               missing tonight.
+#   3. script_condition_field -- GetScriptFieldValue's short-name switch
+#                               (h/vv/t/m/rot/angv/gimbaling/rcsfiring/v/
+#                               partCount). Valid in SCRIPT/TRIGGER condition
+#                               strings, NOT in a 'telemetry on <fields>' list
+#                               (a real, separate mistake from the other two).
+#   4. literal_telemetry_field -- bare names Sample()'s own scoped-telemetry
+#                               loop special-cases directly (currently just
+#                               'partCount', added 2026-09-03) -- valid
+#                               DIRECTLY in a 'telemetry on <fields>' list,
+#                               unlike #3's same-named script field.
+# Plus a fifth, non-enumerable source: real 'telemetry on ...' example
+# field-lists mined straight out of comments elsewhere in the file --
+# working examples previous sessions already wrote down, not manufactured.
+# ---------------------------------------------------------------------------
+
+_COMPUTED_METHOD_RE = re.compile(r'static\s+bool\s+AppendComputedField\s*\(')
+_SCRIPT_METHOD_RE = re.compile(r'static\s+double\s+GetScriptFieldValue\s*\(')
+_SAMPLE_METHOD_RE = re.compile(r'public\s+static\s+void\s+Sample\s*\(')
+_KEY_WRITE_RE = re.compile(r'Append\(",\\"([a-zA-Z0-9_]+)\\":')
+_LITERAL_FIELD_RE = re.compile(r'f\s*==\s*"([a-zA-Z0-9_]+)"')
+_EXAMPLE_RE = re.compile(r'telemetry on ([a-zA-Z0-9_.,:]+)')
+
+
+def _find_method_bounds(lines: List[str], method_re: "re.Pattern[str]") -> Optional[tuple[int, int]]:
+    """Generic version of _find_command_method_bounds above -- locates any
+    method's body via brace counting given its own signature regex, since
+    this tool needs to bound THREE different methods
+    (AppendComputedField/GetScriptFieldValue/Sample), not just Command().
+    Returns (start_line_idx, end_line_idx), both inclusive, 0-indexed."""
+    start = None
+    for i, line in enumerate(lines):
+        if method_re.search(line):
+            start = i
+            break
+    if start is None:
+        return None
+    i = start
+    while "{" not in lines[i]:
+        i += 1
+    depth = 0
+    for j in range(i, len(lines)):
+        depth += lines[j].count("{") - lines[j].count("}")
+        if depth == 0:
+            return start, j
+    return None
+
+
+def _leading_block_comment(lines: List[str], case_line_idx: int) -> Optional[str]:
+    """Comments in these switches sit AFTER the case label and its opening
+    '{', not before -- same convention _parse_probe_commands relies on.
+    Returns None for a single-line case (no attached comment below it --
+    a naive forward scan would wrongly attribute the NEXT case's leading
+    comment to this one, which happened once during prototyping)."""
+    j = case_line_idx + 1
+    if not (j < len(lines) and lines[j].strip() == "{"):
+        return None
+    j += 1
+    out: List[str] = []
+    truncated = False
+    while j < len(lines):
+        s = lines[j].strip()
+        if s.startswith("//"):
+            if len(out) >= _MAX_COMMENT_LINES:
+                truncated = True
+                break
+            out.append(s.lstrip("/ "))
+            j += 1
+        else:
+            break
+    text = " ".join(out).strip()
+    if truncated:
+        text += " [...]"
+    return text or None
+
+
+def _case_block_bounds(lines: List[str], case_line_idx: int) -> tuple[int, int]:
+    j = case_line_idx
+    if j + 1 < len(lines) and lines[j + 1].strip() == "{":
+        depth = 0
+        for k in range(j + 1, len(lines)):
+            depth += lines[k].count("{") - lines[k].count("}")
+            if depth == 0:
+                return j, k
+    k = j
+    while k < len(lines) and ";" not in lines[k]:
+        k += 1
+    return j, k
+
+
+def _parse_computed_groups(lines: List[str]) -> List[Dict[str, Any]]:
+    """Every 'computed:NAME' group from AppendComputedField's switch, with
+    the real OUTPUT keys it writes (mined via _KEY_WRITE_RE over each
+    case's own block, not guessed from the group name -- 'parachuteDrag'
+    the group writes zero fields literally named 'parachuteDrag')."""
+    bounds = _find_method_bounds(lines, _COMPUTED_METHOD_RE)
+    if bounds is None:
+        return []
+    start, end = bounds
+    groups, seen = [], set()
+    for i in range(start, end + 1):
+        m = _CASE_RE.search(lines[i])
+        if not m or lines[i].strip().startswith("default"):
+            continue
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        desc = _leading_block_comment(lines, i)
+        cs, ce = _case_block_bounds(lines, i)
+        keys = _KEY_WRITE_RE.findall("\n".join(lines[cs:ce + 1]))
+        groups.append({"group": name, "description": desc, "output_keys": keys, "source_line": i + 1})
+    return groups
+
+
+def _parse_script_fields(lines: List[str]) -> List[Dict[str, Any]]:
+    """Every short-name alias from GetScriptFieldValue's switch -- valid in
+    script/trigger condition strings, explicitly NOT the same namespace as
+    a scoped-telemetry field list (that distinction is the point)."""
+    bounds = _find_method_bounds(lines, _SCRIPT_METHOD_RE)
+    if bounds is None:
+        return []
+    start, end = bounds
+    fields, seen = [], set()
+    for i in range(start, end + 1):
+        m = _CASE_RE.search(lines[i])
+        if not m:
+            continue
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        is_block = (i + 1 < len(lines) and lines[i + 1].strip() == "{")
+        if is_block:
+            desc = _leading_block_comment(lines, i)
+        else:
+            # single-line case, e.g. 'case "h": return ToD(Get(loc, "Height"));'
+            # -- the return expression itself IS the description, no comment scan
+            desc = lines[i].split(":", 1)[1].strip() if ":" in lines[i] else None
+        fields.append({"name": name, "description": desc, "source_line": i + 1})
+    return fields
+
+
+def _parse_literal_telemetry_fields(lines: List[str]) -> List[Dict[str, Any]]:
+    """Bare field names Sample()'s scoped-telemetry dispatch loop
+    special-cases by literal string equality (currently just 'partCount',
+    added 2026-09-03 -- see mod_changelog.md v0.55.0). Distinct from
+    script fields of the same name: this list IS valid directly in a
+    'telemetry on <fields>' list; #3 above is not."""
+    bounds = _find_method_bounds(lines, _SAMPLE_METHOD_RE)
+    if bounds is None:
+        return []
+    start, end = bounds
+    fields, seen = [], set()
+    for i in range(start, end + 1):
+        m = _LITERAL_FIELD_RE.search(lines[i])
+        if not m:
+            continue
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        desc = _leading_block_comment(lines, i)
+        fields.append({"name": name, "description": desc, "source_line": i + 1})
+    return fields
+
+
+def _mine_documented_examples(text: str) -> List[str]:
+    """Real working 'telemetry on <fields>' example strings already
+    written into comments elsewhere in the file -- previous sessions'
+    own working usage, not manufactured."""
+    return sorted(set(_EXAMPLE_RE.findall(text)))
+
+
+def _build_field_index(cs_path: Path) -> List[Dict[str, Any]]:
+    """Combine all five sources into one flat, taggable entry list. Kept
+    as one function (rather than the four callers building the list
+    separately) so the entry 'kind' tagging happens in exactly one place."""
+    lines = cs_path.read_text().splitlines()
+    text = "\n".join(lines)
+    entries: List[Dict[str, Any]] = []
+
+    for g in _parse_computed_groups(lines):
+        entries.append({
+            "kind": "computed_group",
+            "request_as": "computed:" + g["group"],
+            "produces_keys": g["output_keys"],
+            "description": g["description"],
+            "source_line": g["source_line"],
+        })
+        for key in g["output_keys"]:
+            entries.append({
+                "kind": "computed_output_key",
+                "key": key,
+                "request_as": "computed:" + g["group"],
+                "note": f"'{key}' is an OUTPUT field only, produced by requesting "
+                        f"'computed:{g['group']}' -- it is not itself a valid name "
+                        f"in a 'telemetry on <fields>' list.",
+                "source_line": g["source_line"],
+            })
+
+    for s in _parse_script_fields(lines):
+        entries.append({
+            "kind": "script_condition_field",
+            "name": s["name"],
+            "description": s["description"],
+            "note": "valid in SCRIPT/TRIGGER condition strings (e.g. autostop rules) only -- "
+                    "NOT a valid name in a 'telemetry on <fields>' list.",
+            "source_line": s["source_line"],
+        })
+
+    for f in _parse_literal_telemetry_fields(lines):
+        entries.append({
+            "kind": "literal_telemetry_field",
+            "name": f["name"],
+            "description": f["description"],
+            "note": "valid DIRECTLY in a 'telemetry on <fields>' list (special-cased in Sample()).",
+            "source_line": f["source_line"],
+        })
+
+    for ex in _mine_documented_examples(text):
+        entries.append({"kind": "documented_example", "example": ex})
+
+    return entries
+
+
+def _normalize_fallback_field(e: Dict[str, Any]) -> Dict[str, Any]:
+    """Fallback field-index entries have different shapes per 'kind'
+    (computed_group/computed_output_key/script_condition_field/
+    literal_telemetry_field/documented_example) with no single shared
+    identity field. Give each a synthetic 'key' so _score_items (which is
+    shape-agnostic) has one consistent thing to primary-match against."""
+    e = dict(e)
+    e.setdefault("key", e.get("name") or e.get("request_as") or e.get("example") or "")
+    return e
+
+
+def _score_items(terms: List[str], items: List[Dict[str, Any]], primary_key: str, limit: int) -> List[Dict[str, Any]]:
+    """Shape-agnostic term-overlap scorer, shared by every light_search
+    domain regardless of whether items came from the live 'describe'
+    registry (commands: name/syntax/description/category; fields:
+    key/namespace/group/unit/description/requestAs) or the regex-parsed
+    fallback (different shape per domain/kind, see _normalize_fallback_field
+    above) -- rather than maintaining a separate per-shape haystack
+    function for each of the two sources, every value in the item dict is
+    just stringified and searched. `primary_key` gets exact/prefix bonus
+    scoring (the item's real command/field name), matching the intent of
+    the old per-domain scorers this replaces without needing their
+    per-kind special cases."""
+    if not terms:
+        return items[:limit]
+    scored = []
+    for it in items:
+        primary = str(it.get(primary_key) or "").lower()
+        hay = " ".join(str(v) for v in it.values() if v not in (None, "")).lower()
+        score = 0
+        for t in terms:
+            if primary == t:
+                score += 10
+            elif primary.startswith(t):
+                score += 5
+            if t in hay:
+                score += 1
+        if score > 0:
+            scored.append((score, it))
+    scored.sort(key=lambda x: -x[0])
+    return [it for _, it in scored[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# Drift auditor -- MCP overhaul Checkpoint 7, architecture decision A. The
+# CommandRegistry/FieldRegistry (Checkpoint 1) is meant to be the primary
+# source of truth, but nothing stops it from silently rotting out of sync
+# with the actual case blocks/switches if a future command or field is added
+# to the code without a matching registry entry (exactly the "comments as
+# the only documentation" failure mode this whole overhaul exists to fix).
+# This diffs BOTH sides straight out of SFSProbe.cs: the registry array
+# literals (ground truth for "what the mod claims to support") against the
+# same case-block/switch parsers light_search's static_fallback path already
+# uses (ground truth for "what the mod actually dispatches"). Pure static
+# source analysis -- no live game or `describe` round-trip needed, so this
+# can run even with SFS closed, and will still catch drift the moment new
+# code is written, before it's ever rebuilt or reloaded.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_COMMAND_NAME_RE = re.compile(r'new ProbeCommandInfo\s*\{\s*Name\s*=\s*"([a-zA-Z0-9_]+)"')
+_REGISTRY_FIELD_ENTRY_RE = re.compile(
+    r'new ProbeFieldInfo\s*\{\s*Key\s*=\s*"([a-zA-Z0-9_]+)"\s*,\s*Namespace\s*=\s*"([a-zA-Z-]+)"'
+    r'(?:\s*,\s*Group\s*=\s*"([a-zA-Z0-9_]+)")?'
+)
+
+
+def _extract_named_array_block(text: str, array_name: str, element_type: str) -> str:
+    """Both CommandRegistry and FieldRegistry are declared as
+    'public static readonly ProbeXInfo[] ArrayName = new ProbeXInfo[] { ... };'
+    -- grabs just the '{ ... }' body so the entry regexes below can't
+    accidentally match an unrelated ProbeCommandInfo/ProbeFieldInfo literal
+    elsewhere in the file (there are none today, but this keeps the audit
+    correct if one is ever added for some other purpose)."""
+    m = re.search(
+        re.escape(array_name) + r"\s*=\s*new " + re.escape(element_type) + r"\[\]\s*\{(.*?)\n\s*\};",
+        text, re.S,
+    )
+    if not m:
+        raise ValueError(f"could not locate {array_name} array literal in {SFSPROBE_CS_PATH}")
+    return m.group(1)
+
+
+def _parse_registry_commands(text: str) -> set[str]:
+    block = _extract_named_array_block(text, "CommandRegistry", "ProbeCommandInfo")
+    return set(_REGISTRY_COMMAND_NAME_RE.findall(block))
+
+
+def _parse_registry_fields(text: str) -> List[Dict[str, Optional[str]]]:
+    block = _extract_named_array_block(text, "FieldRegistry", "ProbeFieldInfo")
+    return [
+        {"key": em.group(1), "namespace": em.group(2), "group": em.group(3)}
+        for em in _REGISTRY_FIELD_ENTRY_RE.finditer(block)
+    ]
+
+
+def _run_registry_drift_audit(cs_path: Path) -> Dict[str, Any]:
+    """Compares CommandRegistry/FieldRegistry against the real case-block/
+    switch parsers. Returns a report dict; `clean` is True only if every
+    section below found zero drift in both directions (code-has-it-
+    registry-doesn't, and registry-has-it-code-doesn't -- the latter means
+    a STALE entry describing something that no longer exists)."""
+    lines = cs_path.read_text().splitlines()
+    text = "\n".join(lines)
+
+    reg_commands = _parse_registry_commands(text)
+    case_commands = {c["command"] for c in _parse_probe_commands(cs_path)}
+
+    reg_fields = _parse_registry_fields(text)
+    computed_groups = _parse_computed_groups(lines)
+    case_group_names = {g["group"] for g in computed_groups}
+    case_output_keys: set[str] = set()
+    for g in computed_groups:
+        case_output_keys.update(g["output_keys"])
+    script_fields = {f["name"] for f in _parse_script_fields(lines)}
+    literal_fields = {f["name"] for f in _parse_literal_telemetry_fields(lines)}
+
+    reg_group_names = {f["group"] for f in reg_fields if f["namespace"] == "computed" and f["group"]}
+    reg_output_keys = {f["key"] for f in reg_fields if f["namespace"] == "computed"}
+    reg_script_keys = {f["key"] for f in reg_fields if f["namespace"] == "script-condition"}
+    reg_all_keys = {f["key"] for f in reg_fields}
+
+    sections = {
+        "commands": {
+            "missing_from_registry": sorted(case_commands - reg_commands),
+            "stale_in_registry": sorted(reg_commands - case_commands),
+        },
+        "computed_field_groups": {
+            "missing_from_registry": sorted(case_group_names - reg_group_names),
+            "stale_in_registry": sorted(reg_group_names - case_group_names),
+        },
+        "computed_output_keys": {
+            "missing_from_registry": sorted(case_output_keys - reg_output_keys),
+            "stale_in_registry": sorted(reg_output_keys - case_output_keys),
+        },
+        "script_condition_fields": {
+            "missing_from_registry": sorted(script_fields - reg_script_keys),
+            "stale_in_registry": sorted(reg_script_keys - script_fields),
+        },
+        "literal_telemetry_fields": {
+            # No dedicated registry namespace exists for this kind (by design,
+            # see mod_changelog.md v0.55.0 / the FieldRegistry 'partCount'
+            # entries) -- a literal field is considered covered as long as
+            # SOME registry entry documents that exact key under any
+            # namespace, since its scoped-telemetry-list validity is meant to
+            # be explained in that entry's Description/RequestAs prose, not a
+            # separate tag. This only flags a literal field with ZERO
+            # registry entries at all -- true blind spots, not a namespace
+            # mismatch.
+            "missing_from_registry": sorted(literal_fields - reg_all_keys),
+        },
+    }
+    clean = all(not v for section in sections.values() for v in section.values())
+    return {"clean": clean, "sections": sections}
+
+
+class RegistryAuditInput(BaseModel):
+    pass
+
+
+@mcp.tool(
+    name="sfsprobe_registry_audit",
+    annotations={
+        "title": "Audit CommandRegistry/FieldRegistry for drift against real case blocks",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def sfsprobe_registry_audit(params: RegistryAuditInput) -> str:
+    """Static drift check between SFSProbe.cs's CommandRegistry/FieldRegistry
+    (what light_search's live/static-fallback paths present as ground truth)
+    and the real case blocks/switches those registries are supposed to
+    describe. Flags any command or field present in the code but missing a
+    registry entry (a documentation gap -- a future caller would have to
+    guess), and any registry entry with no matching code (stale, describes
+    something removed). Pure source-file parsing -- no running game needed.
+
+    Run this after adding a new command or telemetry field, per the
+    project's standing convention: a new case block or switch entry must
+    ship WITH a matching registry entry in the same change, not after.
+
+    Returns: {"clean": bool, "sections": {section_name: {"missing_from_registry": [...],
+    "stale_in_registry": [...]}}}. `clean` is true only if every section is
+    empty in both directions.
+    """
+    report = await asyncio.to_thread(_run_registry_drift_audit, SFSPROBE_CS_PATH)
+    return json.dumps(report, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: light_search -- MCP overhaul Checkpoint 2. Unified retrieval tool
+# superseding the old sfsprobe_command_search/sfsprobe_telemetry_field_search
+# tools (removed; their regex-parsing internals live on above as the
+# fallback path). Prefers the live 'describe' registry (Checkpoint 1's
+# CommandRegistry/FieldRegistry, dumped fresh by the mod itself -- correct
+# by construction, including units, since it's read from the actual running
+# game rather than parsed back out of source comments) and falls back to
+# the regex parsers only when the game isn't reachable (not running, mod
+# too old to have 'describe', a timeout). Every response says which path
+# served it via "source": "live_registry" or "static_fallback", so a
+# caller knows whether to trust it as authoritative or double-check.
+#
+# domain="doc" -- MCP overhaul Checkpoint 4. Chunks docs/sfs_physics_
+# reference.md and docs/sfs_source_reference.md by Markdown heading (##/
+# ###/####) so an agent can search physics/IL findings the same way it
+# searches commands/fields, without reading either file (or knowing they
+# exist) directly.
+# ---------------------------------------------------------------------------
+
+_HEADING_RE = re.compile(r'^(#{2,4})\s+(.*\S)\s*$', re.MULTILINE)
+_DOC_TAG_RE = re.compile(r'\[(CONFIRMED|PARTIAL|OPEN)[^\]]*\]')
+_doc_chunk_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+
+
+def _chunk_doc_file(path: Path) -> List[Dict[str, Any]]:
+    """Split one Markdown doc into (heading, body) chunks. Each chunk runs
+    from one ##/###/#### heading to the next heading of any level (flat
+    split, not a nested tree -- simplest thing that lets a search match a
+    specific subsection like '2.5 Aerodynamic torque' on its own, per the
+    checkpoint's spec). `tags` pulls any [CONFIRMED]/[PARTIAL]/[OPEN]
+    markers found in the heading line or the first 500 chars of the body,
+    since that's where this project's docs put them."""
+    text = path.read_text()
+    headings = list(_HEADING_RE.finditer(text))
+    chunks = []
+    for i, m in enumerate(headings):
+        start = m.end()
+        end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+        heading = m.group(2).strip()
+        body = text[start:end].strip()
+        tag_source = heading + " " + body[:500]
+        tags = sorted(set(_DOC_TAG_RE.findall(tag_source)))
+        chunks.append({
+            "heading": heading,
+            "level": len(m.group(1)),
+            "body": body,
+            "source_file": path.name,
+            "tags": tags,
+        })
+    return chunks
+
+
+async def _resolve_docs() -> List[Dict[str, Any]]:
+    """Cached (DOC_CACHE_TTL_S) chunk index across every file in DOC_PATHS.
+    A missing file is skipped, not fatal -- docs are supplementary, and a
+    caller should still get commands/fields even if a doc got moved."""
+    now = time.monotonic()
+    if _doc_chunk_cache["data"] is not None and (now - _doc_chunk_cache["ts"]) < DOC_CACHE_TTL_S:
+        return _doc_chunk_cache["data"]
+    chunks: List[Dict[str, Any]] = []
+    for path in DOC_PATHS:
+        if not path.exists():
+            continue
+        try:
+            chunks.extend(await asyncio.to_thread(_chunk_doc_file, path))
+        except OSError as e:
+            _log(f"_resolve_docs: failed to read {path}: {e}")
+    _doc_chunk_cache["data"] = chunks
+    _doc_chunk_cache["ts"] = now
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+
+_registry_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+
+
+async def _get_registry() -> tuple[Optional[Dict[str, Any]], str]:
+    """Fetch the live 'describe' registry, cached for REGISTRY_CACHE_TTL_S.
+    Returns (registry_or_None, source) -- source is "live_registry" on
+    success (cached or fresh) or "static_fallback" if the game/mod isn't
+    reachable or returned something unparseable. Never raises -- every
+    failure mode here is a legitimate, expected reason to fall back, not
+    a bug to surface as an error."""
+    now = time.monotonic()
+    if _registry_cache["data"] is not None and (now - _registry_cache["ts"]) < REGISTRY_CACHE_TTL_S:
+        return _registry_cache["data"], "live_registry"
+    try:
+        await asyncio.to_thread(send_command, "describe", DESCRIBE_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S)
+        data = json.loads(DESCRIBE_JSON_FILE.read_text())
+    except (ProbeTimeoutError, FileNotFoundError, OSError, json.JSONDecodeError):
+        return None, "static_fallback"
+    _registry_cache["data"] = data
+    _registry_cache["ts"] = now
+    return data, "live_registry"
+
+
+async def _resolve_commands() -> tuple[List[Dict[str, Any]], str]:
+    """Shared command-list resolution: live 'describe' registry preferred
+    (via _get_registry above), regex-parsed SFSProbe.cs fallback
+    otherwise. Used by both light_search's command domain and the
+    fast-fail validator (Checkpoint 3, below) so the two can never
+    disagree about what counts as a valid command. A fallback-parse
+    OSError degrades to an empty list rather than raising -- callers
+    (search: shows total_commands=0; validator: fails open, see
+    _validate_command_line) treat 'couldn't resolve anything' as a
+    known, handleable state, not a crash."""
+    registry, source = await _get_registry()
+    if registry is not None:
+        return registry.get("commands", []), source
+    if not SFSPROBE_CS_PATH.exists():
+        return [], "static_fallback"
+    try:
+        raw = await asyncio.to_thread(_parse_probe_commands, SFSPROBE_CS_PATH)
+    except OSError as e:
+        _log(f"_resolve_commands: fallback parse failed: {e}")
+        return [], "static_fallback"
+    commands = [
+        {
+            "name": c["command"], "description": c["description"],
+            "inline_body": c["inline_body"], "source_line": c["source_line"],
+        }
+        for c in raw
+    ]
+    return commands, "static_fallback"
+
+
+# ---------------------------------------------------------------------------
+# Fast-fail command validation -- MCP overhaul Checkpoint 3. Checks a
+# command's leading word against the known command set (via
+# _resolve_commands above) BEFORE it's ever written to command.txt, so a
+# typo like 'telemetry snapshot' (the real command is 'telemetrysnapshot',
+# one word) fails in milliseconds with a suggestion instead of burning a
+# multi-second send_command timeout waiting for a result.txt line that,
+# because the mod's own `default:` case in Command() DOES still write
+# 'unknown command: ...' to result.txt, would actually have arrived --
+# but only after the same adaptive-poll wait as a real command, and only
+# distinguishable from a real response by reading the text. This check
+# short-circuits before any of that.
+# ---------------------------------------------------------------------------
+
+async def _validate_command_line(cmd_line: str) -> Optional[Dict[str, Any]]:
+    """Returns None if cmd_line's leading word is a known command (or if
+    command-name resolution itself came up empty -- fails OPEN, not
+    closed: an unresolvable command set must never silently block a real
+    command from being sent). Otherwise returns an error-response dict
+    with close-match suggestions, no game round-trip spent."""
+    leading = cmd_line.strip().split(" ", 1)[0].lower()
+    if not leading:
+        return None
+    commands, source = await _resolve_commands()
+    known = {c["name"].lower() for c in commands if c.get("name")}
+    if not known or leading in known:
+        return None
+    close = difflib.get_close_matches(leading, sorted(known), n=3, cutoff=0.5)
+    suggestion = f" Did you mean: {', '.join(close)}?" if close else ""
+    return {
+        "error_code": "UNKNOWN_COMMAND",
+        "error": f"'{leading}' is not a known sfsprobe command.{suggestion}",
+        "command": cmd_line,
+        "suggestions": close,
+        "source": source,
+        "timed_out": False,
+    }
+
+
+class SearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(
+        default="",
+        max_length=200,
+        description=(
+            "Keyword(s) to search for, e.g. 'telemetry', 'parachute', "
+            "'gimbal throttle', 'part count'. Leave empty to list "
+            "everything in the selected domain(s)."
+        ),
+    )
+    domain: Literal["command", "field", "doc", "all"] = Field(
+        default="all",
+        description=(
+            "'command': command.txt commands (name/syntax/description/category). "
+            "'field': telemetry field/parameter names across all namespaces "
+            "(script-condition/computed/truth/inputs when live; a broader "
+            "regex-parsed set when falling back). 'doc': physics/source "
+            "reference docs (docs/sfs_physics_reference.md, docs/"
+            "sfs_source_reference.md), chunked by Markdown heading. "
+            "'all': every domain at once."
+        ),
+    )
+    top_k: int = Field(default=10, ge=1, le=50)
+
+
+@mcp.tool(
+    name="light_search",
+    annotations={
+        "title": "Search sfsprobe commands/fields/docs (live registry preferred, source-parsed fallback)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def light_search(params: SearchInput) -> str:
+    """Search sfsprobe's real commands, telemetry fields, and (eventually)
+    reference docs by keyword, instead of guessing syntax or field
+    semantics from memory -- the tool that exists because of real
+    mistakes made without it: sending 'telemetry snapshot' (not a real
+    command; the real one is 'telemetrysnapshot'), requesting bare
+    'gimbalThrottleOut' (an OUTPUT key, not a request name -- the real
+    request is 'computed:gimbal'), and misreading 'parachuteAlphaDeg' as
+    an angle in degrees when it's actually an angular ACCELERATION in
+    deg/s^2.
+
+    Tries the live 'describe' command first -- the mod's own
+    CommandRegistry/FieldRegistry, correct by construction because it's
+    read out of the actual running game, including each field's real
+    unit. Falls back to parsing SFSProbe.cs's source directly (regex over
+    the Command()/AppendComputedField/GetScriptFieldValue/Sample()
+    switches) only when the game isn't reachable. Every response's
+    "source" field says which path actually served it.
+
+    Args:
+        params (SearchInput): query, domain, top_k
+
+    Returns:
+        str: JSON with keys: query, domain, source ("live_registry" or
+        "static_fallback"), and, per requested domain: commands/
+        total_commands, fields/total_fields, docs/total_docs (docs are
+        chunked docs/sfs_physics_reference.md + docs/sfs_source_
+        reference.md sections, each carrying heading/body/source_file/tags).
+    """
+    registry, source = await _get_registry()
+    terms = [t.lower() for t in params.query.split() if t.strip()]
+    result: Dict[str, Any] = {"query": params.query, "domain": params.domain, "source": source}
+
+    if params.domain in ("command", "all"):
+        commands, _cmd_source = await _resolve_commands()
+        result["total_commands"] = len(commands)
+        result["commands"] = _score_items(terms, commands, "name", params.top_k)
+
+    if params.domain in ("field", "all"):
+        if registry is not None:
+            fields = registry.get("fields", [])
+        elif SFSPROBE_CS_PATH.exists():
+            try:
+                raw = await asyncio.to_thread(_build_field_index, SFSPROBE_CS_PATH)
+            except OSError as e:
+                return _error_for_exception(e)
+            fields = [_normalize_fallback_field(e) for e in raw]
+        else:
+            fields = []
+        result["total_fields"] = len(fields)
+        result["fields"] = _score_items(terms, fields, "key", params.top_k)
+
+    if params.domain in ("doc", "all"):
+        docs = await _resolve_docs()
+        result["total_docs"] = len(docs)
+        result["docs"] = _score_items(terms, docs, "heading", params.top_k)
+
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: deep_search -- MCP overhaul Checkpoint 5. light_search's "doc" domain
+# is only as good as hand-written prose that can drift from ground truth
+# (this project has already found a doc chunk containing its own
+# `> **CORRECTION**` annotation). deep_search goes straight to the real
+# decompiled game IL via `monodis` instead of a summary of it, for when
+# light_search's doc coverage is missing or untrustworthy for a given
+# question.
+#
+# IL HAS NO COMMENTS OR TAGS -- decompilation strips them entirely. Unlike
+# light_search's doc domain (human prose plus [CONFIRMED]/[PARTIAL]/[OPEN]
+# tags), deep_search can only ever match identifiers: type/method/field
+# names. A query like "gimbal" needs to hit EngineModule's `gimbal` FIELD
+# or its `RecalculateGimbal` METHOD -- not the type name "EngineModule",
+# which doesn't contain "gimbal" at all. So this is a two-LEVEL index, not
+# a single type-name lookup:
+#   1. Type-level -- reused as-is from analysis/il_inventory.py (already
+#      built for the docs/sfs_reference/ migration's own inventory), via
+#      `il_inventory.parse_il()`.
+#   2. Member-level (the real gap) -- `parse_il(capture_members=True)`
+#      also collects each type's real method/field names, not just
+#      counts, into that same per-type record.
+# A query tries type names first, then falls through to member names
+# across every type, surfacing which type(s) contain a matching member.
+#
+# Consequence worth documenting everywhere this tool is described: this
+# makes deep_search far less forgiving of open-ended conceptual queries
+# than light_search's doc domain. "why does thrust respond instantly with
+# no ramp" hits nothing here -- no such literal identifiers exist -- but
+# works fine against doc prose. deep_search is for "I roughly know the
+# type/method/field name and want ground truth over a doc's prose," not
+# "explain this concept" -- that job stays with light_search.
+# ---------------------------------------------------------------------------
+
+_CLASS_NESTED_RE = re.compile(r'^  \.class .*nested')
+_member_inventory_cache: Dict[str, Any] = {"data": None, "mtime": None}
+
+
+def _assembly_mtime() -> Optional[float]:
+    try:
+        return ASSEMBLY_PATH.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _run_monodis(args: List[str]) -> str:
+    """Runs monodis, raising RuntimeError with its stderr on failure --
+    never lets a subprocess error surface as an unhandled exception to an
+    MCP caller."""
+    try:
+        proc = subprocess.run(
+            [MONODIS_BIN, *args], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"could not run monodis ({MONODIS_BIN}): {e}") from e
+    if proc.returncode != 0:
+        raise RuntimeError(f"monodis exited {proc.returncode}: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+async def _get_member_inventory() -> List[Dict[str, Any]]:
+    """Cached (keyed on the cached IL dump's mtime, so a rebuilt/updated
+    assembly invalidates it automatically) two-level type+member inventory
+    via `il_inventory.parse_il(capture_members=True)` against deep_search's
+    own IL cache (never scratch/full_il.txt -- see DEEP_SEARCH_CACHE_DIR's
+    comment). `il_inventory.is_compiler_generated` filters out closures/
+    display classes/etc, same as that module's own CLI path does."""
+    il_path = await _ensure_il_dump()
+    mtime = await asyncio.to_thread(lambda: il_path.stat().st_mtime)
+    if _member_inventory_cache["data"] is not None and _member_inventory_cache["mtime"] == mtime:
+        return _member_inventory_cache["data"]
+    types = await asyncio.to_thread(il_inventory.parse_il, str(il_path), True)
+    real = [t for t in types if not il_inventory.is_compiler_generated(t)]
+    _member_inventory_cache["data"] = real
+    _member_inventory_cache["mtime"] = mtime
+    return real
+
+
+def _name_score(name_l: str, term: str) -> int:
+    if name_l == term:
+        return 100
+    if name_l.startswith(term):
+        return 60
+    if term in name_l:
+        return 30
+    return 0
+
+
+def _score_deep_matches(query: str, types: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    """Two-level identifier match (see the module comment above for why:
+    IL has no prose to match against). Tries each type's own name first
+    (exact/prefix/substring, then a tightened fuzzy fallback -- ratio
+    >0.7 only, since 0.6 let unrelated short names like 'Part'/'PartHit'
+    leak into a 'parachute' query at ratio ~0.62), then falls through to
+    every method/field name across all types. Returns each matched type
+    with `matched_via` ("type name" or "member name") and the specific
+    `matched_members` list, so a caller can see *why* a type came back --
+    important here since, unlike a doc chunk, an IL class summary doesn't
+    explain itself.
+
+    Multi-word queries use AND, not OR, across a single candidate name --
+    e.g. a member must contain every term to count as a match. This is
+    deliberate, not an optimization: without it, a conceptual sentence like
+    "why does thrust ramp up slowly" would independently match any field
+    named `thrust` and any field/method literally named `up`, returning
+    noise that makes deep_search look like it (partially) answers
+    conceptual questions when it fundamentally cannot -- IL has no
+    identifier for "why" or "slowly" to fail to match against, only
+    unrelated real names that happen to share a common short word. No
+    single real identifier contains every term of an unrelated sentence,
+    so AND naturally yields zero matches for that class of query while
+    still matching legitimate multi-word identifier lookups."""
+    terms = [t.lower() for t in query.split() if t.strip()]
+    if not terms:
+        return [{"type": t, "matched_via": "listing", "matched_members": []} for t in types[:top_k]]
+
+    def name_matches_all(name_l: str) -> int:
+        """AND across terms: every term must score >0 against name_l (each
+        independently, e.g. exact/prefix/substring or a >0.7 fuzzy ratio
+        for a single-term query only -- fuzzy typo-correction doesn't
+        generalize to multi-term AND). Returns the summed per-term score,
+        or 0 if any term fails to match at all."""
+        total = 0
+        for term in terms:
+            s = _name_score(name_l, term)
+            if s == 0 and len(terms) == 1:
+                ratio = difflib.SequenceMatcher(None, term, name_l).ratio()
+                s = int(ratio * 15) if ratio > 0.7 else 0
+            if s == 0:
+                return 0
+            total += s
+        return total
+
+    scored = []
+    for t in types:
+        name_l = t["name"].lower()
+        best, via = 0, None
+        s = name_matches_all(name_l)
+        if s > best:
+            best, via = s, "type name"
+
+        matched_members = []
+        for kind, names in (("method", t.get("method_names") or []), ("field", t.get("field_names") or [])):
+            for member in names:
+                member_short = member.rsplit(".", 1)[-1].lower()
+                member_score = name_matches_all(member_short)
+                if member_score > 0:
+                    matched_members.append({"kind": kind, "name": member, "score": member_score})
+        if matched_members:
+            matched_members.sort(key=lambda m: -m["score"])
+            top_member_score = matched_members[0]["score"]
+            if top_member_score > best:
+                best, via = top_member_score, "member name"
+
+        if best > 0:
+            scored.append((best, t, via, matched_members[:10]))
+
+    scored.sort(key=lambda x: -x[0])
+    return [{"type": t, "matched_via": via, "matched_members": members} for _, t, via, members in scored[:top_k]]
+
+
+async def _ensure_il_dump() -> Path:
+    """Ensures a full `monodis` IL dump of ASSEMBLY_PATH exists at
+    DEEP_SEARCH_IL_CACHE, re-dumping only if missing or the assembly's
+    mtime has changed since the last dump (~0.3s for the real ~290k-line
+    assembly -- worth caching, but cheap enough not to be precious about).
+    Never touches scratch/full_il.txt -- see the module-level comment on
+    DEEP_SEARCH_CACHE_DIR."""
+    mtime = await asyncio.to_thread(_assembly_mtime)
+    meta = None
+    if DEEP_SEARCH_IL_META.exists():
+        try:
+            meta = json.loads(DEEP_SEARCH_IL_META.read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = None
+    if meta and meta.get("assembly_mtime") == mtime and DEEP_SEARCH_IL_CACHE.exists():
+        return DEEP_SEARCH_IL_CACHE
+    await asyncio.to_thread(DEEP_SEARCH_CACHE_DIR.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(
+        _run_monodis, [f"--output={DEEP_SEARCH_IL_CACHE}", str(ASSEMBLY_PATH)]
+    )
+    await asyncio.to_thread(
+        DEEP_SEARCH_IL_META.write_text,
+        json.dumps({"assembly_mtime": mtime, "assembly_path": str(ASSEMBLY_PATH)}),
+    )
+    return DEEP_SEARCH_IL_CACHE
+
+
+def _extract_class_summary(il_lines: List[str], short_name: str) -> Optional[Dict[str, Any]]:
+    """Ports this project's manual `sig.sh` extraction convention (see
+    docs/sfs_source_reference.md §A2) to Python: finds short_name's
+    top-level `.class` line, then walks forward collecting field
+    declarations and flattened method signatures (declaration spans two
+    lines in monodis output -- gotcha #1 in that doc) until either the
+    class's own closing brace or the first NESTED type, whichever comes
+    first (gotcha #2 -- without this a closure/nested-interface type's
+    members get misattributed to the outer class, a real false positive
+    this project hit twice during manual research)."""
+    class_re = re.compile(r'^  \.class .*[ .]' + re.escape(short_name) + r'$')
+    start = next((i for i, l in enumerate(il_lines) if class_re.match(l.rstrip('\n'))), None)
+    if start is None:
+        return None
+    out_lines = [f"CLASS@{start + 1}: {il_lines[start].strip()}"]
+    end = len(il_lines) - 1
+    truncated_nested = False
+    i = start + 1
+    while i < len(il_lines):
+        stripped = il_lines[i].rstrip('\n')
+        if stripped.startswith('  } // end of class'):
+            end = i
+            break
+        if _CLASS_NESTED_RE.match(stripped):
+            end = i - 1
+            truncated_nested = True
+            break
+        if stripped.startswith('    .field'):
+            out_lines.append(f"  FIELD: {stripped.strip()}")
+        elif stripped.startswith('    .method'):
+            sig_parts = [stripped.strip()]
+            j = i + 1
+            while j < len(il_lines) and j < i + 5:
+                sig_parts.append(il_lines[j].strip())
+                if ')' in il_lines[j]:
+                    break
+                j += 1
+            sig = re.sub(r'\s+', ' ', ' '.join(sig_parts))
+            out_lines.append(f"  METHOD@{i + 1}: {sig}")
+        i += 1
+    if truncated_nested:
+        out_lines.append("  [truncated at first nested type -- nested members NOT shown]")
+    return {"start_line": start + 1, "end_line": end + 1, "lines": out_lines}
+
+
+class DeepSearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "A type, method, or field name (exact or partial) -- an "
+            "IDENTIFIER, e.g. 'EngineModule', 'gimbal', 'RecalculateGimbal'. "
+            "deep_search matches real names in the decompiled assembly only "
+            "(no prose/comments survive decompilation) -- it will NOT answer "
+            "a conceptual question like 'why does thrust ramp up slowly' "
+            "(use light_search's domain=\"doc\" for that instead)."
+        ),
+    )
+    top_k: int = Field(default=3, ge=1, le=10, description="How many matched types to extract.")
+
+
+@mcp.tool(
+    name="deep_search",
+    annotations={
+        "title": "Search real decompiled game IL by type/method/field name (ground truth, no doc summary)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def deep_search(params: DeepSearchInput) -> str:
+    """Look up a type, method, or field directly in the real decompiled
+    game assembly via `monodis`, bypassing light_search's doc summaries
+    entirely. Use this when light_search's `domain="doc"` doesn't cover
+    something, or when a doc chunk's prose shouldn't be trusted over
+    ground truth (this project has already found a doc chunk carrying its
+    own correction annotation).
+
+    IMPORTANT SCOPE LIMIT: decompiled IL has no comments or tags at all --
+    it can only ever be matched by identifier (type/method/field name),
+    never by concept or description. A query like "gimbal" matches
+    EngineModule's `gimbal` field or a `RecalculateGimbal` method; a query
+    like "why does thrust ramp up slowly" matches nothing here, because no
+    such literal identifier exists, even though light_search's doc domain
+    answers it fine from prose. Use deep_search when you roughly know the
+    type/method/field name and want ground truth over a doc's summary of
+    it -- not for open-ended "explain this" questions.
+
+    Two-level index, reusing analysis/il_inventory.py's own type parser
+    (built for the docs/sfs_reference/ migration) rather than
+    reimplementing it: type names are tried first, then every method/field
+    name across all types, since a query term is frequently a *member*
+    name, not the type name itself. For each matched type, fields and
+    method signatures are then extracted from a cached full IL dump using
+    this project's established `sig.sh` extraction convention
+    (docs/sfs_source_reference.md §A2) -- real field names/types and
+    flattened method signatures, not full method bodies (which would be
+    huge) and not a paraphrase.
+
+    Args:
+        params (DeepSearchInput): query, top_k
+
+    Returns:
+        str: JSON with keys: query, source ("monodis_live"), assembly
+        (path), matches (list of {type_name, matched_via ("type name" or
+        "member name"), matched_members, found_in_il, il_lines,
+        line_range, truncated, note}). A `note` explains where to find
+        more in the cache file when a class summary was too long to
+        return in full.
+    """
+    if not ASSEMBLY_PATH.exists():
+        return json.dumps({
+            "error_code": "ASSEMBLY_NOT_FOUND",
+            "error": f"Assembly not found at {ASSEMBLY_PATH}. Override with SFSPROBE_ASSEMBLY_PATH.",
+        }, indent=2)
+    try:
+        types = await _get_member_inventory()
+    except RuntimeError as e:
+        return json.dumps({"error_code": "MONODIS_FAILED", "error": str(e)}, indent=2)
+
+    matches = _score_deep_matches(params.query, types, params.top_k)
+    if not matches:
+        return json.dumps({
+            "query": params.query,
+            "source": "monodis_live",
+            "matches": [],
+            "note": (
+                "No type, method, or field name matched. deep_search only "
+                "matches real identifiers in the decompiled assembly, never "
+                "concepts or prose -- try light_search's domain=\"doc\" for "
+                "a conceptual question, or broaden/correct the identifier."
+            ),
+        }, indent=2)
+
+    il_path = DEEP_SEARCH_IL_CACHE
+    il_text = await asyncio.to_thread(il_path.read_text)
+    il_lines = il_text.splitlines()
+
+    results = []
+    for m in matches:
+        t = m["type"]
+        summary = _extract_class_summary(il_lines, t["name"])
+        if summary is None:
+            results.append({
+                "type_name": t["fq"], "matched_via": m["matched_via"],
+                "matched_members": m["matched_members"], "found_in_il": False,
+            })
+            continue
+        body_lines = summary["lines"]
+        too_long = len(body_lines) > DEEP_SEARCH_MAX_LINES
+        results.append({
+            "type_name": t["fq"],
+            "matched_via": m["matched_via"],
+            "matched_members": m["matched_members"],
+            "found_in_il": True,
+            "il_lines": body_lines[:DEEP_SEARCH_MAX_LINES],
+            "line_range": [summary["start_line"], summary["end_line"]],
+            "truncated": too_long,
+            "note": (
+                f"Full extraction has {len(body_lines)} lines; showing first "
+                f"{DEEP_SEARCH_MAX_LINES}. Real IL spans lines "
+                f"{summary['start_line']}-{summary['end_line']} in the cached "
+                f"dump at {DEEP_SEARCH_IL_CACHE}."
+            ) if too_long else None,
+        })
+
+    return json.dumps({
+        "query": params.query,
+        "source": "monodis_live",
+        "assembly": str(ASSEMBLY_PATH),
+        "matches": results,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: onboarding -- MCP overhaul Checkpoint 6. A single orientation tool
+# for an AI with zero prior context on this project. Deliberately short --
+# the point is to point at light_search/deep_search, not to duplicate their
+# content. Implemented as a @mcp.tool rather than an @mcp.resource: every
+# other capability on this server is a tool, and a tool is guaranteed to
+# show up in a caller's tool list and be callable proactively, whereas
+# resource support/visibility varies by MCP client -- consistency and
+# reachability won over resources' template-URI mechanism, which buys
+# nothing here since there are no parameters.
+# ---------------------------------------------------------------------------
+
+class OnboardingInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+_ONBOARDING_TEXT = """\
+sfsprobe_mcp orientation -- read this first if you have no prior context.
+
+WHAT THIS IS
+sfsprobe_mcp lets you control and observe a live run of Spaceflight
+Simulator (SFS) through a C# mod ("sfsprobe") running inside the game.
+Under the hood, commands are written to command.txt, the mod polls for
+it and executes it, then appends a result line to result.txt -- but you
+never touch those files directly; every tool here already wraps that
+round-trip in adaptive polling. This detail only matters for reading
+error messages (e.g. a FILE_NOT_FOUND means the mod isn't running or
+its working directory is misconfigured, not that you did anything wrong).
+
+STANDING INSTRUCTION: SEARCH BEFORE YOU GUESS
+Never guess a command name, a telemetry field name, or its unit. Call
+light_search first, every time, before sending a command or requesting
+a field you haven't confirmed. Guessing has caused real bugs in this
+project's history (e.g. treating an angular-acceleration field as if it
+were a plain angle because its name looked like one).
+
+light_search vs. deep_search -- which to reach for:
+- light_search(query, domain, top_k): your default. Fast, live-registry
+  backed when the game is running (falls back to static parsing of the
+  mod source otherwise -- check the "source" field in its response to
+  see which). domain="command" for command syntax, domain="field" for
+  telemetry field names + units, domain="doc" for physics/design docs,
+  domain="all" for everything at once. Use this for "how do I..." and
+  "what does X mean" questions -- it also covers open-ended conceptual
+  queries doc prose can answer, which deep_search cannot.
+- deep_search(query, top_k): a slower fallback for when light_search's
+  doc coverage is missing something, or you don't trust a doc chunk's
+  prose over ground truth. It reads the real decompiled game assembly
+  (via monodis) instead of hand-written docs, so it can only match real
+  identifiers (a type, method, or field name) -- not paraphrased
+  concepts. Use it when you roughly know the name of the thing you're
+  looking for but doc prose doesn't cover it or might be stale.
+
+ERROR CODES YOU MAY SEE
+- TIMEOUT: the mod didn't respond in time -- usually means the game is
+  not running, is paused on a loading screen, or the command silently
+  requires state that doesn't exist yet (e.g. no active rocket).
+- FILE_NOT_FOUND: the command/result file pair isn't where expected --
+  the mod isn't running or SFSPROBE_MOD_DIR points somewhere wrong.
+- INVALID_PARAM: a tool argument failed validation before anything was
+  sent to the game at all.
+- UNKNOWN_COMMAND: the leading word of a command didn't match any known
+  command (checked BEFORE any game round-trip, so this fails in
+  milliseconds, not after a timeout) -- the response includes the
+  closest real match(es), so check those before retrying.
+- UNKNOWN_ERROR: an exception occurred that isn't one of the above --
+  check the accompanying message text.
+- ASSEMBLY_NOT_FOUND / MONODIS_FAILED: deep_search-specific -- the game
+  assembly path is wrong, or monodis itself failed to run.
+- NO_ACTIVE_ROCKET: a command needs a rocket to exist and none does.
+- PARSE_ERROR / MISSING_FIELD: a downstream analysis tool (flight-log
+  parsing, field lookups) couldn't find or parse what you asked for.
+- WAIT_TIMEOUT: NOT the same thing as TIMEOUT above, and easy to
+  confuse with it. This is a "warning_code" (not "error_code") emitted
+  by a flight-script wait-for-condition step -- it means the condition
+  you told the script to wait for (e.g. an altitude or velocity
+  threshold) never became true before that step's own timeout elapsed.
+  Nothing failed to respond; the script kept running and simply moved
+  on. A handful of other tool-specific codes exist too (e.g.
+  NOT_IN_BUILD/NOT_IN_WORLD/SPAWN_FAILED on sfsprobe_load_blueprint,
+  NO_NEW_ARCHIVE/NO_SAMPLES on flight-analysis tools) -- those are
+  documented in each tool's own description rather than repeated here.
+
+THE FOUR TELEMETRY FIELD NAMESPACES -- these are NOT interchangeable
+1. computed_group: a "computed:NAME" group you REQUEST (e.g.
+   "computed:parachuteDrag") to make the mod compute and return a set
+   of related values.
+2. computed_output_key: a field WRITTEN by a computed_group (e.g.
+   parachuteDrag's group writes fields that are NOT literally named
+   "parachuteDrag"). An output key is never itself a valid thing to
+   request -- you request the group, you read its output keys.
+3. script_condition_field: short-name aliases valid only inside
+   SCRIPT/TRIGGER condition strings (e.g. autostop rules). NOT valid in
+   a "telemetry on <fields>" list.
+4. literal_telemetry_field: bare names valid DIRECTLY in a
+   "telemetry on <fields>" list (special-cased in the mod's Sample()).
+(Separately, the live "describe" registry also tags plain state fields
+with a "truth"/"inputs" namespace -- those are full-mode-only fields
+read straight off game state, not derived through a computed group or
+script condition. Don't confuse that registry tag with the four
+namespaces above; light_search(query, domain="field") returns each
+match's real kind/namespace so you don't have to guess.)
+"""
+
+
+@mcp.tool(
+    name="sfsprobe_onboarding",
+    annotations={
+        "title": "Orientation for a new AI/agent session",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def sfsprobe_onboarding(params: OnboardingInput) -> str:
+    """Zero-context orientation: what this MCP is, what its error codes
+    mean, the four telemetry field namespaces, and when to use
+    light_search vs. deep_search. Call this once at the start of a
+    session if you have no prior context on this project.
+
+    Args:
+        params (OnboardingInput): no fields, takes no arguments.
+
+    Returns:
+        str: plain-text orientation guide (not JSON -- meant to be read,
+        not parsed).
+    """
+    return _ONBOARDING_TEXT
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +1804,13 @@ async def sfsprobe_send_batch(params: SendBatchInput) -> str:
     null (marked silent=true) rather than looking like a missing/failed
     value.
 
+    Fast-fails the ENTIRE batch (MCP overhaul Checkpoint 3) if ANY command's
+    leading word isn't known -- no commands in the batch are sent, not even
+    the valid ones, since a typo'd step partway through a launch sequence
+    (e.g. 'ignit' instead of 'ignite') is exactly the kind of mistake worth
+    catching before anything fires. Skipped entirely (fails open) if the
+    command set itself can't be resolved.
+
     Args:
         params (SendBatchInput): commands, timeout_s, poll_interval_s
 
@@ -443,8 +1820,28 @@ async def sfsprobe_send_batch(params: SendBatchInput) -> str:
         world/menu]), complete (bool -- true if every non-silent command
         got a confirmed result before timeout; false means check results
         for which ones are still null, partial results are NOT discarded
-        on timeout), elapsed_seconds.
+        on timeout), elapsed_seconds. On a fast-fail: error_code
+        'UNKNOWN_COMMAND', error, invalid (array of {command, suggestions}),
+        source -- no commands were sent.
     """
+    commands_registry, cmd_source = await _resolve_commands()
+    known = {c["name"].lower() for c in commands_registry if c.get("name")}
+    if known:
+        invalid = []
+        for cmd in params.commands:
+            leading = cmd.strip().split(" ", 1)[0].lower()
+            if leading and leading not in known:
+                close = difflib.get_close_matches(leading, sorted(known), n=3, cutoff=0.5)
+                invalid.append({"command": cmd, "suggestions": close})
+        if invalid:
+            return json.dumps({
+                "error_code": "UNKNOWN_COMMAND",
+                "error": f"{len(invalid)} of {len(params.commands)} command(s) in this batch aren't "
+                         "known sfsprobe commands -- no commands were sent.",
+                "invalid": invalid,
+                "source": cmd_source,
+            }, indent=2)
+
     try:
         results, elapsed, complete = await asyncio.to_thread(
             send_command_batch, params.commands, params.timeout_s, params.poll_interval_s

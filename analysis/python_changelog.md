@@ -6,7 +6,529 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
-## 2026-09-02 (latest) — `--test_against_run`: control-input replay, real per-thruster RCS, mass-penalty fix
+## 2026-09-04 (latest) — `sfsprobe_registry_audit` drift auditor (MCP overhaul Checkpoint 7, part 1)
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 7 /
+architecture decision A. Checkpoint 1's `CommandRegistry`/`FieldRegistry`
+is now the primary source of truth for `light_search`, but nothing
+stops a future command or field from being added to `SFSProbe.cs`
+without a matching registry entry -- exactly the "comments as the only
+documentation" failure mode the whole overhaul exists to fix. This
+closes the loop: a static diff between the registry array literals and
+the real case-block/switch parsers that already exist as `light_search`'s
+`static_fallback` path.
+
+- **Added `sfsprobe_registry_audit()`** (`sfsprobe_mcp/server.py`, no
+  params) -- new `_parse_registry_commands`/`_parse_registry_fields`
+  regex-parse `CommandRegistry`/`FieldRegistry`'s array literals straight
+  out of `SFSProbe.cs` (scoped to just those two array bodies via
+  `_extract_named_array_block`, so a stray unrelated `ProbeCommandInfo`/
+  `ProbeFieldInfo` literal elsewhere in the file, if one is ever added,
+  can't get silently swept into the diff). Compares against
+  `_parse_probe_commands`/`_parse_computed_groups`/`_parse_script_fields`/
+  `_parse_literal_telemetry_fields` -- the exact same fallback-parser
+  functions `light_search` already uses, not reimplemented. Reports, per
+  section (commands / computed field groups / computed output keys /
+  script-condition fields / literal telemetry fields): entries present
+  in code but missing a registry entry, and entries present in the
+  registry with no matching code (stale). Pure source-file parsing, no
+  live game or `describe` round-trip needed -- catches drift the moment
+  new code is written, before it's ever rebuilt or reloaded.
+- **`literal_telemetry_fields` section is deliberately looser than the
+  others:** there's no dedicated `FieldRegistry` namespace for "valid
+  directly in a scoped `telemetry on <fields>` list" (currently just
+  `partCount`) -- by design, per `mod_changelog.md` v0.55.0, its dual
+  validity (both a `script-condition` field AND a scoped-telemetry
+  literal) is explained via cross-referencing prose in each of its two
+  registry entries' `Description`/`RequestAs` text, not a fourth
+  namespace tag. This section only flags a literal field with **zero**
+  registry entries under any namespace -- a true blind spot, not a
+  namespace-shape mismatch. Confirmed against the real registry:
+  `partCount` has entries under both `script-condition` and `truth`,
+  each explicitly cross-referencing the other -- correctly not flagged.
+- **Result, run against the real `SFSProbe.cs` (v0.58.0) via the actual
+  `server.py` module (not a fresh reimplementation)**: `"clean": true`
+  across every section -- 44/44 commands, 6/6 computed-field groups,
+  21/21 computed output keys, 10/10 script-condition fields, 1/1 literal
+  telemetry field all present in both the registry and the real code.
+  **No drift found** — Checkpoint 1's registry has stayed in sync
+  through Checkpoints 2-6 despite the one real code change since it was
+  written (`telemetry`'s v0.58.0 mode-validation fix, which touched
+  dispatch logic, not the registry or any case/switch label the
+  registry describes).
+- Implemented as a tool (not a one-off script) specifically so future
+  sessions can re-run it after adding a command/field, per the standing
+  convention Checkpoint 7 documents in `docs/high_level_checklist.md`.
+- Verified: `python -m py_compile`/ast check clean; called directly
+  through the real `server.py` module (game not required -- pure static
+  analysis) and confirmed the `clean: true` result by hand against the
+  actual `CommandRegistry`/`FieldRegistry` source.
+
+**Addendum, same day — Checkpoint 7's live regression pass.** With SFS
+launched fresh (v0.58.0, scene `World_PC`, 1 rocket loaded), ran
+`sfsprobe_status`/`sfsprobe_ping` directly through `server.py` (both
+responded correctly, mod version confirmed live), started a real scoped
+telemetry recording (`fields=["partCount", "computed:gimbal"]`), let it
+run ~5s (488 samples), stopped it, and read the archived
+`flight01_truth_*.jsonl` directly: `partCount` was a clean int (`38`)
+on every one of 488 samples, zero nulls; `gimbalOn` was `true`
+consistently. Confirms neither the v0.55.0 `partCount` fix nor the
+v0.56.1 gimbal engine-selection fix regressed across Checkpoints 1-6's
+changes to the surrounding file. Also re-ran a fast-fail check
+(`zzznotarealcommand123` -> `UNKNOWN_COMMAND` in 0.31s, `source:
+"live_registry"`) and `light_search("parachuteAlphaDeg", domain="field")`
+(still correctly resolves the angular-acceleration unit) live through
+the actual mod, not a fresh throwaway process -- the exact distinction
+Checkpoint 3's false-pass lesson said to keep checking. Full detail and
+the corresponding `docs/high_level_checklist.md` bug-status corrections
+in that file directly (the `partCount`/gimbal checklist entries were
+found stale during this pass -- still listed as open bugs despite being
+fixed in v0.55.0/v0.56.1 -- and moved to a "fixed" section as part of
+this audit).
+
+---
+
+## 2026-09-04 — MCP overhaul complete (Checkpoints 1-8)
+
+**Checkpoint 8 (cleanup) done same day, after Christian's explicit
+confirmation the overhaul was complete and working:**
+`docs/mcp_overhaul_checkpoint_prompt.md` deleted -- it was a temporary
+implementation prompt, not a permanent project doc, fully superseded by
+this entry, the per-checkpoint entries above, `sfsprobe/mod_changelog.md`,
+and the real shipped code. `docs/high_level_checklist.md`'s tracking
+item moved out of "Tooling bugs — confirmed broken, unfixed" (it was
+never actually a bug) into a new "Tooling — MCP overhaul complete"
+section and marked done.
+
+Closing summary tying together the deleted checkpoint prompt's
+full checkpoint sequence, each already individually changelogged above
+and in `sfsprobe/mod_changelog.md`. In one session's work: command/field/
+doc discovery moved from regex-parsed source comments to a live,
+structured, self-describing C# registry (`CommandRegistry`/
+`FieldRegistry`, Checkpoint 1); a unified `light_search` tool superseding
+the old `sfsprobe_command_search`/`sfsprobe_telemetry_field_search`
+(Checkpoint 2), covering commands, fields, and now
+`docs/sfs_physics_reference.md`/`docs/sfs_source_reference.md` prose too
+(Checkpoint 4); fast-fail command validation catching a bad leading word
+in milliseconds instead of a multi-second timeout (Checkpoint 3, which
+also surfaced and fixed a real, separate mod bug --
+`telemetry`'s silent-stop-on-typo behavior, v0.58.0); a second tool,
+`deep_search`, for real decompiled-IL ground truth when doc prose isn't
+trustworthy or doesn't cover something (Checkpoint 5); a zero-context
+`sfsprobe_onboarding` orientation tool (Checkpoint 6); and a static
+drift auditor plus a full live regression pass confirming none of the
+above regressed two known-fixed bugs (`partCount` nulls, wrong-engine
+gimbal selection) (Checkpoint 7, this entry's own predecessor).
+**Deferred, explicitly out of scope for this overhaul:** replacing the
+file-polling `command.txt`/`result.txt` IPC with a real socket protocol
+-- tracked as standing future work in `docs/high_level_checklist.md`,
+not attempted here. **Honest scope notes carried forward, not silently
+dropped:** fast-fail validation is leading-word-only (a bad SECOND word
+on an otherwise-valid command, like the original `telemetry snapshot`
+mistake, is only caught for `telemetry` specifically, via its own
+v0.58.0 fix -- not as a general mechanism); `deep_search` can only ever
+match real identifiers, never paraphrased concepts (that's
+`light_search`'s doc domain's job); the drift auditor's coverage is
+exactly as good as its regex parsers, not fuzzed against hypothetical
+registry-literal reformatting.
+
+---
+
+## 2026-09-04 — `sfsprobe_onboarding` orientation tool (MCP overhaul Checkpoint 6)
+
+**Addendum, same day, post-independent-verification:** a `grep` audit
+of every quoted error-code-shaped string in `server.py` found the
+onboarding text's 10-code list omitted `WAIT_TIMEOUT`. Most of the
+other omissions (`FILE_ERROR`/`NOT_IN_BUILD`/`NOT_IN_WORLD`/
+`SPAWN_FAILED`/`TYPE_RESOLUTION_FAILED` on `sfsprobe_load_blueprint`,
+`NO_NEW_ARCHIVE`/`NO_SAMPLES` on flight-analysis tools) are reasonably
+left to each tool's own docstring. `WAIT_TIMEOUT` was worth fixing
+specifically: it's similar enough to the already-listed `TIMEOUT` that
+a fresh reader could easily assume it's a duplicate or synonym, when
+it's actually unrelated — a `warning_code` (not `error_code`) from a
+flight-script wait-for-condition step timing out, not a mod
+communication failure. Added a clarifying entry distinguishing the two
+plus a one-line pointer to the tool-specific codes intentionally left
+out. `py_compile`/ast check clean after the edit.
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 6.
+The rest of the overhaul (Checkpoints 1–5) makes commands/fields/docs/IL
+all discoverable through tools, but a brand-new AI session with zero
+project context still had no single place telling it those tools exist,
+what order to reach for them in, or what the server's own error codes
+mean. This closes that gap.
+
+- **Added `sfsprobe_onboarding()`** (`sfsprobe_mcp/server.py`, no
+  params) — returns a short plain-text orientation: what the mod/MCP
+  relationship is conceptually (command.txt/result.txt, without
+  requiring the caller to touch those files), the standing instruction
+  to call `light_search` before guessing any command/field/unit, the
+  concrete distinction between `light_search` (fast, live-registry/doc
+  backed, handles open-ended conceptual queries) and `deep_search`
+  (slower, real decompiled IL, identifier-only), every real error code
+  in current use (`TIMEOUT`, `FILE_NOT_FOUND`, `INVALID_PARAM`,
+  `UNKNOWN_COMMAND`, `UNKNOWN_ERROR`, `ASSEMBLY_NOT_FOUND`,
+  `MONODIS_FAILED`, `NO_ACTIVE_ROCKET`, `PARSE_ERROR`, `MISSING_FIELD`
+  — cross-checked against every literal `"error_code"` in the file, not
+  guessed), and the four telemetry field namespaces
+  (`computed_group`/`computed_output_key`/`script_condition_field`/
+  `literal_telemetry_field` from `_build_field_index`) explicitly called
+  out as distinct from the live registry's separate `truth`/`inputs`
+  namespace tags — an early draft of this text conflated the two, caught
+  before shipping by cross-referencing `_build_field_index`'s four
+  `kind` values against `SFSProbe.cs`'s `Namespace = "truth"/"inputs"`
+  entries directly.
+- **Implemented as a `@mcp.tool`, not an `@mcp.resource`.** The plan
+  left this an open choice; went with a tool because every other
+  capability on this server already is one, tools are guaranteed to
+  appear in a caller's tool list and be called proactively, and
+  resources buy nothing here since there are no parameters to template.
+- Verified: `python -m py_compile` clean; ran the tool function directly
+  (no game required, since it's pure static text) and read the output
+  cold as a zero-context AI — it correctly leads with "search before
+  you guess" and correctly routes to `light_search` first for open-ended
+  questions, `deep_search` only for identifier lookups doc prose
+  doesn't cover.
+
+---
+
+## 2026-09-04 — `light_search`/`deep_search` split, corrected to a two-level type+member index (MCP overhaul Checkpoint 5)
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 5.
+`sfsprobe_search`'s `domain="doc"` (Checkpoint 4) is only as good as
+hand-written prose that can drift from ground truth — this project has
+already found a doc chunk carrying its own `> **CORRECTION**`
+annotation. This checkpoint adds a second tool that goes straight to
+the real decompiled game IL instead.
+
+**Mid-checkpoint course-correction, found discussing the design with
+Christian:** the first implementation matched query terms against type
+names only (via a `monodis --typedef` listing). That's wrong on its own
+merits, not just incomplete — IL has **zero comments and zero tags**
+(decompilation strips them entirely), so unlike `light_search`'s doc
+domain (human prose plus `[CONFIRMED]`/`[PARTIAL]`/`[OPEN]` tags),
+`deep_search` can only ever match identifiers: type/method/field names.
+A query like `"gimbal"` needs to hit `EngineModule`'s `gimbal` FIELD or
+its `RecalculateGimbal` METHOD — not the type name `EngineModule`,
+which doesn't contain "gimbal" at all. A type-name-only index would
+have silently returned nothing for exactly the queries this tool most
+needs to answer. Revised to a genuine two-level index before this
+checkpoint's gate was called done:
+
+- **Renamed `sfsprobe_search` → `light_search`** everywhere in
+  `server.py` (tool name, function name, comments) — a pure rename,
+  behavior identical. `SearchInput` (the Pydantic input class) was
+  never named after the tool, so it keeps its name unchanged.
+- **New: `ASSEMBLY_PATH`** (env-var-overridable via
+  `SFSPROBE_ASSEMBLY_PATH`, same pattern as `SFSPROBE_MOD_DIR`) —
+  defaults to the confirmed real Steam install path for
+  `Assembly-CSharp.dll`. **New: `MONODIS_BIN`** (env-var-overridable
+  via `SFSPROBE_MONODIS`, defaults to `"monodis"` — confirmed present
+  at `/opt/homebrew/bin/monodis`).
+- **`analysis/il_inventory.py` refactored, not reimplemented.** This
+  script already existed (built for the `docs/sfs_reference/` migration)
+  and already parsed every `.class` declaration out of a `monodis` IL
+  dump into name/namespace/kind/extends/nesting/line-number records —
+  exactly the type-level index `deep_search` needs. Its gap: it only
+  *counted* `.method`/`.field` declarations per type, never captured
+  their names. Fix, per Christian's explicit direction ("a small
+  addition to existing logic, not a new architecture"):
+  - Its whole top-level parsing block (previously bare module-level
+    code that ran and **wrote `docs/sfs_reference/inventory.json` on
+    bare import** — a real hazard once another module started
+    importing it) is now `parse_il(il_path, capture_members=False)`,
+    an importable function. The write-to-`docs/sfs_reference/` side
+    effect now only happens under `if __name__ == "__main__":`, so
+    importing this module has zero side effects — required for
+    `server.py` to import it safely at all.
+  - New `capture_members=True` flag: when a `.method`/`.field` line
+    matches, also recovers the real name via `_parse_member_name`
+    (concatenates the declaration's continuation line(s) — a `.method`
+    decl splits its attributes from the return-type/name/params onto a
+    `default ...` line, per `sfs_source_reference.md` §A2's gotcha #1 —
+    until a `(` appears, then takes the last token before it) and
+    appends into new `method_names`/`field_names` lists on that type's
+    record. Default `False`, so a plain call is byte-for-byte identical
+    to the module's original behavior.
+  - **Regression check:** ran the script's own CLI path
+    (`capture_members=False`) against the real
+    `docs/sfs_reference/inventory.json` and diffed against a pre-change
+    backup — identical for all 969 real types except one
+    `mentioned_in_old_doc` flag for `Line`, which changed only because
+    `docs/sfs_source_reference.md` itself has been edited since that
+    file was last generated (expected content drift, not a parsing
+    regression). **Restored the WIP file to its original state
+    afterward** — this checkpoint doesn't touch `docs/sfs_reference/`,
+    per Christian's explicit "don't act on it without asking."
+- **`deep_search(query, top_k)` rebuilt as a two-level identifier
+  search:**
+  1. `_get_member_inventory()` calls `il_inventory.parse_il(path,
+     capture_members=True)` against `deep_search`'s own cached full IL
+     dump (never `scratch/full_il.txt` — see below), filtered through
+     `il_inventory.is_compiler_generated` (also reused, not
+     reimplemented), cached in memory keyed on that cache file's mtime.
+  2. `_score_deep_matches` tries each type's own name first
+     (exact/prefix/substring, then — single-term queries only — a
+     tightened `difflib.SequenceMatcher` fuzzy fallback, ratio >0.7),
+     then falls through to every method/field name across all types.
+     Returns `matched_via` (`"type name"` or `"member name"`) plus the
+     specific `matched_members` list, so a caller can see *why* a type
+     came back — unlike a doc chunk, an IL class summary doesn't
+     explain itself.
+  3. **Multi-word queries use AND, not OR, per term against one
+     candidate name.** Found during verification: an OR/max-score
+     scheme let a genuinely conceptual sentence query — `"why does
+     thrust ramp up slowly"` — return several unrelated types, because
+     common short words like `"up"` exact-matched a real field named
+     `up` (`ArrowkeysDrawer`) and `"thrust"` substring-matched several
+     unrelated `thrust` fields, producing noise that made `deep_search`
+     look like it (partially) answers conceptual questions when it
+     fundamentally cannot. Requiring every term to match within the
+     *same* name fixes this: no single real identifier contains all of
+     an unrelated sentence's words, so AND naturally yields zero
+     matches for that whole query class while still correctly matching
+     legitimate multi-word identifier lookups (e.g. `"Recalculate
+     Gimbal"` still resolves to `EngineModule.RecalculateGimbal`).
+  4. For each matched type, `_extract_class_summary` (unchanged from
+     the first pass) ports this project's manual `sig.sh` convention
+     (`docs/sfs_source_reference.md` §A2) to Python: finds the type's
+     top-level `.class` line in the cached IL dump, then walks forward
+     collecting field declarations and flattened method signatures
+     until either the class's own closing brace or the first NESTED
+     type — whichever comes first. The nested-type stop isn't
+     cosmetic: without it the extractor walks into compiler-generated
+     closure/nested-interface types and misattributes their members to
+     the outer class, a real false positive `sig.sh` itself hit twice
+     during manual research (`AeroModule`/`Aero_Rocket`'s phantom
+     `output` field; `Rocket`'s phantom abstract `set_Rocket`).
+  5. IL dump caching unchanged from the first pass: a full `monodis
+     --output=` dump (~0.3s for the real ~290k-line assembly), cached
+     at `scratch/.deep_search_cache/assembly_full_il.txt` with a JSON
+     sidecar recording the assembly's mtime, re-dumped only when that
+     mtime changes. **Deliberately not `scratch/full_il.txt`** —
+     Christian's own manual-research scratch file — so a repeatable
+     tool call can never clobber work he's mid-way through.
+- Response caps each matched type's returned lines at
+  `DEEP_SEARCH_MAX_LINES` (250) with a `note` giving the real line
+  range in the cache file when a class summary runs longer.
+- **Verification (fresh import of the real `server.py`, not through a
+  live MCP client connection — no game dependency for either tool path,
+  so a fresh-process test is equally valid for correctness; same caveat
+  as Checkpoint 4 about the live subprocess not yet having this code):**
+  `light_search` re-run against all of Checkpoints 2/4's original
+  queries under the new name — all still correct, confirming the rename
+  didn't regress anything. `deep_search("gimbal")` (a query that only
+  ever existed as a *field*, never a type name) correctly resolves to
+  `EngineModule` via `matched_via: "member name"`, listing
+  `gimbal`/`gimbalOn`/`RecalculateGimbal`.
+  `deep_search("RecalculateGimbal")` resolves the same type via its
+  real method name. `deep_search("EngineModule")`'s extracted IL
+  contains `hasGimbal`, `engineOn`, and `throttle_Out` (cross-checked
+  against `sfs_source_reference.md` §D2.1 — exact match, both
+  ultimately read the same real assembly), ~0.08s per call once the IL
+  dump/inventory are cached (~0.45s on a fully cold cache).
+  `deep_search("parachute")` resolves `ParachuteModule` as the clear top
+  hit. `deep_search("why does thrust ramp up slowly")` — the exact
+  conceptual-query regression case — now correctly returns zero
+  matches with a note pointing at `light_search`'s doc domain instead.
+  Confirmed `scratch/full_il.txt`'s mtime unchanged before/after
+  every `deep_search` call and every `il_inventory.parse_il` test run.
+- **Honest scope note, now documented in the tool's own docstring/input
+  schema too (per Christian's explicit ask), not just here:**
+  `deep_search` can only ever match real identifiers (type/method/field
+  names) — it has no access to comments, prose, or intent, because none
+  of that survives decompilation. A query like `"why does thrust ramp
+  up slowly"` will always return nothing here, even though
+  `light_search`'s `domain="doc"` answers it fine from hand-written
+  prose. `deep_search` is for "I roughly know the type/method/field
+  name and want ground truth over a doc's summary of it," never for
+  open-ended "explain this concept" questions.
+
+---
+
+## 2026-09-04 — Documentation indexing in `sfsprobe_search` (MCP overhaul Checkpoint 4)
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 4.
+
+- **New: `_chunk_doc_file(path)`** — splits one Markdown doc into flat
+  chunks, one per `##`/`###`/`####` heading (a chunk runs from its
+  heading to the next heading of ANY level, not a nested tree, per the
+  checkpoint's spec). Each chunk carries `heading`/`level`/`body`/
+  `source_file`/`tags`, with `tags` pulling any
+  `[CONFIRMED]`/`[PARTIAL]`/`[OPEN]` markers found in the heading line
+  or the first 500 chars of the body (where this project's docs
+  actually put them).
+- **New: `_resolve_docs()`** — chunks every file in the new `DOC_PATHS`
+  constant (`docs/sfs_physics_reference.md`,
+  `docs/sfs_source_reference.md`), cached in-memory for
+  `DOC_CACHE_TTL_S` (5s, same pattern as `REGISTRY_CACHE_TTL_S`) so
+  repeated searches don't re-read+re-chunk the 7,193-line source-
+  reference file every call, but an edit to either doc still shows up
+  within a few seconds without restarting the server. A missing file is
+  skipped, not fatal.
+- **`sfsprobe_search`'s `doc` domain** now returns real chunks (`docs`/
+  `total_docs`) instead of the Checkpoint-2-era empty stub with a
+  `docs_note` explaining it wasn't built yet. Reuses the existing
+  `_score_items` term-overlap scorer with `primary_key="heading"` — no
+  new scoring logic needed, same as commands (`"name"`) and fields
+  (`"key"`).
+- 214 total chunks across both files (chunk body sizes: min 0, median
+  ~1.3KB, max ~7.3KB — no runaway giant chunks that would blow out a
+  tool response).
+- **Verification (fresh import of the real `server.py`, not through a
+  live MCP client connection — see caveat below):**
+  `sfsprobe_search("three layer engine control", domain="doc")` returns
+  physics-reference §2.2 Thrust as the top hit, which is genuinely the
+  section containing the throttle/master/engineOn three-layer control
+  model (confirmed by reading the actual text at that heading, not just
+  trusting the heading title). `sfsprobe_search("SOI crossing physics
+  mode", domain="doc")` returns both physics-reference §5.4 SOI
+  transitions and terrain and source-reference §D4.3 SOI — the
+  transition mechanism among its top hits. `domain="all"` on
+  `"parachute"` returns 44 commands / 67 fields / 214 docs as three
+  separate lists (each independently scored/truncated to `top_k`), so
+  the much larger doc corpus can't crowd out commands or fields the way
+  a single flat merged ranking might.
+- **Honest gap, same shape as Checkpoint 3's lesson:** this was verified
+  by importing `server.py` fresh in a throwaway process, not through
+  the actual long-lived `sfsprobe_mcp` subprocess a real MCP client
+  stays connected to (two such processes were already running from
+  before this checkpoint's edits — `ps aux` showed them predating this
+  session's changes). Unlike Checkpoint 3's fast-fail validation, this
+  domain has zero game-state dependency (pure file parsing, no
+  `command.txt`/`probe.log` round-trip), so a fresh-process test is
+  equally valid for correctness — but the live client connection still
+  won't see any of this code until it's restarted. Flagging so this
+  doesn't get silently assumed to already be live.
+
+---
+
+## 2026-09-04 — Fast-fail command validation (MCP overhaul Checkpoint 3)
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 3.
+
+- **New: `_resolve_commands()`**, factored out of `sfsprobe_search`'s
+  command domain so it's shared, not duplicated, between search and
+  validation (both now agree on exactly what counts as a known
+  command). `sfsprobe_search`'s command-domain block now just calls it.
+- **New: `_validate_command_line()`** — checks a command's leading word
+  against the known set before `sfsprobe_send_command` ever writes to
+  `command.txt`. On a miss: immediate `UNKNOWN_COMMAND` error with
+  `difflib.get_close_matches` suggestions, zero game round-trip. Fails
+  OPEN (skips the check entirely) if the command set can't be resolved
+  at all (game unreachable AND `SFSProbe.cs` unreadable) — never blocks
+  a real command over an infra hiccup.
+- **`sfsprobe_send_batch`** gets the same check applied to every command
+  in the batch up front: if ANY leading word is unknown, the WHOLE batch
+  is rejected (listing every bad entry + its suggestions) and NOTHING is
+  sent — not even the valid entries — since a typo mid-launch-sequence
+  is exactly the kind of mistake worth stopping before anything fires.
+- **Honest gap found during live verification, not papered over:** the
+  checkpoint plan's own worked example — send `'telemetry snapshot'`
+  and confirm a fast-fail pointing at `telemetrysnapshot` — does NOT
+  actually fast-fail. `telemetry` (the leading word) IS a real command;
+  the mistake is the second word/argument, which leading-word-only
+  validation is structurally unable to catch. Confirmed live: `'telemetry
+  snapshot'` still times out after 5s exactly as before this checkpoint.
+  What DOES work, confirmed live: a genuine leading-word typo
+  (`'telemetrysnapsho'`) fast-fails in 0.46s with suggestions
+  `telemetrysnapshot, telemetry, snapshot`; a bad word inside a batch
+  (`'ignit'`) correctly blocks the whole batch with suggestion `ignite`;
+  real commands (`ping`, `gimbalinfo`, `achievements`) still round-trip
+  normally, unaffected. **This is a scope limitation of leading-word
+  validation as specified, not a bug in this implementation** — a full
+  fix would need per-command argument-shape validation (e.g. knowing
+  `telemetry`'s only valid second words are `on`/`off`), which is a
+  materially bigger feature than what Checkpoint 3 scoped. Flagging
+  here rather than silently claiming the plan's literal example works.
+
+**Correction, 2026-09-04, found by Christian independently testing
+Checkpoint 3 from a separate live MCP session:** the paragraph above
+was written from a fresh, short-lived `python3 -c` process that
+re-imports `server.py` on every run. The MCP server Christian's client
+actually talks to is a long-lived subprocess spawned once by Claude
+Desktop -- two of them, both started 19:32:35, well before this
+checkpoint's code existed. Python doesn't hot-reload a running
+process, so those two processes were still serving the PRE-Checkpoint-3
+`server.py` the whole time my own tests "confirmed" it working --
+proven by Christian sending `telemetyr on partCount` / `asdfqwerty`
+through his session and finding BOTH commands really reached the game
+(matching `unknown command: ...` lines in `probe.log` at the exact
+timestamps), when a working fast-fail should never touch
+`command.txt`/`probe.log` at all.
+
+**Re-verified with the log-based method Christian specified** (send a
+bad command, confirm NO matching line appears in `probe.log`, not just
+trust the JSON response) after he restarted both his SFS session and
+his MCP client connections: `reverifybadcmd777` produced zero trace in
+`probe.log` (only the expected `describe` cache-refresh line), 0.42ms
+once the registry cache was warm. The validation logic itself was
+correct the whole time (case (c) from the original diagnosis: present
+in the file, not live in the already-running process) -- the lesson is
+that verifying against a fresh throwaway process is not equivalent to
+verifying against the actual long-lived server process a real client
+connects to. **Going forward, Checkpoint verification should include
+checking for and accounting for already-running `sfsprobe_mcp` server
+processes** (`ps aux | grep sfsprobe_mcp`), not just testing fresh
+imports.
+
+**Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 2 of the
+MCP overhaul (Checkpoint 1 — `SFSProbe.cs`'s `CommandRegistry`/
+`FieldRegistry` + `describe` command — already done and live-verified,
+see `sfsprobe/mod_changelog.md` v0.57.0).
+
+- **New tool: `sfsprobe_search(query, domain, top_k)`** in
+  `sfsprobe_mcp/server.py`, `domain` ∈ `command`/`field`/`doc`/`all`.
+  Replaces `sfsprobe_command_search` and `sfsprobe_telemetry_field_search`
+  (both removed outright — this project has no external consumers to
+  keep a deprecated wrapper for).
+- **Resolution order:** tries the mod's `describe` command first (via
+  `_get_registry()`, new helper) — the live `CommandRegistry`/
+  `FieldRegistry` dump, cached in-memory for `REGISTRY_CACHE_TTL_S`
+  (5s) so a rapid sequence of searches doesn't each pay a real game
+  round-trip, but never serves data from a previous game session past
+  that TTL. Falls back to the existing regex parsers
+  (`_parse_probe_commands`, `_build_field_index` — kept, not deleted)
+  only when the game/mod isn't reachable (not running, mod too old to
+  have `describe`, or a timeout). Every response's `"source"` field
+  says which path served it: `"live_registry"` or `"static_fallback"`.
+- **New: `_score_items()`**, a single shape-agnostic term-overlap
+  scorer shared by both the `command` and `field` domains regardless of
+  which source (live registry vs. fallback parser) produced the items
+  — replaces the two old per-shape scorers (`_search_probe_commands`,
+  `_search_field_index`, both removed) that each had to special-case
+  every entry "kind." `_normalize_fallback_field()` gives fallback
+  field entries (which have no single shared identity field across
+  their five different kinds) a synthetic `key` so the same scorer
+  works on them too.
+- **`domain="doc"` is part of the schema now but not yet implemented**
+  — returns an empty, clearly-labeled result (`docs_note` explains
+  why) rather than an error, so this is Checkpoint 4's job and callers
+  built against the final four-domain shape won't need to change.
+- Verified offline (game not running): `domain="field"` query
+  `"parachute"` correctly falls back (`"source": "static_fallback"`)
+  and surfaces `parachuteAlphaDeg`/etc. with their real
+  `computed:parachuteDrag` request path; `domain="command"` and
+  `domain="all"` also verified.
+- **Live-verified 2026-09-04** (game running, mod v0.57.0, real
+  `describe` round-trip): all four queries that caused real mistakes
+  this session now return correct, actionable answers, every one
+  tagged `"source": "live_registry"` — `parachuteAlphaDeg` carries the
+  "ANGULAR ACCELERATION, NOT an angle" unit warning; `gimbalThrottleOut`
+  correctly resolves to `computed:gimbal` instead of being requestable
+  bare; `partCount` correctly shows both its real namespaces
+  (script-condition vs. truth/scoped-with-special-case); and
+  `telemetrysnapshot` resolves correctly under `domain="command"` (the
+  exact `telemetry snapshot`-vs-`telemetrysnapshot` confusion this tool
+  exists to prevent). `domain="command"` returned 44 entries,
+  `domain="field"` returned 67 — matching Checkpoint 1's counts exactly.
+  `domain="all"` correctly bundles commands + fields + the doc stub.
+  **Checkpoint 2's verification gate is now fully satisfied**, both
+  fallback and live-registry paths.
+
+---
+
+## 2026-09-02 — `--test_against_run`: control-input replay, real per-thruster RCS, mass-penalty fix
 
 - **New: `getforwardstartinfo`-driven craft_config.** Added
   `load_craft_config_from_getforwardstartinfo()`, translating the

@@ -30,7 +30,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.54.0";
+        public const string VersionString = "0.58.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +52,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (parachute drag validation prep: computed:parachuteDrag now also exposes parachuteForceX/Y -- the torque-side validation on the first descent flight was inconclusive (chute stabilizes the craft, too little rotation signal), so the real test is the LINEAR deceleration the flight actually showed (100->30 m/s near-instantly); combine parachuteForceX/Y with plain rb2d.velocity.x/y,rb2d.mass telemetry paths for a direct predicted-vs-real deceleration check, same methodology as the original 0.098% drag validation; gimbal timing (v0.50.0/0.51.0) fully closed IL+live 2026-08-31/09-01; Tier 1 physics has no unread IL left anywhere as of this build) ===");
+            Log("=== v" + VersionString + " loaded (fix: 'telemetry' command now rejects an unrecognized mode word instead of silently treating it as 'off' -- found 2026-09-04 via live MCP fast-fail testing; 'telemetry snapshot' used to silently StopRecording() an active flight, or silently no-op + timeout if already off; see mod_changelog.md v0.58.0) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -696,6 +696,385 @@ namespace SFSProbe
             telemetryFields = null;   // next hotkey (Enter) always starts back in full mode
         }
 
+        // ================================================================
+        //  Self-description registry (v0.57.0, MCP overhaul Checkpoint 1)
+        // ----------------------------------------------------------------
+        // Structured, honest metadata for every real command and every
+        // real computed-telemetry-field output key -- the new PRIMARY
+        // source of truth for "what commands/fields exist and what do
+        // they mean", superseding sfsprobe_mcp/server.py's regex-parsed
+        // comments (which remain only as a fallback, used when the game
+        // isn't running, and as a drift auditor). Dumped live via the new
+        // 'describe' command below. See docs/mcp_overhaul_checkpoint_
+        // prompt.md Checkpoint 1 for full design rationale -- in
+        // particular: Unit is REQUIRED and reflects the REAL computed
+        // unit, never what the key's name implies. This directly targets
+        // the parachuteAlphaDeg-is-actually-an-angular-acceleration class
+        // of bug that motivated this whole registry.
+        // Additive only -- built by reading every existing case block
+        // below, without changing any of their logic.
+        // ================================================================
+
+        public struct ProbeCommandInfo
+        {
+            public string Name;
+            public string Syntax;
+            public string Description;
+            public string Category;
+        }
+
+        public struct ProbeFieldInfo
+        {
+            public string Key;
+            // Which of the four telemetry field namespaces this entry lives in:
+            //   "script-condition" -- GetScriptFieldValue, script/trigger conditions only
+            //   "computed"         -- AppendComputedField groups, requested as
+            //                         computed:<Group> in a scoped 'telemetry on <fields>' list
+            //   "truth"            -- BuildTruthSample, full-schema 'telemetry on' (no field
+            //                         list), written to truth.jsonl
+            //   "inputs"           -- BuildInputsSample, full-schema only, written to inputs.jsonl
+            public string Namespace;
+            // Non-empty only for "computed" entries: the computed:<Group> name that
+            // produces this key alongside its sibling keys in the same group.
+            public string Group;
+            public string Unit;
+            public string Description;
+            // How a caller actually reaches this exact value -- the same field NAME
+            // can exist in more than one namespace via a genuinely different code
+            // path (e.g. h/vv/t/m/rot/angv/partCount all exist in both
+            // "script-condition" and "truth"; they agree on the value but are NOT
+            // the same mechanism, and scoped-mode 'telemetry on <fields>' does NOT
+            // go through "truth"'s code at all -- see Checkpoint 1 catalog
+            // Uncertainty #1).
+            public string RequestAs;
+        }
+
+        public static readonly ProbeCommandInfo[] CommandRegistry = new ProbeCommandInfo[]
+        {
+            new ProbeCommandInfo { Name = "ping", Category = "diagnostics",
+                Syntax = "ping",
+                Description = "Liveness check. Returns scene name, active rocket count, Time.fixedDeltaTime, game version, mod version." },
+            new ProbeCommandInfo { Name = "snapshot", Category = "diagnostics",
+                Syntax = "snapshot",
+                Description = "Forces an immediate full-schema flight dump (DumpFlight), independent of the polling/telemetry loop." },
+            new ProbeCommandInfo { Name = "world", Category = "diagnostics",
+                Syntax = "world",
+                Description = "Forces an immediate world dump (DumpWorld), resetting the 'already wrote world once' guard so it re-dumps even if unchanged." },
+            new ProbeCommandInfo { Name = "menu", Category = "diagnostics",
+                Syntax = "menu",
+                Description = "Forces an immediate menu-state dump (DumpMenu)." },
+            new ProbeCommandInfo { Name = "telemetry", Category = "telemetry",
+                Syntax = "telemetry on | telemetry on <field1>,<field2>,... [| <cond>@<sec>:<cmd>; ...] | telemetry off",
+                Description = "Starts/stops per-tick recording to truth.jsonl (+inputs.jsonl in full mode). No field list = full schema (every field this mod knows). A field list = scoped mode, one row per tick, computed:<name> allowed. Optional '| ...' suffix adds auxiliary triggers that fire on-demand commands while a script-condition expression holds true ('| auto' = built-in default, '| none' = disabled). Second word must be 'on', 'off', or omitted (defaults to 'off') -- v0.58.0+ rejects anything else as an error instead of silently stopping recording." },
+            new ProbeCommandInfo { Name = "throttle", Category = "control",
+                Syntax = "throttle <0-1 float>",
+                Description = "Sets throttlePercent (amount only). Does NOT touch master ignition (throttleOn)." },
+            new ProbeCommandInfo { Name = "master", Category = "control",
+                Syntax = "master on | master off",
+                Description = "Sets rocket-wide throttleOn (master ignition 'start'), independent of throttle amount and per-engine engineOn." },
+            new ProbeCommandInfo { Name = "diag", Category = "diagnostics",
+                Syntax = "diag",
+                Description = "Per-part index + count of EngineModules found via ModuleValues, for cross-checking against the snapshot dump's own part/engine counts." },
+            new ProbeCommandInfo { Name = "autostop", Category = "control",
+                Syntax = "autostop on | autostop turnover | autostop land | autostop off",
+                Description = "Arms/disarms the probe's own autostop-on-condition behavior. 'on'/'turnover' = ascent-phase auto-stop, 'land' = descent-phase auto-stop, 'off' = disarm." },
+            new ProbeCommandInfo { Name = "ignite", Category = "control",
+                Syntax = "ignite",
+                Description = "Sets EngineModule.engineOn = true on every engine on the active rocket (bypasses staging). Independent of throttle amount and master ignition." },
+            new ProbeCommandInfo { Name = "revert", Category = "control",
+                Syntax = "revert",
+                Description = "Calls GameManager.RevertToLaunch(false) via reflection." },
+            new ProbeCommandInfo { Name = "achievements", Category = "diagnostics",
+                Syntax = "achievements",
+                Description = "Dumps every SFS.Logs.Challenge (id, title, description, planet, difficulty, returnSafely, stepCount) plus which are complete for the active save. Writes sfs_probe_achievements.json. Not a Steamworks achievement -- purely in-game state." },
+            new ProbeCommandInfo { Name = "geometry", Category = "diagnostics",
+                Syntax = "geometry",
+                Description = "Dumps whatever GeometryCapture has passively captured so far (a Harmony postfix on Part.InitializePart). Never triggers capture itself; largely superseded by dragarea/aerotorque's direct-call path, kept for reference. Writes sfs_probe_geometry.json." },
+            new ProbeCommandInfo { Name = "dragarea", Category = "physics-query",
+                Syntax = "dragarea",
+                Description = "One-shot dump of the real dragArea/center-of-drag via direct reflection calls into the game's own Aero_Rocket.GetDragSurfaces -> AeroModule.GetExposedSurfaces -> AeroModule.CalculateDragForce chain. Includes up to 10 sample raw segments. Writes sfs_probe_dragarea.json." },
+            new ProbeCommandInfo { Name = "loadblueprint", Category = "blueprint",
+                Syntax = "loadblueprint <path with possible spaces>",
+                Description = "World_PC ONLY. Deserializes a Blueprint JSON file and spawns it as an ADDITIONAL live physics rocket via RocketManager.SpawnBlueprint. NOT safe for routine mid-flight use (moves the camera, no cost/achievement tracking, functionally a cheat if used repeatedly)." },
+            new ProbeCommandInfo { Name = "loadblueprintbuild", Category = "blueprint",
+                Syntax = "loadblueprintbuild <path with possible spaces>",
+                Description = "Build_PC ONLY. Loads a Blueprint JSON into the editor via BuildState.LoadBlueprint, REPLACING the current design (calls BuildState.Clear() first). Pre-validates part names against the live parts catalog before calling, since Clear() runs before any other failure can be detected." },
+            new ProbeCommandInfo { Name = "getplacedmagnets", Category = "blueprint",
+                Syntax = "getplacedmagnets",
+                Description = "Build_PC ONLY, needs at least one part placed. Dumps MagnetModule.points for every ACTUALLY PLACED part in the editor (not bare catalog prefabs -- see getparts for that). Writes sfs_probe_placed_magnets.json." },
+            new ProbeCommandInfo { Name = "dumpblueprint", Category = "blueprint",
+                Syntax = "dumpblueprint",
+                Description = "Reads the CURRENT editor design as a real Blueprint via BuildState.main.GetBlueprint(true), serialized with the game's own JsonWrapper.ToJson. Writes sfs_probe_current_blueprint.json. Reliable way to get real per-part properties instead of guessing." },
+            new ProbeCommandInfo { Name = "getparts", Category = "blueprint",
+                Syntax = "getparts",
+                Description = "Full parts-catalog index: for every catalog part (not a placed instance), name/mass/centerOfMass/parametric variables/magnet points, plus PartsLoader.partVariants. Deliberately NOT run automatically on scene load -- heavier, command-gated. Writes sfs_probe_parts_index.json." },
+            new ProbeCommandInfo { Name = "aeroformula", Category = "physics-query",
+                Syntax = "aeroformula",
+                Description = "Reads the 4 serialized AeroFormula coefficients (velPow, densityPow, tempOffset, m) AeroModule.GetTemperature needs -- live Unity-serialized data, not IL literals. Writes sfs_probe_aeroformula.json." },
+            new ProbeCommandInfo { Name = "atmophysics", Category = "physics-query",
+                Syntax = "atmophysics",
+                Description = "Reads the active rocket's current planet's atmospherePhysics block: height/density/curve (already difficulty-scaled) plus minHeatingVelocityMultiplier and shockwaveIntensity. Writes sfs_probe_atmophysics.json." },
+            new ProbeCommandInfo { Name = "terrain", Category = "physics-query",
+                Syntax = "terrain | terrain <comma-separated degree offsets, e.g. -30,-10,0,10,30>",
+                Description = "Real per-angle terrain height sweep around the craft's current angular position via Planet.GetTerrainHeightAtAngles (clampToWater true and false), plus a cross-check against Location.GetTerrainHeight. Writes sfs_probe_terrain.json." },
+            new ProbeCommandInfo { Name = "terraingeo", Category = "physics-query",
+                Syntax = "terraingeo",
+                Description = "GetTerrainNormal (actually returns a TANGENT vector along the surface in global XY, not a perpendicular normal -- misnamed in the game's own API), GetTerrainColor, IsInsideTerrain (at the real craft position, a synthetic point below the surface, and one far above maxTerrainHeight), GetMaxLOD. Writes sfs_probe_terraingeo.json." },
+            new ProbeCommandInfo { Name = "difficulty", Category = "physics-query",
+                Syntax = "difficulty",
+                Description = "Reads the actual difficulty-scaled heat multipliers (HeatVelocityMultiplier, MinHeatVelocityMultiplier, IspMultiplier, DryMassMultiplier) instead of assuming Normal=1.0, plus aeroData.testShock/testReentry debug-override flags. Writes sfs_probe_difficulty.json." },
+            new ProbeCommandInfo { Name = "jointgraph", Category = "physics-query",
+                Syntax = "jointgraph",
+                Description = "Dumps the live joint connectivity graph (Rocket.jointsGroup.joints): each PartJoint is an undirected edge (part A name, part B name, anchor position), no strength/type field. Writes sfs_probe_jointgraph.json." },
+            new ProbeCommandInfo { Name = "turn", Category = "control",
+                Syntax = "turn <float>",
+                Description = "Writes arrowkeys.turnAxis directly -- the same state Rocket.ApplyTorque reads. No clamp applied. Has zero physical effect via the torque path on a rocket with no TorqueModule (e.g. no RCS/reaction wheel); the only remaining path is gimbal deflection while an engine's throttle_Out > 0." },
+            new ProbeCommandInfo { Name = "setrot", Category = "control",
+                Syntax = "setrot <degrees>",
+                Description = "INSTANT snap -- writes rb2d.rotation directly (degrees) and zeroes rb2d.angularVelocity. Does not simulate getting there." },
+            new ProbeCommandInfo { Name = "script", Category = "scripting",
+                Syntax = "script <spec> (rest of line, unsplit -- see LoadScript for full condition/command grammar)",
+                Description = "Arms a queued conditional flight plan, evaluated tick-by-tick via GetScriptFieldValue/EvalOp." },
+            new ProbeCommandInfo { Name = "scriptstatus", Category = "scripting",
+                Syntax = "scriptstatus",
+                Description = "Dumps pending/done counts and each queued step's field/op/value/commands/done state." },
+            new ProbeCommandInfo { Name = "scriptclear", Category = "scripting",
+                Syntax = "scriptclear",
+                Description = "Clears the script queue." },
+            new ProbeCommandInfo { Name = "rcsinfo", Category = "physics-query",
+                Syntax = "rcsinfo",
+                Description = "Static per-RcsModule dump: directionAngleThreshold, torqueAngleThreshold, thrust, ISP, local thrustPosition, per-thruster local thrustNormal. Empty (0 modules) if the rocket has no RCS parts. Writes sfs_probe_rcsinfo.json." },
+            new ProbeCommandInfo { Name = "rcsforce", Category = "physics-query",
+                Syntax = "rcsforce",
+                Description = "Live replication of RcsModule.FixedUpdate's exact per-module force/mass-flow computation, calling the SAME private TorqueThrust/DirectionThrust selection methods via reflection (not a reimplementation): per-thruster firing decision, world-space thrust normal, per-module predicted force and mass flow, plus a rocket-wide total. Writes sfs_probe_rcsforce.json." },
+            new ProbeCommandInfo { Name = "aerotorque", Category = "physics-query",
+                Syntax = "aerotorque",
+                Description = "On-demand version of TryComputeAeroTorque: dragArea, air density, drag force vector, center-of-drag (world space and post-20%-lerp), world center of mass, rb2d.inertia, predicted torque, predictedAngularAccelDegPerSec2. NOT valid mid-parachute-deployment. Writes sfs_probe_aerotorque.json." },
+            new ProbeCommandInfo { Name = "gimbalinfo", Category = "physics-query",
+                Syntax = "gimbalinfo",
+                Description = "Full commanded-steering -> gimbal-angle chain dump per gimbaling EngineModule: gimbalOn, throttleOut, turnAxisInput, time/targetTime (unitless 0-1 animation-progress fractions, NOT seconds or degrees), animationTime (seconds), unscaledTime flag, and the real rotate-curve keyframes. Writes sfs_probe_gimbalinfo.json. Reports 'no gimbaling engines found' if none have hasGimbal." },
+            new ProbeCommandInfo { Name = "getforwardstartinfo", Category = "physics-query",
+                Syntax = "getforwardstartinfo",
+                Description = "Full static craft-config snapshot for forward_sim.py's Python integrator: rocket mass, rb2d.inertia, world center of mass, rotation, summed enabled torque, plus per-part arrays for engines/RCS modules/parachutes. Known scope limits (in-code): does NOT capture AoA-dependent dragArea; engine 'scale' term hardcoded to 1.0 (exact only for unscaled parts); positionLocalBody valid only until the next staging event. Call before ignition for the cleanest read. Writes sfs_probe_forwardstartinfo.json." },
+            new ProbeCommandInfo { Name = "parachutedrag", Category = "physics-query",
+                Syntax = "parachutedrag",
+                Description = "On-demand version of TryComputeParachuteDrag -- same shape as aerotorque but with the confirmed chute-compounding step applied on top. chutesActive:0 harmlessly reduces to the plain aero-torque case if no chute is deployed. Writes sfs_probe_parachutedrag.json." },
+            new ProbeCommandInfo { Name = "assignkey", Category = "keybind",
+                Syntax = "assignkey <key> <full command string, including its own args>",
+                Description = "Binds a keyboard key so the PLAYER can trigger any probe command at a precise moment (e.g. exact full deflection), dispatched through the normal Command() path." },
+            new ProbeCommandInfo { Name = "unassignkey", Category = "keybind",
+                Syntax = "unassignkey <key>",
+                Description = "Removes one key binding." },
+            new ProbeCommandInfo { Name = "listkeys", Category = "keybind",
+                Syntax = "listkeys",
+                Description = "Lists all active key -> command bindings." },
+            new ProbeCommandInfo { Name = "clearkeys", Category = "keybind",
+                Syntax = "clearkeys",
+                Description = "Removes all key bindings." },
+            new ProbeCommandInfo { Name = "airtemp", Category = "physics-query",
+                Syntax = "airtemp",
+                Description = "One-shot real-time read of AeroModule.GetTemperatureAndShockwave's actual air-temperature output for the active rocket (same helper the realAirTemp truth field uses), without needing telemetry recording active." },
+            new ProbeCommandInfo { Name = "telemetrysnapshot", Category = "telemetry",
+                Syntax = "telemetrysnapshot",
+                Description = "A genuine one-tick peek: builds exactly the same inputs/truth JSON a real recorded sample would contain (via the SAME BuildInputsSample/BuildTruthSample functions Sample() itself uses) WITHOUT touching Telemetry state, sampleCount, or either file. Works whether recording is on, off, or already running. Writes sfs_probe_telemetry_snapshot.json." },
+            new ProbeCommandInfo { Name = "cheat", Category = "control",
+                Syntax = "cheat <ExactCaseSensitiveCheatName> (e.g. 'cheat InfiniteFuel')",
+                Description = "Calls SandboxSettings.main.Toggle<arg>() via reflection. arg is deliberately NOT lowercased -- reflection method-name lookup is case-sensitive. Known gap: InfiniteOxygen can never work (a UI button exists but no matching Toggle... method on SandboxSettings -- a real naming inconsistency in the game itself, not fixable probe-side). Valid <arg> values are whatever Toggle* methods exist on the live SandboxSettings type; not enumerable statically." },
+            new ProbeCommandInfo { Name = "describe", Category = "diagnostics",
+                Syntax = "describe",
+                Description = "Dumps this entire self-description registry (every command + every telemetry field, across all 4 namespaces, each with its real unit/type) as JSON. Writes sfs_probe_describe.json. Call this FIRST, before guessing at any command or field name -- it is the live, authoritative source of truth, current as of this exact running mod build." },
+        };
+
+        public static readonly ProbeFieldInfo[] FieldRegistry = new ProbeFieldInfo[]
+        {
+            // ---- Namespace: script-condition (GetScriptFieldValue) ----
+            // Used by script/telemetry's auxiliary-trigger condition grammar
+            // (<field><op><value>), NOT by scoped telemetry's field list.
+            new ProbeFieldInfo { Key = "h", Namespace = "script-condition", Unit = "meters",
+                Description = "location.Height", RequestAs = "script/trigger condition only, e.g. 'h<1000@0:cmd'" },
+            new ProbeFieldInfo { Key = "vv", Namespace = "script-condition", Unit = "m/s",
+                Description = "location.VerticalVelocity", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "t", Namespace = "script-condition", Unit = "seconds",
+                Description = "location.time", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "m", Namespace = "script-condition", Unit = "tonnes",
+                Description = "rb2d.mass", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "rot", Namespace = "script-condition", Unit = "degrees",
+                Description = "rb2d.rotation", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "angv", Namespace = "script-condition", Unit = "deg/s",
+                Description = "rb2d.angularVelocity", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "gimbaling", Namespace = "script-condition", Unit = "bool (1.0/0.0)",
+                Description = "1.0 iff TryGetPrimaryGimbal finds an ON gimbaling engine (v0.53.0+)", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "rcsfiring", Namespace = "script-condition", Unit = "count (float)",
+                Description = "CountFiringThrusters(rocket) -- number of RCS thrusters currently firing (targetTime > 0.5)", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "v", Namespace = "script-condition", Unit = "m/s",
+                Description = "sqrt(vx^2+vy^2) from location.velocity", RequestAs = "script/trigger condition only" },
+            new ProbeFieldInfo { Key = "partCount", Namespace = "script-condition", Unit = "count (int, -1 on failure)",
+                Description = "partHolder.parts.Count", RequestAs = "script/trigger condition only -- for SCOPED telemetry, this same name is handled by a separate dedicated special-case, see the 'truth' namespace entry below" },
+
+            // ---- Namespace: computed (AppendComputedField groups) ----
+            // Requested in scoped 'telemetry on ...' field lists as computed:<Group>.
+            // Each group appends multiple named JSON keys per tick. Highest-value
+            // registry entries -- several key names are misleading vs. their real unit.
+            new ProbeFieldInfo { Key = "dragArea", Namespace = "computed", Group = "dragArea", Unit = "m^2-equivalent (drag-force scale per sfs_physics_reference.md 2.3)",
+                Description = "TryComputeDragArea's drag magnitude; null if the reflection chain failed", RequestAs = "telemetry on ...,computed:dragArea" },
+            new ProbeFieldInfo { Key = "dragCopX", Namespace = "computed", Group = "dragArea", Unit = "world-space meters",
+                Description = "center-of-drag x, PRE-Lerp (raw exposed-surface-weighted CoP, not yet blended 20% toward CoM)", RequestAs = "telemetry on ...,computed:dragArea" },
+            new ProbeFieldInfo { Key = "dragCopY", Namespace = "computed", Group = "dragArea", Unit = "world-space meters",
+                Description = "center-of-drag y, PRE-Lerp", RequestAs = "telemetry on ...,computed:dragArea" },
+            new ProbeFieldInfo { Key = "dragSurfaces", Namespace = "computed", Group = "dragArea", Unit = "count (int)",
+                Description = "total raw drag surfaces before occlusion filtering", RequestAs = "telemetry on ...,computed:dragArea" },
+            new ProbeFieldInfo { Key = "dragExposed", Namespace = "computed", Group = "dragArea", Unit = "count (int)",
+                Description = "surfaces remaining after GetExposedSurfaces occlusion filtering", RequestAs = "telemetry on ...,computed:dragArea" },
+            new ProbeFieldInfo { Key = "engines", Namespace = "computed", Group = "engines", Unit = "array of objects",
+                Description = "Per-part array; each element is {part,type,...} where type='engine' (engineOn bool, thrustDirX/Y unit direction, gimbalOn bool, throttleOut 0-1 float) or type='booster' (boosterPrimed bool, thrustVectorX/Y)", RequestAs = "telemetry on ...,computed:engines" },
+            new ProbeFieldInfo { Key = "heatParts", Namespace = "computed", Group = "heatParts", Unit = "array of objects",
+                Description = "Per-part-or-HeatModule array: name (string), temperature (deg C, CAN be literal string '+Inf'/'-Inf' -- real sentinel values, not errors), heatTolerance (deg C threshold, 400/1000/6000 for Low/Mid/High), isHeatShield (bool), exposedSurface ([PARTIAL] a length-like unit -- summed dx of drag-cull-surviving segments for that part, NOT a literal m^2 surface area)", RequestAs = "telemetry on ...,computed:heatParts" },
+            new ProbeFieldInfo { Key = "aeroTorque", Namespace = "computed", Group = "aeroTorque", Unit = "N*m-equivalent (2D cross-product torque, sfs_physics_reference.md 2.5)",
+                Description = "predicted torque about the world center of mass; null on failure", RequestAs = "telemetry on ...,computed:aeroTorque" },
+            new ProbeFieldInfo { Key = "aeroAlphaDeg", Namespace = "computed", Group = "aeroTorque", Unit = "deg/s^2 -- ANGULAR ACCELERATION, not an angle",
+                Description = "alphaPred * 57.29578 -- predicted angular acceleration from torque/inertia", RequestAs = "telemetry on ...,computed:aeroTorque" },
+            new ProbeFieldInfo { Key = "rbInertia", Namespace = "computed", Group = "aeroTorque", Unit = "Unity rb2d.inertia units (kg*m^2-equivalent)",
+                Description = "the actual moment of inertia used in the alpha calc", RequestAs = "telemetry on ...,computed:aeroTorque" },
+            new ProbeFieldInfo { Key = "gimbalOn", Namespace = "computed", Group = "gimbal", Unit = "bool",
+                Description = "primary gimbaling engine's gimbalOn; null if no gimbaling engine exists at all. 'Primary' = first ON gimbaling engine, falling back to the first gimbaling engine found (even if off) if none are on (v0.56.1 fix)", RequestAs = "telemetry on ...,computed:gimbal" },
+            new ProbeFieldInfo { Key = "gimbalThrottleOut", Namespace = "computed", Group = "gimbal", Unit = "0-1 float",
+                Description = "primary gimbaling engine's throttle_Out", RequestAs = "telemetry on ...,computed:gimbal" },
+            new ProbeFieldInfo { Key = "gimbalTurnAxisInput", Namespace = "computed", Group = "gimbal", Unit = "-1 to 1 float",
+                Description = "primary gimbaling engine's turnAxis_Input", RequestAs = "telemetry on ...,computed:gimbal" },
+            new ProbeFieldInfo { Key = "gimbalTime", Namespace = "computed", Group = "gimbal", Unit = "UNITLESS 0-1 fraction, NOT seconds or degrees",
+                Description = "MoveModule.time -- chases targetTime linearly at rate 1/animationTime", RequestAs = "telemetry on ...,computed:gimbal" },
+            new ProbeFieldInfo { Key = "gimbalTargetTime", Namespace = "computed", Group = "gimbal", Unit = "UNITLESS 0-1 fraction",
+                Description = "MoveModule.targetTime -- the commanded target the animation is moving toward", RequestAs = "telemetry on ...,computed:gimbal" },
+            new ProbeFieldInfo { Key = "parachuteTorque", Namespace = "computed", Group = "parachuteDrag", Unit = "N*m-equivalent",
+                Description = "predicted torque including chute compounding; null on failure", RequestAs = "telemetry on ...,computed:parachuteDrag" },
+            new ProbeFieldInfo { Key = "parachuteAlphaDeg", Namespace = "computed", Group = "parachuteDrag", Unit = "deg/s^2 -- ANGULAR ACCELERATION, NOT an angle despite the name",
+                Description = "alphaPred * 57.29578. This is the exact key that motivated this registry's Unit field: the name looks like an angle but is an angular acceleration.", RequestAs = "telemetry on ...,computed:parachuteDrag" },
+            new ProbeFieldInfo { Key = "parachuteChutesActive", Namespace = "computed", Group = "parachuteDrag", Unit = "count (int)",
+                Description = "number of chutes with targetState in {1,2} (partial/full deploy) contributing this tick; 0 harmlessly reduces to the plain aero-torque case", RequestAs = "telemetry on ...,computed:parachuteDrag" },
+            new ProbeFieldInfo { Key = "parachuteRbInertia", Namespace = "computed", Group = "parachuteDrag", Unit = "Unity rb2d.inertia units",
+                Description = "same as aeroTorque's rbInertia", RequestAs = "telemetry on ...,computed:parachuteDrag" },
+            new ProbeFieldInfo { Key = "parachuteForceX", Namespace = "computed", Group = "parachuteDrag", Unit = "force units (same scale as aeroTorque's underlying force)",
+                Description = "total drag force x including chute contribution", RequestAs = "telemetry on ...,computed:parachuteDrag" },
+            new ProbeFieldInfo { Key = "parachuteForceY", Namespace = "computed", Group = "parachuteDrag", Unit = "force units",
+                Description = "total drag force y including chute contribution", RequestAs = "telemetry on ...,computed:parachuteDrag" },
+
+            // ---- Namespace: truth (BuildTruthSample, full-schema, truth.jsonl) ----
+            // Written every tick in FULL mode ('telemetry on' with no field list).
+            // NOT reachable individually in SCOPED mode as a bare dot-path name --
+            // scoped mode only recognizes computed:* and the literal string
+            // "partCount" as special cases; every other name falls through to
+            // ResolvePath, a third, different mechanism again (see script-condition
+            // namespace above for the fourth). Do not assume a name here is usable
+            // verbatim in a scoped field list.
+            new ProbeFieldInfo { Key = "t", Namespace = "truth", Unit = "seconds", Description = "location.time",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "h", Namespace = "truth", Unit = "meters", Description = "location.Height",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "vv", Namespace = "truth", Unit = "m/s", Description = "location.VerticalVelocity",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "m", Namespace = "truth", Unit = "tonnes", Description = "rb2d.mass",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "rot", Namespace = "truth", Unit = "degrees", Description = "rb2d.rotation",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "angv", Namespace = "truth", Unit = "deg/s", Description = "rb2d.angularVelocity",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "px", Namespace = "truth", Unit = "meters, world/planet-centered, double precision",
+                Description = "location.position.x (world frame, NOT rb2d's local-frame velocity)", RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "py", Namespace = "truth", Unit = "meters, world/planet-centered, double precision",
+                Description = "location.position.y", RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "vx", Namespace = "truth", Unit = "m/s, world-frame", Description = "location.velocity.x",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "vy", Namespace = "truth", Unit = "m/s, world-frame", Description = "location.velocity.y",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "predApo", Namespace = "truth", Unit = "meters",
+                Description = "predicted apoapsis from GetPredictedOrbit (via Physics.GetTrajectory(), only valid under live physics, not stale on-rails data)", RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "predPeri", Namespace = "truth", Unit = "meters", Description = "predicted periapsis",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "predEcc", Namespace = "truth", Unit = "unitless", Description = "predicted eccentricity",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "fuelByStage", Namespace = "truth", Unit = "array of {stage:int, fuel:tonnes, capacity:tonnes}",
+                Description = "per-stage fuel remaining/capacity, summed across ResourceModules in each stage", RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "partCount", Namespace = "truth", Unit = "count (int)",
+                Description = "from GetHeatState's Item1. In SCOPED telemetry mode this exact name IS also usable, via a dedicated special-case added in v0.55.0 -- see Fix note in mod_changelog.md.",
+                RequestAs = "telemetry on (full mode) -- truth.jsonl; ALSO usable bare in scoped 'telemetry on <fields>' lists via a dedicated special-case (not ResolvePath)" },
+            new ProbeFieldInfo { Key = "maxTemp", Namespace = "truth", Unit = "deg C",
+                Description = "rocket-wide max part temperature from GetHeatState's Item2 (+-Infinity sentinels excluded before the max)", RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "dragArea", Namespace = "truth", Unit = "m^2-equivalent", Description = "same as computed:dragArea's dragArea",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "dragCopX", Namespace = "truth", Unit = "world-space meters", Description = "same as computed:dragArea's pre-Lerp CoP x",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "dragCopY", Namespace = "truth", Unit = "world-space meters", Description = "same as computed:dragArea's pre-Lerp CoP y",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "dragSurfaces", Namespace = "truth", Unit = "count", Description = "same as computed:dragArea",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "dragExposed", Namespace = "truth", Unit = "count", Description = "same as computed:dragArea",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "realAirTemp", Namespace = "truth", Unit = "deg C, or null",
+                Description = "GetRealAirTemperature -- the game's own live AeroModule.GetTemperatureAndShockwave output (same helper the 'airtemp' command uses)", RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "heatParts", Namespace = "truth", Unit = "array of objects", Description = "same schema as computed:heatParts",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+            new ProbeFieldInfo { Key = "body", Namespace = "truth", Unit = "string", Description = "current planet's codeName",
+                RequestAs = "telemetry on (full mode, no field list) -- truth.jsonl" },
+
+            // ---- Namespace: inputs (BuildInputsSample, full-schema only, inputs.jsonl) ----
+            new ProbeFieldInfo { Key = "t", Namespace = "inputs", Unit = "seconds", Description = "tick time",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "fdt", Namespace = "inputs", Unit = "seconds", Description = "Time.fixedDeltaTime",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "m", Namespace = "inputs", Unit = "tonnes", Description = "rb2d.mass",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "thr", Namespace = "inputs", Unit = "0-1 float", Description = "throttle.throttlePercent",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "thrOn", Namespace = "inputs", Unit = "bool",
+                Description = "throttle.throttleOn (master ignition). [KNOWN UNRELIABLE as a thrust indicator -- see high_level_checklist.md 'Tooling bugs'; prefer checking mass flatness.]",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "turnAxis", Namespace = "inputs", Unit = "-1 to 1 float (unclamped on direct write, see 'turn' command)",
+                Description = "arrowkeys.turnAxis", RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "torque", Namespace = "inputs", Unit = "same units as TorqueModule.torque (sfs_physics_reference.md 2.4)",
+                Description = "SumEnabledTorque -- sum of enabled TorqueModule.torque values", RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "rcsOn", Namespace = "inputs", Unit = "bool", Description = "arrowkeys.rcs",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "rcsFiring", Namespace = "inputs", Unit = "count (int)", Description = "CountFiringThrusters",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "directionalAxisX", Namespace = "inputs", Unit = "unitless direction component",
+                Description = "Rocket.output_DirectionalAxis.x (confirmed NOT on arrowkeys -- a distinct field needed for RcsModule.DirectionThrust reconstruction)", RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "directionalAxisY", Namespace = "inputs", Unit = "unitless direction component",
+                Description = "Rocket.output_DirectionalAxis.y", RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+            new ProbeFieldInfo { Key = "engines", Namespace = "inputs", Unit = "array of objects", Description = "same schema as computed:engines",
+                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
+        };
+
+        static string RegistryToJson()
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\n  \"commands\":[");
+            for (int i = 0; i < CommandRegistry.Length; i++)
+            {
+                var c = CommandRegistry[i];
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"name\":").Append(Q(c.Name))
+                  .Append(",\"syntax\":").Append(Q(c.Syntax))
+                  .Append(",\"description\":").Append(Q(c.Description))
+                  .Append(",\"category\":").Append(Q(c.Category))
+                  .Append("}");
+            }
+            sb.Append("],\n  \"fields\":[");
+            for (int i = 0; i < FieldRegistry.Length; i++)
+            {
+                var f = FieldRegistry[i];
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"key\":").Append(Q(f.Key))
+                  .Append(",\"namespace\":").Append(Q(f.Namespace))
+                  .Append(",\"group\":").Append(Q(f.Group ?? ""))
+                  .Append(",\"unit\":").Append(Q(f.Unit))
+                  .Append(",\"description\":").Append(Q(f.Description))
+                  .Append(",\"requestAs\":").Append(Q(f.RequestAs))
+                  .Append("}");
+            }
+            sb.Append("]\n}");
+            return sb.ToString();
+        }
+
         // ---------- command dispatch ----------
 
         public static void Command(string line)
@@ -764,9 +1143,30 @@ namespace SFSProbe
                         }
                         StartRecording(fields, triggerSpec);
                     }
-                    else
+                    else if (mode == "off" || mode == null)
                     {
                         StopRecording();
+                    }
+                    else
+                    {
+                        // v0.58.0 fix: any non-"on" second word used to silently fall
+                        // through to StopRecording() as if it meant "off" -- a real,
+                        // confirmed bug (found 2026-09-04 via a separate live MCP
+                        // session independently testing Checkpoint 3's fast-fail
+                        // validation): sending the exact typo 'telemetry snapshot'
+                        // (leading word 'telemetry' is a real command, so client-side
+                        // leading-word validation can't catch this) silently stopped
+                        // and archived an ACTIVE recording with no error surfaced --
+                        // it read back as a normal success, not a mistake. Worse, if
+                        // recording was already off, StopRecording() early-returns
+                        // with NO result.txt line at all, producing a client-side
+                        // timeout that looked like "nothing happened" when actually a
+                        // malformed command silently reached this deep. Now any
+                        // second word that isn't "on"/"off"/missing is a real,
+                        // reported error -- no state changed either way.
+                        ProbeMod.Result("telemetry: unrecognized mode '" + mode +
+                                         "' -- expected 'on' or 'off' (omit for 'off'). " +
+                                         "Command ignored, no recording state changed.");
                     }
                     break;
                 }
@@ -3146,6 +3546,19 @@ namespace SFSProbe
                     break;
                 }
 
+                case "describe":
+                {
+                    // Self-description registry dump (v0.57.0, MCP overhaul
+                    // Checkpoint 1). Primary source of truth for command/field
+                    // discovery -- see CommandRegistry/FieldRegistry above.
+                    string describeJson = RegistryToJson();
+                    var describeSb = new StringBuilder(describeJson);
+                    Write("sfs_probe_describe.json", describeSb, "self-description registry");
+                    ProbeMod.Result("describe: " + CommandRegistry.Length + " commands, " +
+                                     FieldRegistry.Length + " fields -> sfs_probe_describe.json");
+                    break;
+                }
+
                 default:
                     ProbeMod.Result("unknown command: " + cmd);
                     break;
@@ -3188,6 +3601,26 @@ namespace SFSProbe
                             string name = f.Substring("computed:".Length);
                             if (!AppendComputedField(name, r, sb3))
                                 sb3.Append(",\"").Append(name).Append("Error\":\"unknown computed field\"");
+                        }
+                        else if (f == "partCount")
+                        {
+                            // Fixed 2026-09-03: "partCount" used to silently record
+                            // null forever in scoped mode -- it was only ever a
+                            // recognized pseudo-field inside GetScriptFieldValue
+                            // (the script/trigger condition evaluator), which this
+                            // loop never consulted; a bare "partCount" isn't a real
+                            // dot-path ResolvePath can walk. Same semantics as
+                            // GetScriptFieldValue's own "partCount" case and as the
+                            // full-schema mode's "partCount" key (BuildTruthSample),
+                            // kept as a literal name check (not a required dot-path)
+                            // so every existing field list using bare "partCount"
+                            // (docs, active_state.md, prior flights) keeps working
+                            // unchanged rather than needing to be rewritten to
+                            // "partHolder.parts.Count".
+                            object holderPC = Get(r, "partHolder");
+                            object partsPC = Get(holderPC, "parts");
+                            var collPC = partsPC as System.Collections.ICollection;
+                            sb3.Append(",\"partCount\":").Append(collPC != null ? collPC.Count.ToString() : "null");
                         }
                         else
                         {
@@ -4360,10 +4793,27 @@ namespace SFSProbe
         // telemetry; this only reads the parts of the confirmed chain that
         // genuinely change every tick (target-setting + MoveTowards timing),
         // so a real flight gives the response ramp automatically without
-        // needing 'gimbalinfo' pressed repeatedly. Finds the first engine with
-        // hasGimbal==true on the active rocket -- fine for a single-gimbal
-        // test craft; multi-gimbal rockets would need per-engine scoping this
-        // doesn't attempt yet.
+        // needing 'gimbalinfo' pressed repeatedly.
+        //
+        // FIXED 2026-09-03 (v0.56.0, then corrected same day): used to
+        // return the FIRST engine with hasGimbal==true in part order --
+        // wrong on a real multi-engine/multi-stage rocket, since the
+        // first gimbaling engine in part order isn't necessarily one
+        // that's firing. v0.56.0's first fix compared throttle_Out
+        // magnitudes across engines and kept the highest -- functional,
+        // but not the RIGHT reason: per the confirmed three-layer control
+        // model (sfs_physics_reference.md D2.2), "amount" (throttle_Input)
+        // and master ignition are BOTH rocket-wide, broadcast identically
+        // to every engine (RecalculateEngineThrottle: throttle_Out =
+        // engineOn ? throttle_Input : 0f) -- so throttle_Out only ever
+        // differs between engines because of the one genuinely per-engine
+        // flag, engineOn. Comparing magnitudes was working by coincidence,
+        // not by checking the actual thing that varies. This version reads
+        // engineOn directly instead: prefers the first gimbaling engine
+        // that is actually ON, and only falls back to the first gimbaling
+        // engine found (regardless of state) if none are on at all -- the
+        // same degenerate between-stages case the original code always
+        // hit, now handled explicitly instead of by accident.
         static bool TryGetPrimaryGimbal(object rocket, out bool gimbalOn, out float throttleOut,
             out float turnAxisInput, out float timeVal, out float targetTimeVal)
         {
@@ -4374,6 +4824,8 @@ namespace SFSProbe
                 object parts = Get(holder, "parts");
                 var en = parts as System.Collections.IEnumerable;
                 if (en == null) return false;
+
+                object firstCandidate = null;
                 foreach (object part in en)
                 {
                     foreach (object mv in ModuleValues(part))
@@ -4382,14 +4834,28 @@ namespace SFSProbe
                         bool hasGimbal = ToB(Get(mv, "hasGimbal"));
                         if (!hasGimbal) continue;
 
-                        gimbalOn = ToB(GetWrapped2(Get(mv, "gimbalOn")));
-                        throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
-                        turnAxisInput = ToF(GetWrapped2(Get(mv, "turnAxis_Input")));
-                        object gimbal = Get(mv, "gimbal");
-                        timeVal = ToF(GetWrapped2(Get(gimbal, "time")));
-                        targetTimeVal = ToF(GetWrapped2(Get(gimbal, "targetTime")));
-                        return true;   // first gimbaling engine found
+                        if (firstCandidate == null) firstCandidate = mv;
+
+                        // The one flag that genuinely varies per engine
+                        // (staging, individual toggling) -- NOT amount or
+                        // master ignition, which are shared by every engine.
+                        bool engineOnNow = ToB(GetWrapped2(Get(mv, "engineOn")));
+                        if (!engineOnNow) continue;
+
+                        ReadPrimaryGimbalFields(mv, out gimbalOn, out throttleOut,
+                            out turnAxisInput, out timeVal, out targetTimeVal);
+                        return true;   // first ON gimbaling engine -- any other ON one would read the same shared throttle/turn-axis anyway
                     }
+                }
+
+                if (firstCandidate != null)
+                {
+                    // No gimbaling engine currently on (e.g. between
+                    // stages) -- fall back to the first one found, same
+                    // as the pre-fix default state.
+                    ReadPrimaryGimbalFields(firstCandidate, out gimbalOn, out throttleOut,
+                        out turnAxisInput, out timeVal, out targetTimeVal);
+                    return true;
                 }
                 return false;
             }
@@ -4398,6 +4864,20 @@ namespace SFSProbe
                 ProbeMod.Log("[gimbal-telemetry] compute error: " + e.Message);
                 return false;
             }
+        }
+
+        // Small shared reader used by TryGetPrimaryGimbal's two return
+        // paths (an ON engine, or the between-stages fallback) so the
+        // five-field read logic exists in exactly one place.
+        static void ReadPrimaryGimbalFields(object mv, out bool gimbalOn, out float throttleOut,
+            out float turnAxisInput, out float timeVal, out float targetTimeVal)
+        {
+            gimbalOn = ToB(GetWrapped2(Get(mv, "gimbalOn")));
+            throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
+            turnAxisInput = ToF(GetWrapped2(Get(mv, "turnAxis_Input")));
+            object gimbal = Get(mv, "gimbal");
+            timeVal = ToF(GetWrapped2(Get(gimbal, "time")));
+            targetTimeVal = ToF(GetWrapped2(Get(gimbal, "targetTime")));
         }
 
         // Parachute drag (2026-09-01). Extends TryComputeAeroTorque's exact
