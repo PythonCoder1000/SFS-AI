@@ -9,6 +9,61 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.62.0 (revised same session) — `getforwardstartinfo` now takes an optional name arg
+
+**2026-09-06, later same session.** `getforwardstartinfo [optional_name_no_spaces]` -- the AoA drag table's filename now prefers a caller-supplied name over the real `Rocket.rocketName`, e.g. `getforwardstartinfo one_engine_gimbal_test` -> `AoA_drag_table_one_engine_gimbal_test.json`. Found necessary immediately after the first live test: a craft's real `rocketName` is genuinely blank until it's been named and launched, but `getforwardstartinfo` is meant to be called BEFORE ignition -- by the time a real name would exist, the pre-ignition snapshot this command exists for has already passed. Falls back to real `rocketName` (or `"unknown"`) if no arg is given, unchanged from the initial v0.62.0 behavior. Also fixed in this same pass: the AoA-sweep block is now wrapped in its own try/catch with a real logged error message on failure -- the very first live test silently produced no file and no error at all (an unhandled exception mid-block was swallowing the whole rest of the command), which the try/catch now surfaces properly.
+
+---
+
+## v0.62.0 — `dragareasweep` command + auto AoA drag table on `getforwardstartinfo`
+
+**2026-09-06.** New one-shot command, `dragareasweep <comma-separated AoA
+degrees>` (e.g. `dragareasweep -90,-60,-30,0,30,60,90,120,150,180`) -- reads
+the game's own real `Aero_Rocket.GetDragSurfaces` →
+`AeroModule.CalculateDragForce` chain (the same one `dragarea`/
+`computed:dragArea` already use) at a whole LIST of caller-chosen synthetic
+angle-of-attack values in a single call, on a STATIONARY craft, no actual
+flying through those angles required. Works because `GetDragSurfaces
+(Matrix2x2)` is a pure function of (real current part geometry) x (an
+alignment matrix built from a bare scalar angle) -- the existing `dragarea`
+path derives that scalar from real velocity heading; the new
+`TryComputeDragAreaAtAoA` helper (generalized from `TryComputeDragArea`,
+which now just calls it with `null`) instead derives an equivalent scalar
+that reproduces a CHOSEN AoA relative to the craft's real current rotation.
+
+**Also, same session: `getforwardstartinfo` now automatically writes a
+full-resolution AoA drag table every time it runs.** 721 samples, -180.0 to
+180.0 degrees inclusive by 0.5, using the same `TryComputeDragAreaAtAoA`
+mechanism, written to `AoA_drag_table_<blueprintName>.json` (blueprint name
+read live from `Rocket.rocketName`, sanitized for filesystem use) --
+alongside the existing `sfs_probe_forwardstartinfo.json` craft-config
+snapshot, same command, no extra step. Means every fresh craft-config
+snapshot automatically comes with a matching, exact, per-craft drag table --
+replaces the old approach of empirically fitting `dragArea(AoA)` from a real
+flight's finite-differenced velocity (noisy, and only covers whatever angles
+that flight happened to pass through) with the exact, noise-free,
+complete-coverage answer straight from the game, for every craft, for free.
+Not yet live-tested -- next step is a real call against a craft on the pad.
+
+---
+
+## v0.61.0 — `computed:torque` added to scoped telemetry
+
+**2026-09-06.** New scoped-telemetry computed field, `torqueEffectiveLive`
+(`"telemetry on ...,computed:torque"`) -- a live per-tick sum of enabled
+`TorqueModule.torque.Value` across all parts, via the existing
+`SumEnabledTorque` helper (previously wired into full-mode's
+`BuildInputsSample` only, never exposed to scoped mode). Added to test a
+specific hypothesis from a forward-integrator gimbal-torque investigation:
+`Rocket.GetTorque()`'s real IL body evaluates `TorqueModule.torque` live,
+suggesting the value CAN be parametric on live state (e.g. `throttle_Out`)
+rather than a fixed per-part constant -- if so, `getforwardstartinfo`'s
+pre-ignition snapshot (`torqueEffectiveRaw`) would not reflect a part's
+real torque contribution once it's actually firing. This field lets a real
+flight compare the two directly. No other behavior changed.
+
+---
+
 ## v0.60.0 — Telemetry archive lifecycle unified across flat and JSON modes
 
 **The refactor, 2026-09-05.** Both telemetry recorders previously had their

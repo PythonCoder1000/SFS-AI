@@ -6,6 +6,99 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-09-06 (latest) — forward_sim.py: control-schedule timing bug fixed, phantom gimbal torque removed, live torque replay added
+
+**Context:** a gimbal-torque divergence investigation (three separate real
+flights, one-engine and six-engine craft) that started by suspecting a
+`rotation_direction` sign bug and ended somewhere completely different --
+three real, independent bugs found and fixed in one session, plus one real
+open question still unresolved.
+
+**1. Real bug, high impact: `_prepare_replay`'s `control_schedule` was built
+with the wrong time origin.** `load_control_schedule(..., t0_abs=t0, ...)`
+used the flight's ABSOLUTE start time as the schedule's zero-point, but
+`forward_simulate`'s step loop queries it with `t_before`/`t_after` that are
+ZERO-INDEXED FROM `start_t`. For any `start_t != 0` (every real use of this
+replay, since `start_t=0` is rejected by the velocity-estimate check), every
+real throttle/turn-axis/RCS lookup during the sim was reading from
+`start_t` seconds too early in the real recording -- for a replay starting
+right at ignition, this meant reading pre-ignition (all-zero) control state
+for the ENTIRE predicted window, regardless of what the real craft was
+actually doing. Root-caused by noticing `gimbal_times` stayed frozen at
+exactly `0.0` through an entire real full-throttle hard turn. Fixed:
+`t0_abs=t0 + start_t`. This single bug explains the apparent
+"catastrophic rotation-direction sign error" theory chased across three
+flights earlier the same session -- once fixed, sign was confirmed correct
+on every craft tested; that theory is walked back, not confirmed.
+
+**2. Real, IL-confirmed finding: gimbal deflection contributes ZERO real
+torque, ever.** `EngineModule.thrustNormal` is initialized to `Vector2.up`
+in the constructor and is NEVER written anywhere else in the entire
+assembly (grepped every reference) -- `RecalculateGimbal()` only ever
+touches `gimbal.targetTime` (the purely visual nozzle-animation target).
+The force applied in `FixedUpdate()` (`rb2d.AddForceAtPosition(thrustNormal
+* thrust * 9.8 * throttle_Out, ...)`) therefore never reflects real gimbal
+deflection -- gimbal is cosmetic. Confirmed independently two ways: (a) the
+IL read above, and (b) live data -- real angular acceleration stayed
+constant across a full 17%->100% gimbal deflection ramp instead of scaling
+with deflection angle, on two separate flights. Removed the entire
+engine-lever torque contribution from `_derivative()` (`torque_z +=
+lx*fy - ly*fx` over `engine_levers`) -- it was modeling a physically
+nonexistent mechanism and, combined with bug #3 below, was causing genuine
+double-counting once the timing bug (#1) was fixed and real torque started
+flowing through correctly.
+
+**3. Real finding: `TorqueModule.torque` (the source of `torque_effective`,
+via `Rocket.GetTorque()`) is LIVE-STATE-DEPENDENT, not a fixed per-part
+constant -- `getforwardstartinfo`'s pre-ignition snapshot (`throttle=0` at
+capture time) was silently missing this entirely for at least one real
+engine.** Measured directly on a real craft: `torqueEffectiveLive` (new
+probe field, see `mod_changelog.md` v0.61.0) read a flat `5` (capsule only)
+pre-ignition, but scaled LINEARLY with real throttle up to `13` at full
+throttle during an actual burn (`5 + 8*throttle`) -- confirmed by directly
+watching it track a real throttle ramp down to 0 and back up. Added
+`torque_field` support end to end: `ControlSchedule.torque_effective(t)`,
+`load_control_schedule(..., torque_field=...)`, and a new per-step
+`torque_effective_now` in `forward_simulate`'s loop that prefers the LIVE
+recorded value over the static `torque_effective` parameter whenever a
+`torque_field` is supplied (falls back to the old static behavior
+unchanged if not, so no existing caller breaks). `test_against_run` and
+`test_against_run_trajectory` both gained a `torque_field` parameter
+threaded through to `_prepare_replay`.
+
+**Validated result, all three fixes combined:** on a real, continuously
+throttle-varying, actively-tumbling one-engine flight, single-tick formula
+validation (live torque against real finite-differenced angular
+acceleration) gave **2.31% median error on cleanly-spaced samples** (most
+of an earlier 6% figure turned out to be finite-differencing noise from
+irregular tick spacing, not a real formula gap) -- and the FULL RK4
+integrator, run end to end over a real 9-second window with `drag: True,
+aero_torque: False`, tracked real rotation to **0.48 deg median error** and
+position to **~13m median error**. This is the first real multi-second
+trajectory validation this project has had -- everything before tonight was
+either a single-tick check or run against a stale/mismatched craft config.
+
+**Open, unresolved, flagged not solved:** enabling `aero_torque` (drag-
+induced torque from the CoP/CoM lever arm) makes the SAME run dramatically
+WORSE (42 deg median rotation error, up from 0.48 deg) despite
+`aero_torque`'s underlying mechanism being IL-confirmed as a real,
+structurally independent force application
+(`AeroModule.ApplyForce`->`AddForceAtPosition` at the real CoP, nothing to
+do with `torque_effective`/`ApplyTorque`) and previously live-validated on
+a DIFFERENT craft (0.9986 correlation, 4.66% median error, capsule
+reentry). Root cause not found. Leading unconfirmed suspicion, not yet
+checked: a possible frame mismatch between the new real `dragCopX/Y`
+(velocity-aligned frame, from the new `AoA_drag_table_*.json` -- see
+`mod_changelog.md` v0.62.0) and `worldCenterOfMass` when computing the
+lever arm -- both showed coincidentally similar magnitudes (~365) for this
+craft, which is exactly the kind of thing that would produce a badly wrong
+torque if one is subtly in the wrong frame relative to the other. Needs a
+direct numeric check (pull real CoM and a few real CoP values, verify the
+DIFFERENCE comes out as a physically sane few-meter lever arm) before doing
+anything else with `aero_torque` -- not attempted yet.
+
+---
+
 ## 2026-09-05 (latest) — telemetry archive lifecycle refactor: Python side (MCP capability audit + implementation)
 
 **Context:** `SFSProbe.cs` v0.60.0 unified the telemetry archive lifecycle

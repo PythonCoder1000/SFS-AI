@@ -31,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.60.0";
+        public const string VersionString = "0.62.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -843,6 +843,9 @@ namespace SFSProbe
             new ProbeCommandInfo { Name = "dragarea", Category = "physics-query",
                 Syntax = "dragarea",
                 Description = "One-shot dump of the real dragArea/center-of-drag via direct reflection calls into the game's own Aero_Rocket.GetDragSurfaces -> AeroModule.GetExposedSurfaces -> AeroModule.CalculateDragForce chain. Includes up to 10 sample raw segments. Writes sfs_probe_dragarea.json." },
+            new ProbeCommandInfo { Name = "dragareasweep", Category = "physics-query",
+                Syntax = "dragareasweep <comma-separated AoA degrees, no spaces>",
+                Description = "Reads the game's own REAL drag computation (same reflection chain as dragarea) at a whole list of caller-chosen SYNTHETIC AoA values in one call -- e.g. 'dragareasweep -90,-60,-30,0,30,60,90,120,150,180'. No actual flying through those angles required; works on a stationary craft on the pad. Built to replace empirically fitting an AoA table from noisy finite-differenced flight velocity -- this reads the exact, complete-coverage answer straight from the game for any angle. dragCopX/Y are in the same velocity-aligned frame as computed:dragArea's dragCopX/Y. Writes sfs_probe_dragareasweep.json." },
             new ProbeCommandInfo { Name = "loadblueprint", Category = "blueprint",
                 Syntax = "loadblueprint <path with possible spaces>",
                 Description = "World_PC ONLY. Deserializes a Blueprint JSON file and spawns it as an ADDITIONAL live physics rocket via RocketManager.SpawnBlueprint. NOT safe for routine mid-flight use (moves the camera, no cost/achievement tracking, functionally a cheat if used repeatedly)." },
@@ -904,8 +907,8 @@ namespace SFSProbe
                 Syntax = "gimbalinfo",
                 Description = "Full commanded-steering -> gimbal-angle chain dump per gimbaling EngineModule: gimbalOn, throttleOut, turnAxisInput, time/targetTime (unitless 0-1 animation-progress fractions, NOT seconds or degrees), animationTime (seconds), unscaledTime flag, and the real rotate-curve keyframes. Writes sfs_probe_gimbalinfo.json. Reports 'no gimbaling engines found' if none have hasGimbal." },
             new ProbeCommandInfo { Name = "getforwardstartinfo", Category = "physics-query",
-                Syntax = "getforwardstartinfo",
-                Description = "Full static craft-config snapshot for forward_sim.py's Python integrator: rocket mass, rb2d.inertia, world center of mass, rotation, summed enabled torque, plus per-part arrays for engines/RCS modules/parachutes. Known scope limits (in-code): does NOT capture AoA-dependent dragArea; engine 'scale' term hardcoded to 1.0 (exact only for unscaled parts); positionLocalBody valid only until the next staging event. Call before ignition for the cleanest read. Writes sfs_probe_forwardstartinfo.json." },
+                Syntax = "getforwardstartinfo [optional_name_no_spaces]",
+                Description = "Full static craft-config snapshot for forward_sim.py's Python integrator: rocket mass, rb2d.inertia, world center of mass, rotation, summed enabled torque, plus per-part arrays for engines/RCS modules/parachutes. Known scope limits (in-code): engine 'scale' term hardcoded to 1.0 (exact only for unscaled parts); positionLocalBody valid only until the next staging event. Call before ignition for the cleanest read. Writes sfs_probe_forwardstartinfo.json. ALSO (v0.62.0+) writes a full 721-sample, 0.5-degree-resolution real AoA-vs-dragArea/CoP table for this exact craft to AoA_drag_table_<name>.json (same mechanism as 'dragareasweep', run at full resolution automatically). <name> is an OPTIONAL arg (e.g. 'getforwardstartinfo one_engine_gimbal_test') that overrides the real Rocket.rocketName -- needed because a craft's real name is blank until it's been named+launched, by which point this pre-ignition snapshot has already been taken; falls back to rocketName (or 'unknown') if omitted." },
             new ProbeCommandInfo { Name = "parachutedrag", Category = "physics-query",
                 Syntax = "parachutedrag",
                 Description = "On-demand version of TryComputeParachuteDrag -- same shape as aerotorque but with the confirmed chute-compounding step applied on top. chutesActive:0 harmlessly reduces to the plain aero-torque case if no chute is deployed. Writes sfs_probe_parachutedrag.json." },
@@ -995,6 +998,8 @@ namespace SFSProbe
                 Description = "MoveModule.time -- chases targetTime linearly at rate 1/animationTime", RequestAs = "telemetry on ...,computed:gimbal" },
             new ProbeFieldInfo { Key = "gimbalTargetTime", Namespace = "computed", Group = "gimbal", Unit = "UNITLESS 0-1 fraction",
                 Description = "MoveModule.targetTime -- the commanded target the animation is moving toward", RequestAs = "telemetry on ...,computed:gimbal" },
+            new ProbeFieldInfo { Key = "torqueEffectiveLive", Namespace = "computed", Group = "torque", Unit = "same units as torqueEffectiveRaw (getforwardstartinfo)",
+                Description = "LIVE per-tick sum of enabled TorqueModule.torque.Value (Rocket.GetTorque()'s real mechanism, via the existing SumEnabledTorque helper -- previously wired into full-mode telemetry only, never scoped). Added 2026-09-06 specifically to test whether a TorqueModule's torque expression is parametric on live state (e.g. throttle_Out) and therefore differs from the pre-ignition snapshot getforwardstartinfo captures.", RequestAs = "telemetry on ...,computed:torque" },
             new ProbeFieldInfo { Key = "parachuteTorque", Namespace = "computed", Group = "parachuteDrag", Unit = "N*m-equivalent",
                 Description = "predicted torque including chute compounding; null on failure", RequestAs = "telemetry on ...,computed:parachuteDrag" },
             new ProbeFieldInfo { Key = "parachuteAlphaDeg", Namespace = "computed", Group = "parachuteDrag", Unit = "deg/s^2 -- ANGULAR ACCELERATION, NOT an angle despite the name",
@@ -1146,6 +1151,61 @@ namespace SFSProbe
                 case "snapshot": DumpFlight("cmd"); break;
                 case "world":    WroteWorld = false; DumpWorld("cmd"); break;
                 case "menu":     DumpMenu("cmd"); break;
+
+                case "dragareasweep":
+                {
+                    // 2026-09-06: reads the game's own REAL drag computation at a
+                    // whole LIST of caller-chosen synthetic AoA values in one call,
+                    // via TryComputeDragAreaAtAoA -- no actual flying through those
+                    // angles required, works on a stationary craft. Built to replace
+                    // the old approach (finite-differencing velocity from a real
+                    // flight to empirically build an AoA table -- noisy, and only
+                    // covers whatever angles the flight happened to pass through) --
+                    // this gets the exact, noise-free, complete-coverage answer
+                    // straight from the game for any angle requested. Argument: a
+                    // comma-separated list of AoA degrees, e.g.
+                    // "dragareasweep -90,-60,-30,0,30,60,90,120,150,180". No spaces.
+                    object rSweep = ActiveRocket();
+                    if (rSweep == null) { ProbeMod.Result("dragareasweep: no active rocket"); break; }
+                    if (string.IsNullOrEmpty(arg)) { ProbeMod.Result("dragareasweep: needs a comma-separated list of AoA degrees, e.g. dragareasweep -90,-60,-30,0,30,60,90"); break; }
+
+                    string[] aoaStrs = arg.Split(',');
+                    var sweepResults = new List<string>();
+                    for (int ai = 0; ai < aoaStrs.Length; ai++)
+                    {
+                        float aoaTarget;
+                        if (!float.TryParse(aoaStrs[ai], out aoaTarget))
+                        {
+                            sweepResults.Add("{\"aoaDeg\":" + Q(aoaStrs[ai]) + ",\"error\":\"unparseable\"}");
+                            continue;
+                        }
+                        float sweepDrag, sweepCopX, sweepCopY;
+                        int sweepAllCount, sweepExposedCount;
+                        bool sweepOk = TryComputeDragAreaAtAoA(rSweep, aoaTarget, out sweepDrag, out sweepCopX, out sweepCopY,
+                            out sweepAllCount, out sweepExposedCount);
+                        var ssb = new StringBuilder();
+                        ssb.Append("{\"aoaDeg\":").Append(Num(aoaTarget));
+                        ssb.Append(",\"dragArea\":").Append(sweepOk ? Num(sweepDrag) : "null");
+                        ssb.Append(",\"dragCopX\":").Append(sweepOk ? Num(sweepCopX) : "null");
+                        ssb.Append(",\"dragCopY\":").Append(sweepOk ? Num(sweepCopY) : "null");
+                        ssb.Append(",\"allSurfaceCount\":").Append(sweepAllCount);
+                        ssb.Append(",\"exposedSurfaceCount\":").Append(sweepExposedCount);
+                        ssb.Append("}");
+                        sweepResults.Add(ssb.ToString());
+                    }
+
+                    object rb2dSweep = Get(rSweep, "rb2d");
+                    float thetaRealSweepDeg = ToF(Get(rb2dSweep, "rotation"));
+                    var sweepOut = new StringBuilder();
+                    sweepOut.Append("{\"realRotationDeg\":").Append(Num(thetaRealSweepDeg));
+                    sweepOut.Append(",\"note\":\"dragCopX/Y are in the same velocity-aligned frame as computed:dragArea's dragCopX/Y -- NOT world/local frame, matching existing convention\"");
+                    sweepOut.Append(",\"samples\":[").Append(string.Join(",", sweepResults.ToArray())).Append("]}");
+
+                    string sweepJson = sweepOut.ToString();
+                    File.WriteAllText(Path.Combine(ProbeMod.OutDir ?? ".", "sfs_probe_dragareasweep.json"), sweepJson);
+                    ProbeMod.Result("dragareasweep: " + aoaStrs.Length + " angle(s) -> sfs_probe_dragareasweep.json");
+                    break;
+                }
 
                 case "telemetry":
                 {
@@ -3360,9 +3420,82 @@ namespace SFSProbe
                     fsOut.Append(",\"parachutes\":[").Append(string.Join(",", chuteResults.ToArray())).Append("]");
                     fsOut.Append("}");
                     Write("sfs_probe_forwardstartinfo.json", fsOut, "forward-integrator craft config dump");
+
+                    // 2026-09-06: ALSO write a full 0.5-degree-resolution AoA drag
+                    // table for this exact craft, every time getforwardstartinfo runs
+                    // -- so a fresh table always exists alongside the fresh craft
+                    // config snapshot, one per blueprint (by name), no separate
+                    // command needed. Same TryComputeDragAreaAtAoA mechanism as the
+                    // standalone 'dragareasweep' command, just always run at full
+                    // resolution (721 samples, -180.0 to 180.0 inclusive by 0.5) and
+                    // auto-named from the rocket's real blueprint name so re-running
+                    // this for a DIFFERENT craft never silently overwrites a
+                    // different craft's table under the same generic filename.
+                    object rocketNameObjFS = null;
+                    string blueprintNameFS = "unknown";
+                    string aoaTableFileName = "AoA_drag_table_unknown.json";
+                    int aoaSampleCountFS = 0;
+                    try
+                    {
+                        // 2026-09-06: an optional caller-supplied name (e.g.
+                        // "getforwardstartinfo one_engine_gimbal_test") takes
+                        // priority over the real Rocket.rocketName. Added because
+                        // rocketName is genuinely blank for any craft that hasn't
+                        // been named+launched yet -- by the time it CAN be named,
+                        // naming it is no longer useful for this workflow (you're
+                        // already past the pre-ignition snapshot moment this
+                        // command is meant to be called at). No spaces in the name
+                        // (matches this file's existing single-arg convention, e.g.
+                        // dragareasweep's angle list).
+                        if (!string.IsNullOrEmpty(arg))
+                        {
+                            blueprintNameFS = arg;
+                        }
+                        else
+                        {
+                            rocketNameObjFS = Get(rFS, "rocketName");
+                            blueprintNameFS = rocketNameObjFS != null ? rocketNameObjFS.ToString() : "unknown";
+                        }
+                        var safeNameSb = new StringBuilder();
+                        foreach (char c in blueprintNameFS)
+                            safeNameSb.Append((char.IsLetterOrDigit(c) || c == '_' || c == '-') ? c : '_');
+                        string safeBlueprintName = safeNameSb.Length > 0 ? safeNameSb.ToString() : "unknown";
+
+                        var aoaResultsFS = new List<string>();
+                        for (float aoaDegFS = -180f; aoaDegFS <= 180f + 0.001f; aoaDegFS += 0.5f)
+                        {
+                            float aoaSweepDrag, aoaSweepCopX, aoaSweepCopY;
+                            int aoaSweepAllCount, aoaSweepExposedCount;
+                            bool aoaSweepOk = TryComputeDragAreaAtAoA(rFS, aoaDegFS, out aoaSweepDrag, out aoaSweepCopX, out aoaSweepCopY,
+                                out aoaSweepAllCount, out aoaSweepExposedCount);
+                            var aoaSsb = new StringBuilder();
+                            aoaSsb.Append("{\"aoaDeg\":").Append(Num(aoaDegFS));
+                            aoaSsb.Append(",\"dragArea\":").Append(aoaSweepOk ? Num(aoaSweepDrag) : "null");
+                            aoaSsb.Append(",\"dragCopX\":").Append(aoaSweepOk ? Num(aoaSweepCopX) : "null");
+                            aoaSsb.Append(",\"dragCopY\":").Append(aoaSweepOk ? Num(aoaSweepCopY) : "null");
+                            aoaSsb.Append("}");
+                            aoaResultsFS.Add(aoaSsb.ToString());
+                        }
+                        var aoaTableOut = new StringBuilder();
+                        aoaTableOut.Append("{\"blueprintName\":").Append(Q(blueprintNameFS));
+                        aoaTableOut.Append(",\"realRotationDeg\":").Append(Num(rotationDegFS));
+                        aoaTableOut.Append(",\"stepDeg\":0.5");
+                        aoaTableOut.Append(",\"note\":\"dragCopX/Y are in the same velocity-aligned frame as computed:dragArea's dragCopX/Y -- NOT world/local frame\"");
+                        aoaTableOut.Append(",\"samples\":[").Append(string.Join(",", aoaResultsFS.ToArray())).Append("]}");
+                        aoaTableFileName = "AoA_drag_table_" + safeBlueprintName + ".json";
+                        aoaSampleCountFS = aoaResultsFS.Count;
+                        Write(aoaTableFileName, aoaTableOut, "full-resolution AoA drag table for this craft");
+                    }
+                    catch (Exception e)
+                    {
+                        ProbeMod.Log("[getforwardstartinfo] AoA drag table sweep FAILED (craft config above was still written fine): " + e);
+                        aoaTableFileName = null;
+                    }
+
                     ProbeMod.Result("getforwardstartinfo: " + engineResults.Count + " engine(s), " + rcsResults.Count +
                         " RCS module(s), " + chuteResults.Count + " parachute(s), " + torqueModuleResults.Count +
-                        " torque module(s) (raw sum=" + torqueEffectiveRaw + ") -> sfs_probe_forwardstartinfo.json");
+                        " torque module(s) (raw sum=" + torqueEffectiveRaw + ") -> sfs_probe_forwardstartinfo.json; " +
+                        (aoaTableFileName != null ? (aoaSampleCountFS + "-sample AoA drag table -> " + aoaTableFileName) : "AoA drag table FAILED, see probe.log"));
                     break;
                 }
 
@@ -4906,6 +5039,30 @@ namespace SFSProbe
         static bool TryComputeDragArea(object rocket, out float drag, out float copX, out float copY,
                                         out int allCount, out int exposedCount)
         {
+            return TryComputeDragAreaAtAoA(rocket, null, out drag, out copX, out copY, out allCount, out exposedCount);
+        }
+
+        // Generalized 2026-09-06: identical reflection chain as TryComputeDragArea,
+        // but optionally builds the alignment matrix from a SYNTHETIC target AoA
+        // (degrees) instead of the craft's real current velocity heading. This
+        // works because GetDragSurfaces(Matrix2x2) is a pure function of (real
+        // current part geometry) x (an alignment matrix) -- the matrix is built
+        // from a bare scalar angle, not read internally from the craft's real
+        // state. The real 'dragarea'/TryComputeDragArea path derives that scalar
+        // from real velocityAngle; this derives an EQUIVALENT scalar that would
+        // produce a CHOSEN AoA relative to the craft's real current rotation,
+        // using the same AoA convention analysis/aoa_dragarea.py already assumes
+        // (aoaDeg = wrap((theta+90) - headingDeg)): solving for the synthetic
+        // heading that yields the requested AoA at the craft's real theta, then
+        // feeding that into the IDENTICAL formula the real velocity-driven path
+        // uses. Lets a full AoA sweep be read from the game's own real drag
+        // computation in one command, on a stationary craft, with zero actual
+        // maneuvering -- see 'dragareasweep' command. aoaTargetDeg=null
+        // reproduces the original real-velocity behavior exactly (backward
+        // compatible with every existing caller of TryComputeDragArea).
+        static bool TryComputeDragAreaAtAoA(object rocket, float? aoaTargetDeg, out float drag, out float copX, out float copY,
+                                        out int allCount, out int exposedCount)
+        {
             drag = 0f; copX = 0f; copY = 0f; allCount = 0; exposedCount = 0;
             try
             {
@@ -4916,10 +5073,22 @@ namespace SFSProbe
                 Type aeroModuleType = FindType("SFS.World.Drag.AeroModule");
                 if (matrixType == null || aeroModuleType == null) return false;
 
-                object dloc = Unwrap(Get(rocket, "location"));
-                object velocity = GetWrapped(dloc, "velocity");
-                double velocityAngle = ToD(Get(velocity, "AngleRadians"));
-                float rotationInput = (float)(-(velocityAngle - Math.PI / 2.0));
+                float rotationInput;
+                if (aoaTargetDeg.HasValue)
+                {
+                    object rb2dForAoa = Get(rocket, "rb2d");
+                    float thetaRealDeg = ToF(Get(rb2dForAoa, "rotation"));
+                    float syntheticHeadingDeg = thetaRealDeg + 90f - aoaTargetDeg.Value;
+                    double syntheticHeadingRad = syntheticHeadingDeg * Math.PI / 180.0;
+                    rotationInput = (float)(-(syntheticHeadingRad - Math.PI / 2.0));
+                }
+                else
+                {
+                    object dloc = Unwrap(Get(rocket, "location"));
+                    object velocity = GetWrapped(dloc, "velocity");
+                    double velocityAngle = ToD(Get(velocity, "AngleRadians"));
+                    rotationInput = (float)(-(velocityAngle - Math.PI / 2.0));
+                }
                 object matrix = InvokeStatic(matrixType, "Angle", new Type[] { typeof(float) }, new object[] { rotationInput });
                 if (matrix == null) return false;
 
@@ -5558,6 +5727,19 @@ namespace SFSProbe
                     sb.Append(",\"gimbalTurnAxisInput\":").Append(gok ? Num(gTurnIn) : "null");
                     sb.Append(",\"gimbalTime\":").Append(gok ? Num(gTime) : "null");
                     sb.Append(",\"gimbalTargetTime\":").Append(gok ? Num(gTarget) : "null");
+                    return true;
+                }
+                case "torque":
+                {
+                    // Added 2026-09-06 to test whether a TorqueModule's torque
+                    // expression is parametric on live state (e.g. throttle_Out)
+                    // rather than a fixed per-part constant -- SumEnabledTorque
+                    // already existed (used by full-mode's BuildInputsSample) but
+                    // was never wired into scoped telemetry. Compare this LIVE
+                    // per-tick value against getforwardstartinfo's pre-ignition
+                    // torqueEffectiveRaw snapshot for the same craft.
+                    float torqueLive = SumEnabledTorque(rocket);
+                    sb.Append(",\"torqueEffectiveLive\":").Append(Num(torqueLive));
                     return true;
                 }
                 case "parachuteDrag":

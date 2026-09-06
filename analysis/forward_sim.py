@@ -1330,7 +1330,30 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
     start_state["vy"] = (r1["location.position.y"] - r0["location.position.y"]) / dt_v
 
     craft_config = load_craft_config_from_getforwardstartinfo(craft_config_path)
-    control_schedule = load_control_schedule(flight_jsonl_path, t0_abs=t0, throttle_field=throttle_field)
+    # FIXED 2026-09-06: control_schedule's own internal clock must be
+    # zero-based from start_t (matching forward_simulate's internal
+    # t_before/t_after loop variable, which is always 0-indexed from
+    # wherever this replay starts) -- NOT from the flight's absolute
+    # beginning. Passing bare t0 here (pre-fix) meant every
+    # control_schedule.throttle(t)/.turn_axis(t)/.directional_axis(t)
+    # call during the sim loop was silently reading real control data
+    # from `start_t` seconds too early in the recording -- for any
+    # start_t != 0 (i.e. every real use of this replay, since start_t=0
+    # is rejected by the velocity-estimate check above), the model was
+    # driven by whatever throttle/turn-axis/RCS state existed at that
+    # EARLIER real time, not the real state at the sim's own start.
+    # Concretely: a replay starting right at ignition (start_t=29.98s)
+    # queried the schedule at t=0,0.25,0.5... which maps to real flight
+    # seconds 0,0.25,0.5... -- almost entirely PRE-ignition, so
+    # throttle read 0 and turn_axis read 0 for the whole predicted
+    # window regardless of what the real craft was actually doing.
+    # Found 2026-09-06 while investigating an apparent catastrophic
+    # gimbal-torque divergence across 3 separate flights; root-caused by
+    # noticing gimbal_times stayed frozen at exactly 0.0 the entire sim
+    # even during a real full-throttle hard turn (see
+    # docs/high_level_checklist.md's forward-integrator section for the
+    # full story and the walked-back "sign bug" theory this bug caused).
+    control_schedule = load_control_schedule(flight_jsonl_path, t0_abs=t0 + start_t, throttle_field=throttle_field)
 
     aoa_table = json.loads(Path(aoa_table_path).read_text()) if aoa_table_path else None
 

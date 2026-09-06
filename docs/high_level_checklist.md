@@ -561,6 +561,27 @@ multi-engine, terrain, and RCS. Detail in `sfs_physics_reference.md` §5.
 
 ## Tooling bugs — confirmed broken, unfixed
 
+- [ ] **`computed:engines`'s per-engine `thrustDirX`/`thrustDirY` never
+      reflects real gimbal deflection (found 2026-09-06).** Confirmed
+      across an entire clean 6,518-sample flight (6-engine rocket,
+      real hard steering corrections including a full ±1 turnAxis
+      reversal at t=33.6s): every engine reports exactly `(0, 1)` —
+      the un-deflected baseline direction — on 100% of samples, even
+      while the single-engine proxy (`gimbalTime`/`gimbalTargetTime`)
+      correctly shows the SAME engines' gimbal actively ramping to full
+      deflection and back. `engineOn` and `throttleOut` in the same
+      `computed:engines` payload ARE correct per-engine (confirmed
+      individually-toggled engines read correctly). This is likely the
+      same underlying issue as the old `GetEngineDirection`/
+      `GetEngineArray` `thrustDirX` bug (fixed 2026-08-29/08-30,
+      v0.34.0/v0.37.0 — see below) recurring in the newer
+      `computed:engines` scoped-telemetry code path, which may not
+      route through the fixed `GetEngineArray` function at all. Not yet
+      root-caused this session — flagged for a probe-code fix before
+      relying on per-engine gimbal direction for anything. Workaround in
+      the meantime: use the single-engine `gimbalTime`/`gimbalTargetTime`
+      proxy for gimbal-timing validation (still correct), and don't use
+      per-engine `thrustDirX/Y` for anything until fixed.
 - [ ] `thrOn` — unreliable as a thrust indicator (workaround exists: check
       mass flatness instead)
 - [ ] `GetHeatState` may under-report — it reads the `Part.temperature`
