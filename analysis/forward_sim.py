@@ -192,12 +192,16 @@ import argparse
 import bisect
 import json
 import math
+import statistics
 import sys
 from pathlib import Path
 from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 from aoa_dragarea import lookup_field  # noqa: E402 (path setup above)
+import sfs_telemetry as st  # noqa: E402 -- reuse load_samples for gzip-aware
+                             # reading (v0.60.0 archives are always .gz) rather
+                             # than duplicating that logic here
 
 PLANET_CONSTANTS = {
     "Earth": {
@@ -1185,15 +1189,7 @@ def load_control_schedule(flight_jsonl_path: str, t0_abs: Optional[float] = None
     uses. None (default) uses this file's own first sample as t0 --
     correct when the craft_config's own starting sample came from the
     SAME flight file, which is the expected/normal use."""
-    rows = []
-    with open(flight_jsonl_path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    rows = st.load_samples(Path(flight_jsonl_path))
     if not rows:
         raise ValueError(f"no samples found in {flight_jsonl_path}")
     if "output_TurnAxisTorque" not in rows[0] or "output_DirectionalAxis.x" not in rows[0]:
@@ -1285,6 +1281,68 @@ def load_craft_config_from_getforwardstartinfo(path: str) -> dict:
     }
 
 
+def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
+                     start_t: float, duration_s: float, dt: float = 0.25,
+                     body_name: str = "Earth", aoa_table_path: Optional[str] = None,
+                     throttle_field: Optional[str] = None,
+                     flags: Optional[dict] = None) -> tuple[list[dict], float, list[dict]]:
+    """Shared setup for test_against_run and test_against_run_trajectory
+    (2026-09-05 split -- both need the identical real-flight load,
+    starting-state construction, and control-replay forward_simulate()
+    call; only what they DO with the resulting full trajectory differs).
+    Loads the real flight (gzip-transparent via st.load_samples), builds
+    the starting state via central-difference velocity, loads
+    craft_config + control_schedule, and runs the full forward_simulate()
+    replay.
+
+    Returns (rows, t0, sim): rows is the full real flight, t0 is the
+    flight's absolute time origin (rows[0]["t"]), sim is
+    forward_simulate's full per-step predicted trajectory (list[dict],
+    one entry per RK4 step -- NOT just the final point).
+    """
+    rows = st.load_samples(Path(flight_jsonl_path))
+    if not rows:
+        raise ValueError(f"no samples found in {flight_jsonl_path}")
+    if "output_TurnAxisTorque" not in rows[0] or "output_DirectionalAxis.x" not in rows[0]:
+        raise ValueError(
+            "flight file is missing output_TurnAxisTorque / output_DirectionalAxis.x -- "
+            "these are required for --test_against_run's control-input replay (see "
+            "load_control_schedule's docstring)."
+        )
+    t0 = rows[0]["t"]
+
+    def to_state(r):
+        return {
+            "px": r["location.position.x"], "py": r["location.position.y"],
+            "m": r["rb2d.mass"], "rot": r["rb2d.rotation"], "angv": r["rb2d.angularVelocity"],
+        }
+
+    start_idx = min(range(len(rows)), key=lambda i: abs(rows[i]["t"] - t0 - start_t))
+    if start_idx == 0 or start_idx == len(rows) - 1:
+        raise ValueError(f"start_t={start_t} too close to the flight's own start/end "
+                          "for a velocity estimate")
+    r0, r1 = rows[start_idx - 1], rows[start_idx + 1]
+    dt_v = r1["t"] - r0["t"]
+    if dt_v <= 0:
+        raise ValueError("degenerate dt around start_idx -- check for a revert/discontinuity here")
+    start_state = to_state(rows[start_idx])
+    start_state["vx"] = (r1["location.position.x"] - r0["location.position.x"]) / dt_v
+    start_state["vy"] = (r1["location.position.y"] - r0["location.position.y"]) / dt_v
+
+    craft_config = load_craft_config_from_getforwardstartinfo(craft_config_path)
+    control_schedule = load_control_schedule(flight_jsonl_path, t0_abs=t0, throttle_field=throttle_field)
+
+    aoa_table = json.loads(Path(aoa_table_path).read_text()) if aoa_table_path else None
+
+    sim = forward_simulate(
+        start_state, duration_s, dt=dt, body_name=body_name, aoa_table=aoa_table,
+        inertia=craft_config["inertia"], com_local=craft_config["com_local"],
+        torque_effective=craft_config["torque_effective"], flags=flags,
+        craft_config=craft_config, control_schedule=control_schedule)
+
+    return rows, t0, sim
+
+
 def test_against_run(flight_jsonl_path: str, craft_config_path: str,
                      start_t: float, duration_s: float, dt: float = 0.25,
                      body_name: str = "Earth", aoa_table_path: Optional[str] = None,
@@ -1315,51 +1373,9 @@ def test_against_run(flight_jsonl_path: str, craft_config_path: str,
     near zero-crossings -- caller should compute those over MULTIPLE
     calls at different start_t if a real statistical validation is the
     goal; this single call is one data point)."""
-    rows = []
-    with open(flight_jsonl_path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-    if not rows:
-        raise ValueError(f"no samples found in {flight_jsonl_path}")
-    t0 = rows[0]["t"]
-
-    def to_state(r):
-        return {
-            "px": r["location.position.x"], "py": r["location.position.y"],
-            "m": r["rb2d.mass"], "rot": r["rb2d.rotation"], "angv": r["rb2d.angularVelocity"],
-        }
-
-    # velocity isn't directly in telemetry -- central-difference position
-    # around the chosen start sample (single pair, not the whole flight,
-    # since this is the STARTING state only, not a residual-force estimate
-    # the way the interactive demo's dead-reckoning model needed).
-    start_idx = min(range(len(rows)), key=lambda i: abs(rows[i]["t"] - t0 - start_t))
-    if start_idx == 0 or start_idx == len(rows) - 1:
-        raise ValueError(f"start_t={start_t} too close to the flight's own start/end "
-                          "for a velocity estimate")
-    r0, r1 = rows[start_idx - 1], rows[start_idx + 1]
-    dt_v = r1["t"] - r0["t"]
-    if dt_v <= 0:
-        raise ValueError("degenerate dt around start_idx -- check for a revert/discontinuity here")
-    start_state = to_state(rows[start_idx])
-    start_state["vx"] = (r1["location.position.x"] - r0["location.position.x"]) / dt_v
-    start_state["vy"] = (r1["location.position.y"] - r0["location.position.y"]) / dt_v
-
-    craft_config = load_craft_config_from_getforwardstartinfo(craft_config_path)
-    control_schedule = load_control_schedule(flight_jsonl_path, t0_abs=t0, throttle_field=throttle_field)
-
-    aoa_table = json.loads(Path(aoa_table_path).read_text()) if aoa_table_path else None
-
-    sim = forward_simulate(
-        start_state, duration_s, dt=dt, body_name=body_name, aoa_table=aoa_table,
-        inertia=craft_config["inertia"], com_local=craft_config["com_local"],
-        torque_effective=craft_config["torque_effective"], flags=flags,
-        craft_config=craft_config, control_schedule=control_schedule)
+    rows, t0, sim = _prepare_replay(
+        flight_jsonl_path, craft_config_path, start_t, duration_s, dt,
+        body_name, aoa_table_path, throttle_field, flags=flags)
     predicted = sim[-1]
 
     target_t_abs = t0 + start_t + duration_s
@@ -1397,6 +1413,94 @@ def test_against_run(flight_jsonl_path: str, craft_config_path: str,
     }
 
 
+def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
+                                 start_t: float, duration_s: float, dt: float = 0.25,
+                                 body_name: str = "Earth", aoa_table_path: Optional[str] = None,
+                                 throttle_field: Optional[str] = None,
+                                 flags: Optional[dict] = None,
+                                 stride: int = 1) -> dict:
+    """Like test_against_run, but compares the ENTIRE predicted trajectory
+    against the real flight step-by-step, not just the final point --
+    built to characterize forward-integrator compounding error
+    separately for position vs. rotation over time (the open item in
+    docs/high_level_checklist.md this project had no real per-step
+    comparison data for). test_against_run() itself only ever looked at
+    sim[-1]; forward_simulate's full per-step output (list[dict], one
+    entry per RK4 step) was always there, just discarded down to one
+    point -- this function is that same replay, just kept whole.
+
+    Units, confirmed against docs/sfs_source_reference.md rather than
+    assumed (Unity's Rigidbody2D convention, NOT radians): rb2d.rotation
+    is degrees, rb2d.angularVelocity is deg/s -- both already match
+    forward_simulate's own theta_deg/omega_degs directly, no conversion.
+    Getting this wrong (e.g. applying math.degrees() to an already-degree
+    value) would silently produce a rotation error ~57x too large without
+    ever raising an exception -- exactly the class of bug this project's
+    "confirm from real reference, never assume units" discipline exists
+    to catch before it contaminates a validation result.
+
+    stride: compare only every Nth predicted step (1 = every step) --
+    for a long duration_s at a small dt this can be thousands of steps;
+    stride trades resolution for response size without changing the
+    underlying simulation's step size (dt).
+
+    Returns a dict with 'steps' (per-step sim_t/real_t/
+    position_offset_m/rotation_error_deg/angular_velocity_error_degs)
+    and 'summary' with median/mean/max for position_offset_m and
+    rotation_error_deg computed SEPARATELY (median first, per this
+    project's established near-zero-crossing caveat -- see
+    test_against_run's own docstring).
+    """
+    rows, t0, sim = _prepare_replay(
+        flight_jsonl_path, craft_config_path, start_t, duration_s, dt,
+        body_name, aoa_table_path, throttle_field, flags=flags)
+
+    steps = []
+    for point in sim[::max(1, stride)]:
+        target_t_abs = t0 + start_t + point["t"]
+        actual_idx = min(range(len(rows)), key=lambda i: abs(rows[i]["t"] - target_t_abs))
+        actual_row = rows[actual_idx]
+
+        pos_err = math.hypot(point["px"] - actual_row["location.position.x"],
+                             point["py"] - actual_row["location.position.y"])
+
+        predicted_rot_deg = point.get("theta_deg")
+        actual_rot_deg = actual_row.get("rb2d.rotation")
+        rot_err = (abs(_wrap180(predicted_rot_deg - actual_rot_deg))
+                   if predicted_rot_deg is not None and actual_rot_deg is not None else None)
+
+        predicted_angv_degs = point.get("omega_degs")
+        actual_angv_degs = actual_row.get("rb2d.angularVelocity")
+        angv_err = (abs(predicted_angv_degs - actual_angv_degs)
+                    if predicted_angv_degs is not None and actual_angv_degs is not None else None)
+
+        steps.append({
+            "sim_t": point["t"], "real_t": actual_row["t"] - t0 - start_t,
+            "position_offset_m": pos_err,
+            "rotation_error_deg": rot_err,
+            "angular_velocity_error_degs": angv_err,
+            "collided": point.get("collided", False),
+        })
+
+    def _summary(key):
+        vals = [s[key] for s in steps if s[key] is not None]
+        if not vals:
+            return None
+        return {"median": statistics.median(vals), "mean": statistics.mean(vals),
+                "max": max(vals), "count": len(vals)}
+
+    return {
+        "start_t": start_t, "duration_s": duration_s, "stride": stride,
+        "step_count": len(steps),
+        "steps": steps,
+        "summary": {
+            "position_offset_m": _summary("position_offset_m"),
+            "rotation_error_deg": _summary("rotation_error_deg"),
+            "angular_velocity_error_degs": _summary("angular_velocity_error_degs"),
+        },
+    }
+
+
 def prep_demo_data(src_path: str, out_path: str, n_downsample: int = 2500,
                     aoa_table_path: Optional[str] = None,
                     inertia: Optional[float] = None,
@@ -1408,15 +1512,7 @@ def prep_demo_data(src_path: str, out_path: str, n_downsample: int = 2500,
     mid-flight sample, compared against the REAL recorded trajectory at
     the matching later timestamp) so the demo ships with a known,
     reported accuracy figure."""
-    samples = []
-    with open(src_path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    samples.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    samples = st.load_samples(Path(src_path))
 
     aoa_table = None
     if aoa_table_path:

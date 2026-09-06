@@ -9,6 +9,71 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.60.0 — Telemetry archive lifecycle unified across flat and JSON modes
+
+**The refactor, 2026-09-05.** Both telemetry recorders previously had their
+own, divergent save/lifecycle policy: flat mode (`telemetry on`/`off`)
+wrote `truth.jsonl` AND `inputs.jsonl` separately, archived them into
+`archive/` under an inconsistent naming scheme
+(`flightNN_<tag>_<timestamp>.jsonl`, sometimes no `flightNN`), and never
+cleaned up -- 456MB across 81 files accumulated since 2026-08-25 with zero
+retention policy. JSON mode (`telemetry json on`/`off`, added v0.59.0,
+never individually changelogged until now -- see below) followed a
+different, also-inconsistent pattern. Both now share ONE lifecycle:
+
+- **One file, not two.** `truth.jsonl`/`inputs.jsonl` merged into a single
+  live file (`sample.jsonl`) via a new `MergeJsonObjects` helper --
+  `Sample()` still calls `BuildTruthSample`/`BuildInputsSample`
+  independently (zero schema risk), just splices their output into one
+  JSON object per tick instead of writing two files. Applies to both
+  scoped and full mode.
+- **Unified naming.** `archive/telemetry_<mode>_<timestamp>.jsonl`, where
+  `mode` is `"flat"` (was the truth/inputs split) or `"parts"` (was
+  `"rocketstate"`, renamed to match).
+- **Gzip-then-delete-raw on stop.** `ArchiveOne` now compresses via
+  `System.IO.Compression.GZipStream` immediately after archiving, then
+  deletes the uncompressed `.jsonl` -- the raw form only ever exists on
+  disk during the recording itself.
+- **New runs overwrite previous results.** `DeletePreviousArchive(mode)`
+  runs at the START of the next recording (not at stop), deleting the
+  prior `.gz` for that mode -- so a just-completed archive survives until
+  superseded, giving a window to tag it. `sfsprobe_tag_flight` is the
+  only path to permanence now (copies into `archive/kept/` before this can
+  delete it) -- **that Python-side copy step is NOT yet implemented, next
+  step**.
+- Build reference added: `-r:"$MANAGED/System.IO.Compression.dll"` in
+  `build.sh` (confirmed present in the game's own Managed folder, no new
+  bundled dependency needed).
+- One-time migration performed this session (not code, a manual cleanup):
+  the two flights actually referenced by `flights_log.jsonl` tags
+  (`smoke-test`, `drag_validation_full_ascent_reentry`) were copied into
+  `archive/kept/` by hand before the remaining 81-file/456MB archive was
+  deleted outright.
+- **Retroactively documenting v0.59.0** (shipped in an earlier session,
+  never individually entered here): `telemetry json on`/`telemetry json
+  off` added an independent ~1Hz full per-part JSON rocket-state snapshot
+  recorder (`SampleJson`/`BuildRocketJsonSnapshot`), deliberately separate
+  from the main `Telemetry` bool/lifecycle -- can run alongside or
+  instead of flat-mode recording, since it answers a different question
+  ("what does the rocket structurally look like right now") at a much
+  slower, deliberately un-synced cadence than the ~60Hz physics telemetry.
+- Live-tested: NOT YET -- compiles clean (3 pre-existing unrelated
+  warnings only, `CS1718` at line ~2785-2788), installed, but needs a real
+  game reload + recording cycle to confirm the gzip/delete-on-start
+  behavior actually works at runtime, not just compiles.
+
+**Not done in this pass, tracked as the next steps:** `sfsprobe_tag_flight`
+(Python, `sfsprobe_mcp/server.py`) still needs the copy-to-`archive/kept/`
+step added -- without it, tagging still only logs a path, and that path's
+file can be deleted by the next `telemetry on` of the same mode. Every
+existing Python analysis tool that reads a `.jsonl` also still needs
+routing through a shared `read_telemetry()` helper that decompresses `.gz`
+in memory (never writing an unzipped copy to disk on either machine) --
+none of the analysis tools have been touched yet, they still expect a raw
+`.jsonl` on disk.
+
+---
+
 ## MCP overhaul complete (Checkpoints 1-8) — 2026-09-04, no version bump this entry
 
 **Checkpoint 8 (cleanup) done same day, after Christian's explicit

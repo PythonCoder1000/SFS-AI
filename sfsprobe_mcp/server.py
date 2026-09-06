@@ -28,6 +28,7 @@ stderr via the `log` module or print(..., file=sys.stderr).
 import json
 import os
 import sys
+import shutil
 import time
 import asyncio
 import csv
@@ -51,6 +52,9 @@ sys.path.insert(0, str(_PROJECT_ROOT / "analysis"))
 import sfs_telemetry as st  # noqa: E402
 import blueprint_builder as bpb  # noqa: E402
 import il_inventory  # noqa: E402  -- deep_search's type/member parser, MCP overhaul Checkpoint 5
+import forward_sim as fsim  # noqa: E402  -- test_against_run(), wrapped as sfsprobe_test_against_run below.
+                             # Guarded by `if __name__ == "__main__":` in forward_sim.py itself, so
+                             # importing it here never touches sys.argv or runs its CLI block.
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -100,8 +104,13 @@ DEEP_SEARCH_IL_META = DEEP_SEARCH_CACHE_DIR / "assembly_full_il.meta.json"
 CMD_FILE = MOD_DIR / "command.txt"
 RESULT_FILE = MOD_DIR / "result.txt"
 PROBE_LOG_FILE = MOD_DIR / "probe.log"
-TRUTH_FILE = MOD_DIR / "truth.jsonl"
-INPUTS_FILE = MOD_DIR / "inputs.jsonl"
+# v0.60.0: truth.jsonl/inputs.jsonl merged into one live file (SFSProbe.cs's
+# unified archive lifecycle) -- SAMPLE_FILE replaces the old TRUTH_FILE/
+# INPUTS_FILE pair. ROCKETSTATE_FILE is the separate ~1Hz per-part JSON
+# recorder's live file ("parts" mode), never previously referenced from this
+# side since no parts-mode analysis tooling existed until this pass.
+SAMPLE_FILE = MOD_DIR / "sample.jsonl"
+ROCKETSTATE_FILE = MOD_DIR / "rocketstate.jsonl"
 DRAGAREA_JSON_FILE = MOD_DIR / "sfs_probe_dragarea.json"
 # Written by the mod's 'describe' command (v0.57.0+, MCP overhaul Checkpoint
 # 1) -- the live CommandRegistry/FieldRegistry dump that light_search
@@ -110,6 +119,10 @@ DESCRIBE_JSON_FILE = MOD_DIR / "sfs_probe_describe.json"
 SNAPSHOT_JSON_FILE = MOD_DIR / "sfs_probe_flight.json"
 PLACED_MAGNETS_JSON_FILE = MOD_DIR / "sfs_probe_placed_magnets.json"
 ARCHIVE_DIR = MOD_DIR / "archive"
+# v0.60.0: the only path off the archive lifecycle's auto-delete-on-next-run
+# policy -- sfsprobe_tag_flight copies a .gz here so DeletePreviousArchive
+# (SFSProbe.cs) can never remove it.
+KEPT_DIR = ARCHIVE_DIR / "kept"
 FLIGHTS_LOG_FILE = _PROJECT_ROOT / "bookkeeping" / "flights_log.jsonl"
 BLUEPRINTS_RESEARCH_DIR = _PROJECT_ROOT / "blueprints" / "research"
 BLUEPRINTS_LIVE_DIR = _PROJECT_ROOT / "blueprints" / "live"
@@ -2217,15 +2230,15 @@ async def sfsprobe_status(params: StatusInput) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: tail probe.log / truth.jsonl / inputs.jsonl -- read-only, sends NO
+# Tool: tail probe.log / sample.jsonl / rocketstate.jsonl -- read-only, sends NO
 # command at all. New capability: inspect recent activity or telemetry
 # samples without triggering anything in the game.
 # ---------------------------------------------------------------------------
 
 class TailFileTarget(str, Enum):
     PROBE_LOG = "probe_log"
-    TRUTH = "truth"
-    INPUTS = "inputs"
+    SAMPLE = "sample"
+    PARTS = "parts"
 
 
 class TailFileInput(BaseModel):
@@ -2234,14 +2247,17 @@ class TailFileInput(BaseModel):
     target: TailFileTarget = Field(
         ...,
         description="Which live file to tail: 'probe_log' (probe.log, human-"
-                     "readable events), 'truth' (truth.jsonl, per-tick physics "
-                     "telemetry), or 'inputs' (inputs.jsonl, per-tick control "
-                     "signals -- only written in full telemetry mode).",
+                     "readable events), 'sample' (sample.jsonl, per-tick physics "
+                     "telemetry + control signals merged into one record -- v0.60.0, "
+                     "was 'truth'/'inputs' as two separate targets before the truth/inputs "
+                     "file split was removed), or 'parts' (rocketstate.jsonl, the "
+                     "independent ~1Hz per-part structural snapshot recorder -- 'telemetry "
+                     "json on', a separate lifecycle from 'sample').",
     )
     lines: int = Field(default=20, ge=1, le=1000, description="Number of most recent lines to return.")
     parse_json: bool = Field(
         default=False,
-        description="For 'truth'/'inputs': parse each line as JSON and return "
+        description="For 'sample'/'parts': parse each line as JSON and return "
                      "a structured array instead of raw text lines.",
     )
 
@@ -2261,7 +2277,7 @@ async def sfsprobe_tail_file(params: TailFileInput) -> str:
     game interaction at all -- doesn't send a command or wait for anything.
 
     Useful for checking recent activity (probe_log) or inspecting the most
-    recent telemetry samples (truth/inputs) without disturbing a running
+    recent telemetry samples (sample/parts) without disturbing a running
     flight or recording.
 
     Args:
@@ -2270,13 +2286,13 @@ async def sfsprobe_tail_file(params: TailFileInput) -> str:
     Returns:
         str: JSON with keys: target, path, line_count (lines actually
         found, may be less than requested), lines (array of strings, or
-        array of parsed objects if parse_json and target is truth/inputs),
+        array of parsed objects if parse_json and target is sample/parts),
         parse_errors (int, only present if parse_json hit malformed lines).
     """
     path = {
         TailFileTarget.PROBE_LOG: PROBE_LOG_FILE,
-        TailFileTarget.TRUTH: TRUTH_FILE,
-        TailFileTarget.INPUTS: INPUTS_FILE,
+        TailFileTarget.SAMPLE: SAMPLE_FILE,
+        TailFileTarget.PARTS: ROCKETSTATE_FILE,
     }[params.target]
 
     raw_lines = _tail_file(path, params.lines)
@@ -2311,7 +2327,7 @@ async def sfsprobe_tail_file(params: TailFileInput) -> str:
 
 # ---------------------------------------------------------------------------
 # Shared helper: resolve a telemetry file path -- either an explicit
-# archived flight, or the live truth.jsonl if none given. Used by every
+# archived flight, or the live sample.jsonl if none given. Used by every
 # analysis tool below (Stages 1-7).
 # ---------------------------------------------------------------------------
 
@@ -2321,12 +2337,12 @@ def _resolve_flight_path(path: Optional[str]) -> Path:
         if not p.exists():
             raise FileNotFoundError(f"telemetry file not found: {p}")
         return p
-    if not TRUTH_FILE.exists():
+    if not SAMPLE_FILE.exists():
         raise FileNotFoundError(
-            f"no path given and no live truth.jsonl found at {TRUTH_FILE} -- "
+            f"no path given and no live sample.jsonl found at {SAMPLE_FILE} -- "
             "either pass an archived flight's path, or start telemetry recording first."
         )
-    return TRUTH_FILE
+    return SAMPLE_FILE
 
 
 # ===========================================================================
@@ -2336,7 +2352,7 @@ def _resolve_flight_path(path: Optional[str]) -> Path:
 class FieldStatsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     fields: List[str] = Field(..., min_length=1, description="Telemetry field names, e.g. ['h','vv','dragArea'].")
-    path: Optional[str] = Field(default=None, description="Archived flight file. Omit to use the live truth.jsonl.")
+    path: Optional[str] = Field(default=None, description="Archived flight file. Omit to use the live sample.jsonl.")
     scope: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Restrict to a portion of the flight. Forms: {'phase':'ascent'}, "
@@ -2383,6 +2399,13 @@ class FieldSearchInput(BaseModel):
     value: float = Field(...)
     path: Optional[str] = Field(default=None)
     limit: Optional[int] = Field(default=50, ge=1, le=5000)
+    scope: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Restrict the search to a portion of the flight, same forms as sfsprobe_field_stats: "
+                     "{'phase':'ascent'}, {'time_range':[t1,t2]}, {'before_event':'impact','window_s':10}, "
+                     "{'after_event':'engine_cutoff'}, {'around_event':'apoapsis','window_s':5}. "
+                     "Omit to search the whole flight.",
+    )
 
 
 @mcp.tool(name="sfsprobe_field_search", annotations={"title": "Find samples matching a field condition",
@@ -2390,19 +2413,29 @@ class FieldSearchInput(BaseModel):
 async def sfsprobe_field_search(params: FieldSearchInput) -> str:
     """Find all samples where field <op> value holds, e.g. h > 10000 or
     vv < 0. Returns matching indices/times/values instead of requiring a
-    manual scroll through raw telemetry.
+    manual scroll through raw telemetry. Optionally scoped to a phase/
+    time-range/event-window, same as sfsprobe_field_stats -- e.g. "find
+    engine cutoffs only during ascent" without a separate phase_detect
+    call plus manual index intersection.
 
     Args:
-        params (FieldSearchInput): field, op, value, path, limit
+        params (FieldSearchInput): field, op, value, path, limit, scope
 
     Returns:
-        str: JSON with keys: path, match_count, matches (capped at limit).
+        str: JSON with keys: path, scope_applied, scoped_range,
+        match_count, matches (capped at limit).
     """
     try:
         path = _resolve_flight_path(params.path)
         samples = await asyncio.to_thread(st.load_samples, path)
-        matches = st.search_field(samples, params.field, params.op, params.value, limit=params.limit)
-        return json.dumps({"path": str(path), "match_count": len(matches), "matches": matches}, indent=2)
+        start, end, warning = st.resolve_scope(samples, params.scope)
+        matches = st.search_field(samples, params.field, params.op, params.value,
+                                   start=start, end=end + 1, limit=params.limit)
+        result = {"path": str(path), "scope_applied": params.scope, "scoped_range": [start, end],
+                  "match_count": len(matches), "matches": matches}
+        if warning:
+            result["warnings"] = [warning]
+        return json.dumps(result, indent=2)
     except (FileNotFoundError, ValueError) as e:
         return _error_for_exception(e)
 
@@ -2862,9 +2895,39 @@ def _append_flight_log(path: Path, tag: Optional[str], notes: Optional[str], sum
         f.write(json.dumps(entry) + "\n")
 
 
+def _copy_to_kept(path: Path) -> Path:
+    """Copies an archived flight into archive/kept/ -- the only thing that
+    survives SFSProbe.cs's DeletePreviousArchive, which wipes the prior
+    .gz for a mode (flat/parts) the instant the NEXT same-mode recording
+    starts (v0.60.0's unified archive lifecycle: new runs overwrite
+    previous results by design). Called by sfsprobe_tag_flight before
+    logging, so a tag always points at something durable, not a file that
+    might vanish the next time someone hits 'telemetry on'.
+
+    A no-op copy (returns path unchanged) if the file is already under
+    kept/ -- e.g. re-tagging, or an explicit path someone already rescued
+    by hand.
+    """
+    if KEPT_DIR in path.resolve().parents:
+        return path
+    KEPT_DIR.mkdir(parents=True, exist_ok=True)
+    dest = KEPT_DIR / path.name
+    shutil.copy2(path, dest)
+    return dest
+
+
 class ListFlightsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     limit: int = Field(default=20, ge=1, le=500)
+    tag_substring: Optional[str] = Field(
+        default=None,
+        description="Case-insensitive filter on the tag field, e.g. 'drag_validation' -- applied before limit.",
+    )
+    mode: Optional[Literal["flat", "parts"]] = Field(
+        default=None,
+        description="Filter to only flights recorded in this telemetry mode ('flat' = normal per-tick physics "
+                     "telemetry, 'parts' = the ~1Hz per-part structural recorder). Omit for either.",
+    )
 
 
 @mcp.tool(name="sfsprobe_list_flights", annotations={"title": "List logged/archived flights",
@@ -2876,11 +2939,12 @@ async def sfsprobe_list_flights(params: ListFlightsInput) -> str:
     live in chat history and evaporate between sessions.
 
     Args:
-        params (ListFlightsInput): limit
+        params (ListFlightsInput): limit, tag_substring, mode
 
     Returns:
-        str: JSON with 'tagged_flights' (newest first, capped at limit)
-        and 'untagged_archive_count'.
+        str: JSON with 'tagged_flights' (newest first, filtered, capped
+        at limit) and 'untagged_archive_count' (unaffected by
+        tag_substring/mode -- always the whole archive's untagged count).
     """
     tagged = []
     if FLIGHTS_LOG_FILE.exists():
@@ -2891,11 +2955,21 @@ async def sfsprobe_list_flights(params: ListFlightsInput) -> str:
                     tagged.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass
+    if params.tag_substring:
+        needle = params.tag_substring.lower()
+        tagged = [e for e in tagged if needle in (e.get("tag") or "").lower()]
+    if params.mode:
+        mode_marker = "telemetry_" + params.mode + "_"
+        tagged = [e for e in tagged if mode_marker in (e.get("file") or "")]
     tagged.sort(key=lambda e: e.get("logged_at", 0), reverse=True)
     tagged_files = {e["file"] for e in tagged}
     untagged_count = 0
     if ARCHIVE_DIR.exists():
-        for f in ARCHIVE_DIR.glob("*_truth_*.jsonl"):
+        # v0.60.0: archive naming is now telemetry_<mode>_<timestamp>.jsonl.gz
+        # (mode is 'flat' or 'parts'), not the old flightNN_truth_*.jsonl --
+        # glob only the top-level dir so kept/ (already-tagged, durable
+        # copies) is never double-counted as "untagged".
+        for f in ARCHIVE_DIR.glob("telemetry_*_*.jsonl.gz"):
             if str(f) not in tagged_files:
                 untagged_count += 1
     return json.dumps({"tagged_flights": tagged[:params.limit], "untagged_archive_count": untagged_count,
@@ -2955,20 +3029,201 @@ async def sfsprobe_tag_flight(params: TagFlightInput) -> str:
     flights_log.jsonl at the project root, so sfsprobe_list_flights can
     find it later.
 
+    v0.60.0: FIRST copies the file into archive/kept/ (unless it's already
+    there) -- the unified archive lifecycle deletes the previous .gz for a
+    mode the instant the next same-mode recording starts, so tagging a
+    file in place would let it get silently deleted later. The logged
+    path always points at the durable kept/ copy, never the original
+    transient archive location.
+
     Args:
         params (TagFlightInput): path, tag, notes
 
     Returns:
-        str: JSON confirming what was logged.
+        str: JSON confirming what was logged, including whether a copy
+        into archive/kept/ was made (kept_path, copied bool).
     """
     try:
         path = _resolve_flight_path(params.path)
-        samples = await asyncio.to_thread(st.load_samples, path)
+        kept_path = await asyncio.to_thread(_copy_to_kept, path)
+        samples = await asyncio.to_thread(st.load_samples, kept_path)
         summary = st.flight_summary(samples)
-        await asyncio.to_thread(_append_flight_log, path, params.tag, params.notes, summary)
-        return json.dumps({"logged": True, "path": str(path), "tag": params.tag,
+        await asyncio.to_thread(_append_flight_log, kept_path, params.tag, params.notes, summary)
+        return json.dumps({"logged": True, "path": str(kept_path), "original_path": str(path),
+                            "copied": kept_path != path, "tag": params.tag,
                             "flights_log_file": str(FLIGHTS_LOG_FILE)}, indent=2)
     except FileNotFoundError as e:
+        return _error_for_exception(e)
+
+
+class PartsTimelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: Optional[str] = Field(
+        default=None,
+        description="Archived parts-mode ('telemetry json') flight file (a telemetry_parts_*.jsonl.gz "
+                     "archive, or a kept/ copy). Omit to use the live rocketstate.jsonl.",
+    )
+    name_substring: Optional[str] = Field(
+        default=None,
+        description="Case-insensitive filter on part name, e.g. 'Fuel Tank' -- applied BEFORE tracking, "
+                     "so vanished_parts/most_resource_lost only reflect matching parts.",
+    )
+
+
+@mcp.tool(name="sfsprobe_parts_timeline", annotations={"title": "Track per-part state across a parts-mode recording",
+          "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
+async def sfsprobe_parts_timeline(params: PartsTimelineInput) -> str:
+    """Tracks every part across a 'telemetry json' (parts-mode) recording's
+    snapshots -- answers what the flat per-tick telemetry can't: which
+    specific fuel tank lost the most resourcePercent, and which parts
+    vanished (destroyed or staged away) partway through the flight. The
+    schema has no explicit 'broken' flag -- disappearing from a later
+    snapshot IS the signal, so this tool does that diffing for you.
+
+    Args:
+        params (PartsTimelineInput): path, name_substring
+
+    Returns:
+        str: JSON with path, sample_count, part_count_tracked, parts
+        (every tracked part's first/last seen values), vanished_parts
+        (subset that disappeared before the recording's final sample),
+        most_resource_lost (top 10 by resourcePercent drop, resource-
+        bearing parts only).
+    """
+    try:
+        if params.path:
+            p = Path(params.path).expanduser()
+            if not p.exists():
+                raise FileNotFoundError(f"telemetry file not found: {p}")
+        else:
+            if not ROCKETSTATE_FILE.exists():
+                raise FileNotFoundError(
+                    f"no path given and no live rocketstate.jsonl found at {ROCKETSTATE_FILE} -- "
+                    "either pass an archived parts-mode flight's path, or start 'telemetry json on' first."
+                )
+            p = ROCKETSTATE_FILE
+        samples = await asyncio.to_thread(st.load_samples, p)
+        result = st.parts_timeline(samples, params.name_substring)
+        result["path"] = str(p)
+        result["sample_count"] = len(samples)
+        return json.dumps(result, indent=2)
+    except FileNotFoundError as e:
+        return _error_for_exception(e)
+
+
+class TestAgainstRunInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    flight_jsonl_path: str = Field(
+        ..., description="Real flight telemetry file (archived .gz or the live sample.jsonl) -- must "
+                          "include output_TurnAxisTorque and output_DirectionalAxis.x/y for control-input replay."
+    )
+    craft_config_path: str = Field(
+        ..., description="sfs_probe_forwardstartinfo.json from the 'getforwardstartinfo' command -- the "
+                          "static craft-config snapshot the forward integrator starts from."
+    )
+    start_t: float = Field(..., description="Sim-relative start time (seconds since flight start) to begin from.")
+    duration_s: float = Field(..., description="Prediction horizon in seconds.")
+    dt: float = Field(default=0.25, description="RK4 step size, seconds.")
+    body_name: str = Field(default="Earth")
+    aoa_table_path: Optional[str] = Field(default=None, description="Optional aoa_dragarea.py table for drag/aero_torque.")
+    throttle_field: Optional[str] = Field(
+        default=None,
+        description="Optional telemetry field for throttle replay, e.g. 'gimbalThrottleOut' -- see "
+                     "forward_sim.py's load_control_schedule docstring for the single-engine-scoping caveat.",
+    )
+
+
+@mcp.tool(name="sfsprobe_test_against_run", annotations={"title": "Forward-simulate against a real flight and compare",
+          "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
+async def sfsprobe_test_against_run(params: TestAgainstRunInput) -> str:
+    """Forward-simulates from a real flight sample at start_t, REPLAYING
+    that flight's real control inputs (rotation, RCS, optionally
+    throttle) rather than guessing them, then compares the prediction
+    against what actually happened at start_t+duration_s in the SAME
+    flight -- isolating "does the confirmed physics predict correctly"
+    from "can this module guess pilot behavior". This wraps
+    analysis/forward_sim.py's --test_against_run as an MCP tool: every
+    other validation step (validate_gravity_drag, regression_check,
+    noise_floor) already had one; the forward integrator's own
+    end-to-end check didn't.
+
+    Args:
+        params (TestAgainstRunInput): flight_jsonl_path, craft_config_path,
+        start_t, duration_s, dt, body_name, aoa_table_path, throttle_field
+
+    Returns:
+        str: JSON with start_t, duration_s, predicted (final predicted
+        state), actual (real sample nearest start_t+duration_s), and
+        errors (height/speed/position, percent and absolute).
+    """
+    try:
+        result = await asyncio.to_thread(
+            fsim.test_against_run,
+            params.flight_jsonl_path, params.craft_config_path,
+            params.start_t, params.duration_s,
+            dt=params.dt, body_name=params.body_name,
+            aoa_table_path=params.aoa_table_path,
+            throttle_field=params.throttle_field,
+        )
+        return json.dumps(result, indent=2)
+    except (FileNotFoundError, ValueError) as e:
+        return _error_for_exception(e)
+
+
+class TestAgainstRunTrajectoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    flight_jsonl_path: str = Field(
+        ..., description="Real flight telemetry file (archived .gz or the live sample.jsonl) -- must "
+                          "include output_TurnAxisTorque and output_DirectionalAxis.x/y for control-input replay."
+    )
+    craft_config_path: str = Field(
+        ..., description="sfs_probe_forwardstartinfo.json from the 'getforwardstartinfo' command."
+    )
+    start_t: float = Field(..., description="Sim-relative start time (seconds since flight start) to begin from.")
+    duration_s: float = Field(..., description="Prediction horizon in seconds.")
+    dt: float = Field(default=0.25, description="RK4 step size, seconds.")
+    body_name: str = Field(default="Earth")
+    aoa_table_path: Optional[str] = Field(default=None, description="Optional aoa_dragarea.py table for drag/aero_torque.")
+    throttle_field: Optional[str] = Field(default=None, description="Optional telemetry field for throttle replay.")
+    stride: int = Field(
+        default=1, ge=1,
+        description="Compare only every Nth predicted step (1 = every step) -- trades resolution for "
+                     "response size on a long duration_s / small dt without changing the simulation's own step size.",
+    )
+
+
+@mcp.tool(name="sfsprobe_test_against_run_trajectory", annotations={"title": "Forward-simulate a full trajectory and compare step-by-step",
+          "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
+async def sfsprobe_test_against_run_trajectory(params: TestAgainstRunTrajectoryInput) -> str:
+    """Like sfsprobe_test_against_run, but compares the ENTIRE predicted
+    trajectory against the real flight step-by-step instead of only the
+    final point -- built to characterize forward-integrator compounding
+    error separately for position vs. rotation over time, the open
+    question this project had no real per-step comparison data for.
+
+    Args:
+        params (TestAgainstRunTrajectoryInput): flight_jsonl_path,
+        craft_config_path, start_t, duration_s, dt, body_name,
+        aoa_table_path, throttle_field, stride
+
+    Returns:
+        str: JSON with start_t, duration_s, stride, step_count, steps
+        (per-step sim_t/real_t/position_offset_m/rotation_error_deg/
+        angular_velocity_error_degs), and summary (median/mean/max for
+        position_offset_m and rotation_error_deg computed SEPARATELY).
+    """
+    try:
+        result = await asyncio.to_thread(
+            fsim.test_against_run_trajectory,
+            params.flight_jsonl_path, params.craft_config_path,
+            params.start_t, params.duration_s,
+            dt=params.dt, body_name=params.body_name,
+            aoa_table_path=params.aoa_table_path,
+            throttle_field=params.throttle_field,
+            stride=params.stride,
+        )
+        return json.dumps(result, indent=2)
+    except (FileNotFoundError, ValueError) as e:
         return _error_for_exception(e)
 
 
@@ -3106,22 +3361,35 @@ async def sfsprobe_checklist_status(params: ChecklistStatusInput) -> str:
 # ===========================================================================
 
 def _wait_until(field: str, op: str, value: float, timeout_s: float, poll_interval_s: float) -> tuple[bool, float, Optional[dict]]:
-    """Poll the LIVE truth.jsonl's last line until field <op> value holds
-    or timeout. Reads only the file's tail (last 4KB) each poll -- cheap
-    even on a large, actively-growing telemetry file."""
+    """Poll the LIVE sample.jsonl's last line until field <op> value holds
+    or timeout. Reads only the file's tail each poll -- cheap even on a
+    large, actively-growing telemetry file. (v0.60.0: was truth.jsonl --
+    the live file is never gzipped while still recording, only on stop,
+    so this plain tail-read stays valid unmodified.)
+
+    Tail size is 64KB, not a smaller round number -- confirmed via a real
+    live test (2026-09-05) that full-mode samples (embedded heatParts/
+    engines/fuelByStage arrays) can exceed 4KB per line on their own,
+    which silently truncated the last line mid-object, made it fail to
+    parse as JSON, and made every wait_until against full-mode telemetry
+    time out reporting last_sample_value: null regardless of whether the
+    condition was already true. Scoped-mode samples are much smaller, so
+    64KB comfortably covers both.
+    """
     if op not in st._OPS:
         raise ValueError(f"unknown op {op!r}, must be one of {list(st._OPS)}")
     fn = st._OPS[op]
     start = time.monotonic()
     deadline = start + timeout_s
     last = None
+    TAIL_READ_BYTES = 65536
     while time.monotonic() < deadline:
-        if TRUTH_FILE.exists():
+        if SAMPLE_FILE.exists():
             try:
-                with TRUTH_FILE.open("rb") as f:
+                with SAMPLE_FILE.open("rb") as f:
                     f.seek(0, 2)
                     size = f.tell()
-                    read_size = min(size, 4096)
+                    read_size = min(size, TAIL_READ_BYTES)
                     f.seek(size - read_size)
                     chunk = f.read().decode("utf-8", errors="ignore")
                 lines = [l for l in chunk.splitlines() if l.strip()]
@@ -3231,7 +3499,7 @@ class RunAndAnalyzeInput(BaseModel):
           "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False})
 async def sfsprobe_run_and_analyze(params: RunAndAnalyzeInput) -> str:
     """Run a flight script (see sfsprobe_run_flight_script), then find
-    the newly-archived truth.jsonl (by mtime, created after this call
+    the newly-archived flight (by mtime, created after this call
     started) and automatically run flight_summary + gravity/drag
     validation on it. Optionally tags the result. Closes the test ->
     analyze loop into one call instead of two-plus-manual-lookup.
@@ -3250,20 +3518,33 @@ async def sfsprobe_run_and_analyze(params: RunAndAnalyzeInput) -> str:
 
     candidates = []
     if ARCHIVE_DIR.exists():
-        candidates = [f for f in ARCHIVE_DIR.glob("*_truth_*.jsonl") if f.stat().st_mtime >= script_start - 1]
+        # v0.60.0: archive naming is telemetry_<mode>_<timestamp>.jsonl.gz
+        # (was *_truth_*.jsonl pre-refactor -- that pattern could never
+        # match again, silently breaking this tool until caught 2026-09-05
+        # by an explicit live test).
+        candidates = [f for f in ARCHIVE_DIR.glob("telemetry_*_*.jsonl.gz") if f.stat().st_mtime >= script_start - 1]
     if not candidates:
         return json.dumps({"script_log": script_result, "archived_file": None,
                             "warning_code": "NO_NEW_ARCHIVE",
-                            "note": "no newly-archived truth.jsonl found -- did the script include a "
+                            "note": "no newly-archived flight found -- did the script include a "
                                      "{'commands': ['telemetry off']} step?"}, indent=2)
     newest = max(candidates, key=lambda f: f.stat().st_mtime)
     samples = await asyncio.to_thread(st.load_samples, newest)
     summary = st.flight_summary(samples)
     validation = st.validate_gravity_drag(samples)
+    logged_path = newest
     if params.tag:
-        await asyncio.to_thread(_append_flight_log, newest, params.tag, params.notes, summary)
+        # Same protection sfsprobe_tag_flight gives -- copy into kept/
+        # BEFORE logging, so this tag survives the next same-mode
+        # recording's DeletePreviousArchive the same way a direct
+        # sfsprobe_tag_flight call does. Previously logged 'newest'
+        # directly, leaving run_and_analyze tags unprotected while
+        # sfsprobe_tag_flight's were safe -- an inconsistency caught
+        # 2026-09-05 alongside the glob-pattern bug above.
+        logged_path = await asyncio.to_thread(_copy_to_kept, newest)
+        await asyncio.to_thread(_append_flight_log, logged_path, params.tag, params.notes, summary)
     return json.dumps({
-        "script_log": script_result, "archived_file": str(newest),
+        "script_log": script_result, "archived_file": str(logged_path),
         "flight_summary": summary, "drag_validation_summary": validation["summary"],
         "tagged": bool(params.tag),
     }, indent=2)

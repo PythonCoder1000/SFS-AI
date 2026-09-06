@@ -13,6 +13,7 @@ honestly when data is missing or a heuristic is uncertain, rather than
 silently returning a plausible-looking but ungrounded number.
 """
 
+import gzip
 import json
 import math
 import statistics
@@ -46,9 +47,27 @@ LOW_TOLERANCE_DESTRUCTION_C = 400.0 * 1.03
 # Loading
 # ---------------------------------------------------------------------------
 
+def _open_samples_file(path: Path):
+    """Opens a telemetry file for text reading, transparently handling
+    gzip -- v0.60.0's unified archive lifecycle always gzips a stopped
+    recording (see SFSProbe.cs's ArchiveOne), so any archived flight
+    passed here is realistically a .gz today. Detected by real magic
+    bytes (1f 8b), not just the .gz suffix, so an oddly-named or
+    extension-stripped gzipped file still works rather than silently
+    mis-parsing binary junk as JSON. Decompresses straight into memory
+    via gzip.open's text mode -- never writes an unzipped copy to disk,
+    per the project's storage rule of thumb (2026-09-05).
+    """
+    with open(path, "rb") as probe:
+        magic = probe.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, "rt")
+    return open(path, "r")
+
+
 def load_samples(path: Path) -> list[dict]:
     samples = []
-    with open(path) as f:
+    with _open_samples_file(path) as f:
         for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -966,3 +985,97 @@ def part_lookup(snapshot: dict, name_substring: str) -> list[dict]:
                 "heat_tolerance": p.get("HeatTolerance"),
             })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Parts-mode ('telemetry json' -- SFSProbe.cs's BuildRocketJsonSnapshot,
+# v0.59.0) analysis. Each sample here is a full per-tick structural
+# snapshot: {"t":..., "partCount":..., "mass":..., "parts":[{"id":
+# "<name>#<refId>", "name":..., "mass":..., "resourcePercent": <float or
+# null -- null means "not a fuel-bearing part", NOT "confirmed empty">,
+# "temperature":...}, ...]}. This is a genuinely different data shape
+# from the flat per-tick schema every other function above assumes
+# (nested list of parts vs flat scalar keys), so it gets its own
+# function rather than forcing field_stats/field_search/etc. to also
+# understand nested records -- see MCP capability-gap discussion,
+# 2026-09-05.
+#
+# 'id' embeds a live .NET RuntimeHelpers.GetHashCode() -- stable for one
+# recording's continuous run of samples (same object instance every tick
+# a part exists), NOT a persistent identifier across separate
+# recordings or game restarts. Never compare ids across two different
+# flight files.
+#
+# The schema has NO explicit "broken" flag. The signal for "this part
+# broke or was staged away" is its id simply not appearing in a later
+# snapshot's "parts" list -- that's what "vanished" below detects.
+# ---------------------------------------------------------------------------
+
+def parts_timeline(samples: list[dict], name_substring: Optional[str] = None) -> dict:
+    """Tracks every part id across a parts-mode recording's snapshots.
+    Answers what the flat per-tick view can't: which specific fuel tank
+    lost the most resourcePercent, and which parts vanished (destroyed
+    or staged away) before the recording ended.
+
+    name_substring: optional case-insensitive filter on part name (e.g.
+    'Fuel Tank'), applied BEFORE tracking -- so asking about only fuel
+    tanks doesn't pull in vanished-RCS-thruster noise from staging.
+    """
+    if not samples:
+        return {"part_count_tracked": 0, "parts": [], "vanished_parts": [], "most_resource_lost": []}
+
+    name_filter = name_substring.lower() if name_substring else None
+    final_t = samples[-1].get("t")
+    tracked: dict[str, dict] = {}
+
+    for sample in samples:
+        t = sample.get("t")
+        for part in sample.get("parts", []):
+            pid = part.get("id")
+            if pid is None:
+                continue
+            if name_filter and name_filter not in (part.get("name") or "").lower():
+                continue
+            entry = tracked.get(pid)
+            if entry is None:
+                entry = {
+                    "id": pid,
+                    "name": part.get("name"),
+                    "first_seen_t": t,
+                    "resource_percent_first": part.get("resourcePercent"),
+                    "mass_first": part.get("mass"),
+                }
+                tracked[pid] = entry
+            entry["last_seen_t"] = t
+            entry["resource_percent_last"] = part.get("resourcePercent")
+            entry["mass_last"] = part.get("mass")
+            entry["temperature_last"] = part.get("temperature")
+
+    parts_list = []
+    for entry in tracked.values():
+        vanished = entry["last_seen_t"] != final_t
+        rp_first, rp_last = entry.get("resource_percent_first"), entry.get("resource_percent_last")
+        resource_drop = (
+            rp_first - rp_last
+            if isinstance(rp_first, (int, float)) and isinstance(rp_last, (int, float))
+            else None
+        )
+        parts_list.append({
+            **entry,
+            "vanished": vanished,
+            "vanished_at_t": entry["last_seen_t"] if vanished else None,
+            "resource_percent_drop": resource_drop,
+        })
+
+    vanished_parts = [p for p in parts_list if p["vanished"]]
+    most_resource_lost = sorted(
+        (p for p in parts_list if p["resource_percent_drop"] is not None),
+        key=lambda p: p["resource_percent_drop"], reverse=True,
+    )[:10]
+
+    return {
+        "part_count_tracked": len(parts_list),
+        "parts": parts_list,
+        "vanished_parts": vanished_parts,
+        "most_resource_lost": most_resource_lost,
+    }

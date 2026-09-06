@@ -6,6 +6,150 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-09-05 (latest) — telemetry archive lifecycle refactor: Python side (MCP capability audit + implementation)
+
+**Context:** `SFSProbe.cs` v0.60.0 unified the telemetry archive lifecycle
+(single merged flat file, gzip-then-delete-raw on stop, delete-previous-
+.gz on next start of the same mode -- see `mod_changelog.md` v0.60.0). This
+entry is the Python-side follow-through: an MCP capability audit
+(loosely following a generic tool-improvement framework Christian
+provided, applied to `sfsprobe_mcp`'s real codebase after actually
+reading it, not assumed) that found every one of the 16 flight-file
+analysis tools was now silently broken against real archived flights,
+plus three genuine capability gaps worth closing in the same pass.
+
+**1. Gzip transparency -- the single highest-leverage fix.**
+`analysis/sfs_telemetry.py`'s `load_samples(path)` is the one chokepoint
+every flight-file tool routes through (`field_stats`, `field_search`,
+`downsample`, `field_at_time`, `flight_summary`, `phase_detect`,
+`find_events`, `clean_segments`, `apoapsis_periapsis`, `delta_v`,
+`compare_flights`, `noise_floor`, `validate_gravity_drag`,
+`regression_check`, `flight_to_csv`, `tag_flight` -- 16 tools). It did a
+plain `open()` with zero gzip awareness; since v0.60.0 archives every
+flight is a `.gz`, this one function being broken meant all 16 tools
+were broken, not just theoretically at-risk. New `_open_samples_file()`
+helper detects real gzip magic bytes (`1f 8b`), not just the `.gz`
+suffix, and decompresses straight into memory via `gzip.open(path,
+"rt")` -- never writes an unzipped copy to disk, per the project's
+storage rule of thumb (2026-09-05). One function fixed, sixteen tools
+unblocked.
+
+**Same bug, found independently in THREE more places while auditing,
+all fixed the same way** (reusing `st.load_samples` instead of
+duplicating the fix): `analysis/forward_sim.py`'s `test_against_run()`
+(its own raw `open()`), its control-input loader (a second raw `open()`
+in the same file), and `prep_demo_data()` (a third, for the interactive
+prediction-demo artifact's self-test). None of these were caught by
+the original MCP-side audit since they live outside `sfsprobe_mcp/` --
+found only because the audit extended into `analysis/` too.
+
+**2. Stale `TRUTH_FILE`/`INPUTS_FILE` constants -- a currently-live bug,
+not just future risk.** `sfsprobe_mcp/server.py` still pointed
+`_resolve_flight_path(None)` (the "use the live recording" fallback),
+`_wait_until` (the `run_flight_script`/`run_and_analyze` live-condition
+poller), and `tail_file`'s `truth`/`inputs` targets at `truth.jsonl`/
+`inputs.jsonl`, which v0.60.0 merged away in favor of `sample.jsonl`.
+Concretely: **any `wait_until` step in a scripted flight was silently
+non-functional the moment the mod shipped v0.60.0**, not a hypothetical.
+Repointed to new `SAMPLE_FILE`/`ROCKETSTATE_FILE` constants; `tail_file`
+gained a `parts` target (tailing the live `rocketstate.jsonl` had no
+path at all before this).
+
+**3. `sfsprobe_tag_flight` didn't survive the new auto-delete policy.**
+Tagging only ever logged a path string -- under v0.60.0's "new runs
+overwrite previous results" policy, that path could get deleted by the
+next same-mode recording, silently orphaning the tag. New
+`_copy_to_kept(path)` copies the `.gz` into `archive/kept/` (a no-op if
+it's already there) before logging; `sfsprobe_tag_flight` now logs the
+durable `kept/` path, not the transient archive one. `sfsprobe_list_flights`'
+untagged-file glob (`*_truth_*.jsonl`, the old naming) was also stale --
+fixed to `telemetry_*_*.jsonl.gz`.
+
+**4. New `sfsprobe_parts_timeline` -- the 'parts' mode (`telemetry
+json`) recording had ZERO analysis tooling before this**, despite being
+the literal feature built to answer "which fuel tank lost fuel, when
+did something break." Rather than forking a parallel tool family
+(`get_fuel_drain`/`find_broken_part`/...), one generalized capability:
+`st.parts_timeline(samples, name_substring=None)` tracks every part id
+(confirmed against `BuildRocketJsonSnapshot`'s real schema in
+`SFSProbe.cs`, not assumed) across a recording's snapshots, reporting
+first/last resourcePercent and mass per part, which parts vanished
+before the recording's final sample (the schema has no explicit
+'broken' flag -- disappearance from a later snapshot IS the signal),
+and the top 10 by resourcePercent drop. **First real run against this
+session's own earlier parts-mode test recording caught something
+genuine**: 37 of 38 parts vanished (`partCount` 38->1) -- something
+destroyed almost the whole rocket during that live test, previously
+unnoticed.
+
+**5. New `sfsprobe_test_against_run` -- the forward integrator's own
+end-to-end validation had no MCP wrapper**, despite every OTHER
+validation step (`validate_gravity_drag`, `regression_check`,
+`noise_floor`) already having one. Straight wrap of
+`forward_sim.test_against_run()` (itself fixed under item 1 above).
+
+**6. New `sfsprobe_test_against_run_trajectory` -- the deeper fix.**
+Originally scoped as "generalize `divergence_check` into a trajectory
+curve"; course-corrected after actually reading `divergence_check`'s
+code, since it compares one sample against FIXED SCALAR targets
+(`{"h": 5000}`) -- a genuinely different operation from comparing a
+PREDICTED trajectory against the ACTUAL one over time, and forcing them
+together would have blurred a real semantic boundary rather than
+generalized one. The right fix: `forward_simulate()` already returns
+the FULL predicted trajectory (`list[dict]`, one entry per RK4 step) --
+`test_against_run()` itself only ever looked at `sim[-1]`, discarding
+every intermediate step. Refactored the shared setup (real-flight load,
+starting-state construction, control-schedule replay) into a new
+`_prepare_replay()` helper used by both functions (zero behavior change
+for the existing `test_against_run` -- verified by running it against
+two real flight files post-refactor and confirming identical validation
+behavior), then added `test_against_run_trajectory()`, which walks every
+predicted step and compares against the real flight at that timestamp,
+reporting position error and rotation error as SEPARATE curves --
+directly answering `docs/high_level_checklist.md`'s open item
+("characterize forward integrator compounding error separately for
+position vs. rotation") that this project had no real per-step data for
+before now. Even `test_against_run`'s own single-endpoint check never
+reported rotation error at all until this pass.
+
+**Units caught before they became a silent bug:** confirmed against
+`docs/sfs_source_reference.md` (not assumed) that `rb2d.rotation` is
+degrees and `rb2d.angularVelocity` is deg/s -- Unity's `Rigidbody2D`
+convention, NOT radians -- meaning both already match
+`forward_simulate`'s own `theta_deg`/`omega_degs` directly. Applying
+`math.degrees()` to an already-degree value (the natural first guess)
+would have silently produced a rotation error ~57x too large without
+ever raising an exception.
+
+**Verification:** `python3 -m py_compile` on all three touched files,
+plus a real import + tool-registration smoke test via the project's own
+venv (`PYTHONPATH=` cleared to avoid an unrelated `mcp` package shadow
+from `mac-terminal-mcp`'s bundled deps) -- confirms all 40 tools
+register cleanly (37 original + 3 new). Beyond that, real functional
+tests against actual files from this session: `load_samples` against
+both a new `.gz` archive AND an old pre-refactor uncompressed `kept/`
+file (backward compatible), `flight_summary` end-to-end through the
+gzip path, `parts_timeline` against a real parts-mode recording (the
+38->1 finding above), and `test_against_run_trajectory` against two
+real flight files (both correctly hit the same pre-existing, unmodified
+validation error for missing control-input fields -- confirming the
+refactor preserved behavior rather than silently changing it). None of
+this touched the live game -- pure static analysis against files
+already on disk.
+
+**Not done, explicitly deferred (noted per the audit framework's own
+"remaining opportunities" step, not silently dropped):** per-engine ISP
+for `delta_v` (needs either a new computed telemetry field or an
+IL-sourced catalog lookup -- real mod-side work, insufficiently
+justified to bundle into a Python-side pass). The `output_TurnAxisTorque`/
+`output_DirectionalAxis.x` field-naming mismatch surfaced during
+verification (neither of today's real flat-mode recordings had those
+exact field names, even in full-telemetry mode) is flagged as a finding
+for the NEXT session, not fixed here -- touching it without fully
+understanding why the naming differs risked a worse, silent bug.
+
+---
+
 ## 2026-09-04 (latest) — `sfsprobe_registry_audit` drift auditor (MCP overhaul Checkpoint 7, part 1)
 
 **Context:** `docs/mcp_overhaul_checkpoint_prompt.md`, Checkpoint 7 /

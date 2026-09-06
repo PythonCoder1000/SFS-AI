@@ -676,6 +676,13 @@ assumed from a model.
       item just formally tracks it at the Tier 1 level, since it's a
       real prerequisite for calling the integrator done, not an optional
       nice-to-have.
+      **2026-09-05 update:** `test_against_run` and the new
+      `test_against_run_trajectory` (full predicted-vs-actual curve,
+      position/rotation error separated) are both now wrapped as MCP
+      tools and confirmed working end-to-end via real live testing —
+      but only against tiny (<1min, mostly stationary) test flights with
+      a stale craft_config. The tooling gap is closed; the actual real-
+      mission run this item describes still hasn't happened.
 - [ ] **Determine actual error-compounding behavior empirically, not by
       assumed model.** The only real data point so far: four 10-second
       BLIND-mode (no control replay) forward-sims from an earlier

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -30,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.58.0";
+        public const string VersionString = "0.60.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -52,7 +53,7 @@ namespace SFSProbe
             catch (Exception e) { Debug.Log("[SFSProbe] couldn't set MONOMOD_DMDType: " + e.Message); }
 
             OutDir = ModFolder;
-            Log("=== v" + VersionString + " loaded (fix: 'telemetry' command now rejects an unrecognized mode word instead of silently treating it as 'off' -- found 2026-09-04 via live MCP fast-fail testing; 'telemetry snapshot' used to silently StopRecording() an active flight, or silently no-op + timeout if already off; see mod_changelog.md v0.58.0) ===");
+            Log("=== v" + VersionString + " loaded (telemetry archive lifecycle unified: flat ('truth'+'inputs' merged into one file/tag 'flat') and json ('rocketstate' renamed 'parts') modes now share one naming scheme telemetry_<mode>_<timestamp>.jsonl, gzip-then-delete-raw on stop, delete-previous-.gz-for-that-mode on next start -- see mod_changelog.md v0.60.0) ===");
             SceneManager.sceneLoaded += OnSceneLoaded;
             Probe.DumpMenu("load");
             try
@@ -152,6 +153,7 @@ namespace SFSProbe
         void FixedUpdate()
         {
             if (Probe.Telemetry) Probe.Sample();
+            if (Probe.TelemetryJson) Probe.SampleJson();
             if (Probe.AutoStop) Probe.CheckAutoStop();
             if (Probe.Telemetry) Probe.CheckSeparation();
             Probe.CheckScript();
@@ -232,6 +234,14 @@ namespace SFSProbe
         }
         static int sampleCount;
         static int flightNumber;
+
+        // JSON rocket-state snapshot recorder (v0.59.0) -- fully independent
+        // lifecycle from the truth/inputs telemetry above. See 'telemetry json
+        // on/off' in Command() and SampleJson()/BuildRocketJsonSnapshot() below.
+        public static bool TelemetryJson;
+        static int jsonSampleCount;
+        static int jsonFlightNumber;
+        static double lastJsonSnapshotT = double.NegativeInfinity;
 
         // Scoped-telemetry field spec (v0.29). null = default full-schema
         // recording (unchanged behavior). Non-null = only these fields are
@@ -678,7 +688,14 @@ namespace SFSProbe
                                     // the previous recording's rocket count
             telemetryFields = fields;
             LoadTelemetryTriggers(triggerSpec);
-            ArchiveTelemetry();
+            // v0.60.0 unified archive lifecycle: discard any stray leftover live
+            // file from an uncleanly-stopped previous recording (rare -- e.g. a
+            // crash), then delete the LAST COMPLETED run's archive for this mode.
+            // New runs overwrite previous results by design; a flight that needs
+            // to survive this must be tagged via sfsprobe_tag_flight, which copies
+            // it into archive/kept/ BEFORE it can be deleted here.
+            ClearLiveFile("sample.jsonl");
+            DeletePreviousArchive("flat");
             Telemetry = true;
             string scopeNote = fields == null ? "full" : ("scoped[" + fields.Length + "]: " + string.Join(",", fields));
             ProbeMod.Result("[hotkey] recording STARTED  flight #" + flightNumber + "  mode=" + scopeNote);
@@ -688,12 +705,45 @@ namespace SFSProbe
         {
             if (!Telemetry) return;
             Telemetry = false;
-            string a1 = ArchiveOne("inputs.jsonl", "inputs", flightNumber);
-            string a2 = ArchiveOne("truth.jsonl", "truth", flightNumber);
+            string a1 = ArchiveOne("sample.jsonl", "flat");
             ProbeMod.Result("[hotkey] recording STOPPED  flight #" + flightNumber +
                              "  samples=" + sampleCount +
-                             "  -> " + (a1 ?? "(no inputs)") + "  " + (a2 ?? "(no truth)"));
+                             "  -> " + (a1 ?? "(no samples)"));
             telemetryFields = null;   // next hotkey (Enter) always starts back in full mode
+        }
+
+        // ---------- JSON rocket-state snapshot recorder (v0.59.0, lifecycle
+        // unified with flat mode in v0.60.0) ----------
+        // 'telemetry json on' / 'telemetry json off' -- see the "telemetry"
+        // command case and SampleJson()/BuildRocketJsonSnapshot() for the full
+        // design writeup. Deliberately a SEPARATE bool/lifecycle from
+        // Telemetry above: can run alongside scoped/full flat telemetry, or
+        // entirely on its own, since it answers a different question ("what
+        // does the rocket structurally look like right now") at a much
+        // slower, deliberately un-synced cadence (~1 Hz) than the physics
+        // telemetry (~60 Hz). Archive tag is "parts" (renamed from
+        // "rocketstate" in v0.60.0 to match the flat/parts mode-naming
+        // convention the archive lifecycle now shares with flat mode).
+        public static void StartJsonRecording()
+        {
+            if (TelemetryJson) return;
+            jsonFlightNumber++;
+            jsonSampleCount = 0;
+            lastJsonSnapshotT = double.NegativeInfinity;   // force an immediate first snapshot
+            ClearLiveFile("rocketstate.jsonl");
+            DeletePreviousArchive("parts");
+            TelemetryJson = true;
+            ProbeMod.Result("[json] recording STARTED  flight #" + jsonFlightNumber + "  ~1 Hz -> rocketstate.jsonl");
+        }
+
+        public static void StopJsonRecording()
+        {
+            if (!TelemetryJson) return;
+            TelemetryJson = false;
+            string a3 = ArchiveOne("rocketstate.jsonl", "parts");
+            ProbeMod.Result("[json] recording STOPPED  flight #" + jsonFlightNumber +
+                             "  samples=" + jsonSampleCount +
+                             "  -> " + (a3 ?? "(no rocketstate)"));
         }
 
         // ================================================================
@@ -764,8 +814,8 @@ namespace SFSProbe
                 Syntax = "menu",
                 Description = "Forces an immediate menu-state dump (DumpMenu)." },
             new ProbeCommandInfo { Name = "telemetry", Category = "telemetry",
-                Syntax = "telemetry on | telemetry on <field1>,<field2>,... [| <cond>@<sec>:<cmd>; ...] | telemetry off",
-                Description = "Starts/stops per-tick recording to truth.jsonl (+inputs.jsonl in full mode). No field list = full schema (every field this mod knows). A field list = scoped mode, one row per tick, computed:<name> allowed. Optional '| ...' suffix adds auxiliary triggers that fire on-demand commands while a script-condition expression holds true ('| auto' = built-in default, '| none' = disabled). Second word must be 'on', 'off', or omitted (defaults to 'off') -- v0.58.0+ rejects anything else as an error instead of silently stopping recording." },
+                Syntax = "telemetry on | telemetry on <field1>,<field2>,... [| <cond>@<sec>:<cmd>; ...] | telemetry off | telemetry json on | telemetry json off",
+                Description = "Starts/stops per-tick recording to a single live file (sample.jsonl) merging truth+input fields into one JSON object per tick (v0.60.0: truth.jsonl/inputs.jsonl split removed -- one record per tick, not two). No field list = full schema (every field this mod knows). A field list = scoped mode, one row per tick, computed:<name> allowed. Optional '| ...' suffix adds auxiliary triggers that fire on-demand commands while a script-condition expression holds true ('| auto' = built-in default, '| none' = disabled). Second word must be 'on', 'off', 'json', or omitted (defaults to 'off') -- v0.58.0+ rejects an unrecognized word as an error instead of silently stopping recording. On 'off', the live file is archived to archive/telemetry_flat_<timestamp>.jsonl.gz (gzipped, raw deleted immediately -- JSON only lives on disk during the run). The NEXT 'telemetry on' deletes that .gz first: new runs overwrite previous results. Use sfsprobe_tag_flight to copy a .gz into archive/kept/ before it's superseded, if it needs to survive. SEPARATELY, 'telemetry json on'/'telemetry json off' (v0.59.0) starts/stops an independent ~1Hz full per-part JSON rocket-state snapshot recorder to rocketstate.jsonl, archived the same way under tag 'parts' (archive/telemetry_parts_<timestamp>.jsonl.gz) -- its own lifecycle, can run alongside or instead of the above. See the 'field' domain for its per-part schema (id/name/mass/resourcePercent/temperature)." },
             new ProbeCommandInfo { Name = "throttle", Category = "control",
                 Syntax = "throttle <0-1 float>",
                 Description = "Sets throttlePercent (amount only). Does NOT touch master ignition (throttleOn)." },
@@ -1129,7 +1179,20 @@ namespace SFSProbe
                     //   auxiliary triggers entirely.
                     string[] parts3 = line.Split(new char[] { ' ' }, 3);
                     string mode = parts3.Length > 1 ? parts3[1] : null;
-                    if (mode == "on")
+                    if (mode == "json")
+                    {
+                        // "telemetry json on" / "telemetry json off" (v0.59.0) --
+                        // the independent per-part JSON rocket-state snapshot
+                        // recorder (rocketstate.jsonl, ~1 Hz), separate from the
+                        // truth/inputs telemetry above -- see StartJsonRecording/
+                        // StopJsonRecording/SampleJson for the full design.
+                        string jsonSubMode = parts3.Length > 2 ? parts3[2].Trim() : null;
+                        if (jsonSubMode == "on") StartJsonRecording();
+                        else if (jsonSubMode == "off" || string.IsNullOrEmpty(jsonSubMode)) StopJsonRecording();
+                        else ProbeMod.Result("telemetry json: unrecognized mode '" + jsonSubMode +
+                                              "' -- expected 'on' or 'off'. Command ignored.");
+                    }
+                    else if (mode == "on")
                     {
                         string[] fields = null;
                         string triggerSpec = null;
@@ -3579,10 +3642,22 @@ namespace SFSProbe
                 if (telemetryFields != null)
                 {
                     // Scoped mode (v0.29): caller-selected fields only, single
-                    // file (truth.jsonl), one JSON key per requested field. See
-                    // ResolvePath/AppendComputedField below and the "telemetry"
-                    // command case above for the spec syntax. inputs.jsonl is
-                    // deliberately NOT written in this mode.
+                    // TRUTH file (truth.jsonl), one JSON key per requested field.
+                    // See ResolvePath/AppendComputedField below and the
+                    // "telemetry" command case above for the spec syntax.
+                    //
+                    // inputs.jsonl fix (v0.59.0, 2026-09-05): this mode used to
+                    // skip inputs.jsonl entirely -- meaning any flight recorded
+                    // with a curated field list (which is most physics-validation
+                    // flights, since full mode's truth schema is much heavier and
+                    // not what those flights want) had NO control-input record at
+                    // all, making a real REPLAY-mode forward-integrator run
+                    // against it impossible even though the flight itself was
+                    // fine. inputs.jsonl recording is now UNCONDITIONAL whenever
+                    // Telemetry is on, in both scoped and full mode -- decoupled
+                    // from which truth fields were requested, via the exact same
+                    // BuildInputsSample() full-mode already uses below, so the two
+                    // code paths can never silently drift apart on schema.
 
                     // Auxiliary conditional triggers (v0.53.0+) -- see the
                     // telemetryTriggers/LoadTelemetryTriggers/CheckTelemetryTriggers
@@ -3629,21 +3704,143 @@ namespace SFSProbe
                         }
                     }
                     sb3.Append("}");
-                    ProbeMod.Append("truth.jsonl", sb3.ToString());
+
+                    // v0.60.0: truth+inputs merged into one live file/line
+                    // under the unified telemetry archive lifecycle (single
+                    // 'flat'-mode archive, gzip-on-stop) -- see ArchiveOne/
+                    // DeletePreviousArchive and the "telemetry" command case.
+                    // Same BuildInputsSample() full mode uses, so the two
+                    // paths can never silently drift apart on schema.
+                    object rbScoped = Get(r, "rb2d");
+                    string mergedScoped = MergeJsonObjects(sb3.ToString(), BuildInputsSample(r, rbScoped, t));
+                    ProbeMod.Append("sample.jsonl", mergedScoped);
+
                     sampleCount++;
                     return;
                 }
 
                 object rb = Get(r, "rb2d");
                 string inputsLine = BuildInputsSample(r, rb, t);
-                ProbeMod.Append("inputs.jsonl", inputsLine);
-
                 string truthLine = BuildTruthSample(r, rb, loc, t);
-                ProbeMod.Append("truth.jsonl", truthLine);
+                ProbeMod.Append("sample.jsonl", MergeJsonObjects(truthLine, inputsLine));
 
                 sampleCount++;
             }
             catch (Exception e) { ProbeMod.Log("sample error: " + e.Message); }
+        }
+
+        // ---------- JSON rocket-state snapshot recorder (v0.59.0) ----------
+        // Independent of Sample()/Telemetry above -- runs on its own
+        // 'telemetry json on/off' lifecycle, own file (rocketstate.jsonl), own
+        // archive naming, own cadence. Deliberately NOT per-tick: fires at most
+        // once per real SECOND OF SIM TIME (gated on Location.time, the same
+        // clock truth.jsonl's own "t" uses, so the two files can be correlated
+        // on one shared time axis even though they're sampled ~60x apart). A
+        // full per-part JSON snapshot at full 60Hz would be ~60x the size for
+        // no real analysis benefit -- see the 2026-09-05 chat sizing this
+        // against a real 38-part blueprint (~3.3KB/snapshot at 1Hz -> ~2MB for
+        // a 10-minute flight, vs. ~120MB at a naive 60Hz).
+        //
+        // Each entry is a COMPLETE snapshot, not a diff -- a reader never has
+        // to reconstruct state by replaying deltas. There is no in-place
+        // "current" flag rewritten onto old entries (that would mean
+        // rewriting the whole file every second); by convention here, matching
+        // every other recorder in this file, the LAST line in rocketstate.jsonl
+        // is the current state and every earlier line is history.
+        //
+        // Per-part id: a part's display name is NOT unique (a rocket with 9
+        // fuel tanks has nine parts all named "Fuel Tank"), so name alone
+        // can't track one SPECIFIC tank's mass across snapshots. There is no
+        // persistent per-part id anywhere in the game's own data (Part has no
+        // serialized id/GUID field). This uses .NET object reference identity
+        // instead (RuntimeHelpers.GetHashCode) appended to the name -- stable
+        // for a given part's entire lifetime in memory, unlike a list index
+        // (which shifts for every part after a staging event drops one).
+        //
+        // "What broke": there is no broken:true flag to read anywhere -- a
+        // destroyed part is removed from partHolder.parts entirely, not
+        // marked broken in place. A part's id present in snapshot N and
+        // absent in snapshot N+1 means it was destroyed or staged off
+        // sometime in that ~1s window -- that disappearance IS the signal,
+        // recoverable by diffing two consecutive snapshots' part id sets.
+        public static void SampleJson()
+        {
+            try
+            {
+                object r = ActiveRocket();
+                if (r == null) return;
+                object loc = Unwrap(Get(r, "location"));
+                double t = ToD(Get(loc, "time"));
+                if (t - lastJsonSnapshotT < 1.0) return;
+                lastJsonSnapshotT = t;
+
+                string line = BuildRocketJsonSnapshot(r, t);
+                ProbeMod.Append("rocketstate.jsonl", line);
+                jsonSampleCount++;
+            }
+            catch (Exception e) { ProbeMod.Log("sampleJson error: " + e.Message); }
+        }
+
+        static string BuildRocketJsonSnapshot(object r, double t)
+        {
+            object holder = Get(r, "partHolder");
+            object parts = Get(holder, "parts");
+            var en = parts as System.Collections.IEnumerable;
+            var partLines = new List<string>();
+            if (en != null)
+            {
+                foreach (object part in en)
+                {
+                    string pname = "?";
+                    try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+                    int refId = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(part);
+
+                    float mass = float.NaN;
+                    try { mass = ToF(GetWrapped2(Get(part, "mass"))); } catch { }
+
+                    // resourcePercent only exists for parts with a ResourceModule
+                    // (fuel tanks) -- "null" for everything else, deliberately NOT
+                    // 0 (0 would falsely mean "confirmed empty tank").
+                    string resourcePctStr = "null";
+                    object resOwner = null;
+                    object heatOwner = null;
+                    foreach (object mv in ModuleValues(part))
+                    {
+                        string mvType = mv.GetType().Name;
+                        if (mvType == "ResourceModule" && resOwner == null) resOwner = mv;
+                        else if (mvType == "HeatModule" && heatOwner == null) heatOwner = mv;
+                    }
+                    if (resOwner != null)
+                    {
+                        try { resourcePctStr = Num(ToD(GetWrapped2(Get(resOwner, "resourcePercent")))); }
+                        catch { }
+                    }
+
+                    // Same owner-fallback pattern as GetHeatState above: prefer a
+                    // real HeatModule if this part has one, else read Temperature
+                    // straight off the part itself.
+                    if (heatOwner == null) heatOwner = part;
+                    float temp = float.NegativeInfinity;
+                    try { temp = ToF(Get(heatOwner, "Temperature")); } catch { }
+
+                    var pb = new StringBuilder();
+                    pb.Append("{\"id\":\"").Append(pname.Replace("\"", "'")).Append("#").Append(refId).Append("\"")
+                      .Append(",\"name\":\"").Append(pname.Replace("\"", "'")).Append("\"")
+                      .Append(",\"mass\":").Append(Num(mass))
+                      .Append(",\"resourcePercent\":").Append(resourcePctStr)
+                      .Append(",\"temperature\":").Append(NumOrInf(temp))
+                      .Append("}");
+                    partLines.Add(pb.ToString());
+                }
+            }
+
+            var sb = new StringBuilder();
+            sb.Append("{\"t\":").Append(Num(t));
+            sb.Append(",\"partCount\":").Append(partLines.Count);
+            sb.Append(",\"mass\":").Append(Num(Get(Get(r, "rb2d"), "mass")));
+            sb.Append(",\"parts\":[").Append(string.Join(",", partLines.ToArray())).Append("]");
+            sb.Append("}");
+            return sb.ToString();
         }
 
         // Extracted 2026-08-30 from Sample()'s inline body, unchanged logic --
@@ -4208,15 +4405,62 @@ namespace SFSProbe
             return w;
         }
 
-        // ---------- archiving ----------
+        // ---------- archiving (v0.60.0: unified lifecycle, both modes) ----------
+        // One naming scheme for both flat and parts modes:
+        // telemetry_<mode>_<timestamp>.jsonl -> gzipped to .jsonl.gz on
+        // ArchiveOne, raw deleted immediately after. At most one archived
+        // .gz per mode ever sits on disk -- DeletePreviousArchive(mode) is
+        // called at the START of the NEXT recording of that mode (not here),
+        // so an untagged flight's .gz survives until superseded, giving a
+        // window to tag it. sfsprobe_tag_flight copies a .gz into
+        // archive/kept/ to make it permanent -- that's the only path out of
+        // this overwrite policy.
 
-        static void ArchiveTelemetry()
+        // Deletes a stray leftover LIVE file (uncommitted, from an uncleanly-
+        // stopped previous recording) before a fresh one starts. Not archived
+        // -- partial data from a botched run isn't worth preserving over the
+        // last COMPLETED run's archive, which DeletePreviousArchive handles
+        // separately.
+        static void ClearLiveFile(string liveName)
         {
-            ArchiveOne("inputs.jsonl", "inputs", 0);
-            ArchiveOne("truth.jsonl", "truth", 0);
+            try
+            {
+                string live = Path.Combine(ProbeMod.OutDir ?? ".", liveName);
+                if (File.Exists(live)) File.Delete(live);
+            }
+            catch (Exception e) { ProbeMod.Log("ClearLiveFile(" + liveName + ") failed: " + e.Message); }
         }
 
-        static string ArchiveOne(string liveName, string tag, int flightNum)
+        // Deletes any previously archived .gz for this mode ("flat" or
+        // "parts") before a new recording of that mode starts. This is what
+        // makes "new runs overwrite previous results" real -- called from
+        // StartRecording/StartJsonRecording, not from ArchiveOne itself, so
+        // the just-completed archive survives until the NEXT run begins
+        // (giving sfsprobe_tag_flight a window to promote it into
+        // archive/kept/ first if it's worth keeping).
+        static void DeletePreviousArchive(string mode)
+        {
+            try
+            {
+                string archiveDir = Path.Combine(ProbeMod.OutDir ?? ".", "archive");
+                if (!Directory.Exists(archiveDir)) return;
+                foreach (string f in Directory.GetFiles(archiveDir, "telemetry_" + mode + "_*.jsonl.gz"))
+                {
+                    try { File.Delete(f); ProbeMod.Log("deleted previous archive: " + Path.GetFileName(f)); }
+                    catch (Exception e) { ProbeMod.Log("could not delete previous archive " + f + ": " + e.Message); }
+                }
+            }
+            catch (Exception e) { ProbeMod.Log("DeletePreviousArchive(" + mode + ") failed: " + e.Message); }
+        }
+
+        // Moves the live file into archive/ under the unified naming scheme,
+        // gzips it, then deletes the raw .jsonl -- the raw form only ever
+        // exists ON DISK during the recording itself, per the project's
+        // storage rule of thumb (2026-09-05): JSON only lives during the
+        // run; once stopped, it's zipped; new runs overwrite previous
+        // results (see DeletePreviousArchive, called separately at the
+        // START of the next recording, not here).
+        static string ArchiveOne(string liveName, string mode)
         {
             try
             {
@@ -4227,15 +4471,39 @@ namespace SFSProbe
                 string archiveDir = Path.Combine(ProbeMod.OutDir ?? ".", "archive");
                 Directory.CreateDirectory(archiveDir);
                 string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-                string name = flightNum > 0
-                    ? "flight" + flightNum.ToString("D2") + "_" + tag + "_" + stamp + ".jsonl"
-                    : tag + "_" + stamp + ".jsonl";
+                string name = "telemetry_" + mode + "_" + stamp + ".jsonl";
                 string dest = Path.Combine(archiveDir, name);
                 File.Move(live, dest);
-                ProbeMod.Log("archived -> archive/" + name);
-                return "archive/" + name;
+
+                string gzName = name + ".gz";
+                string gzDest = Path.Combine(archiveDir, gzName);
+                using (FileStream rawStream = File.OpenRead(dest))
+                using (FileStream gzStream = File.Create(gzDest))
+                using (GZipStream gzip = new GZipStream(gzStream, CompressionMode.Compress))
+                {
+                    rawStream.CopyTo(gzip);
+                }
+                File.Delete(dest);   // raw only lives during the run -- see rule of thumb above
+
+                ProbeMod.Log("archived -> archive/" + gzName);
+                return "archive/" + gzName;
             }
             catch (Exception e) { ProbeMod.Log("archive failed (" + liveName + "): " + e.Message); return null; }
+        }
+
+        // Merges two flat, single-line JSON objects of the form {"t":X,...}
+        // into one -- used to fold BuildInputsSample's output into the same
+        // per-tick record as BuildTruthSample's/scoped mode's, now that both
+        // write to one live file under the unified archive lifecycle
+        // (v0.60.0). Relies on the invariant (true for every caller) that
+        // both strings are flat objects ending in a bare "}" with nothing
+        // after it. b's leading {"t":<num> is redundant (same tick, same
+        // value as a's) and is stripped up to and including the first comma.
+        static string MergeJsonObjects(string a, string b)
+        {
+            int firstComma = b.IndexOf(',');
+            string bRemainder = firstComma >= 0 ? b.Substring(firstComma) : "";
+            return a.Substring(0, a.Length - 1) + bRemainder;
         }
 
         // ---------- dumps (menu/world/flight snapshots, unchanged) ----------

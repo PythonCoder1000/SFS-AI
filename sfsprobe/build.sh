@@ -36,6 +36,7 @@ mcs -target:library -out:SFSProbe.dll \
     -r:"$MANAGED/netstandard.dll" \
     -r:"$MANAGED/System.dll" \
     -r:"$MANAGED/System.Core.dll" \
+    -r:"$MANAGED/System.IO.Compression.dll" \
     -r:"$MANAGED/Assembly-CSharp.dll" \
     -r:"$MANAGED/UnityEngine.dll" \
     -r:"$MANAGED/UnityEngine.CoreModule.dll" \
