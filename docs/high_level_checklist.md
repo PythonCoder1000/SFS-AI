@@ -276,7 +276,20 @@ multi-engine, terrain, and RCS. Detail in `sfs_physics_reference.md` §5.
       (29.38 real vs 29.4 predicted for `turnAxis<0`; the `turnAxis>0`
       case, predicted exactly zero by geometric cancellation, landed
       close to the measurement noise floor). Median per-tick direction
-      error 6.1°. See `docs/sfs_source_reference.md` §D3.8 — including
+      error 6.1°. **2026-09-06 addendum:** IL-confirmed which mechanism
+      RCS torque actually goes through — `RcsModule.FixedUpdate` calls
+      the real Unity `AddForceAtPosition`, the exact same mechanism as
+      aero torque (goes through `rb2d.inertia`/Unity's solver), NOT a
+      direct `angularVelocity` write like SAS/manual turning. Not
+      explicitly stated anywhere in this project before now — found via
+      an exhaustive grep of all 9 real `set_angularVelocity` call sites
+      in the decompiled assembly. See `bookkeeping/active_state.md`
+      2026-09-06 for the full breakdown (also surfaced:
+      `RocketManager.MergeRockets` writes angularVelocity on docking,
+      not previously documented as a rotation-affecting event;
+      `Water_Rocket.FixedUpdate` is a separate, undecoded
+      buoyancy-physics rotation mechanism). See
+      `docs/sfs_source_reference.md` §D3.8 — including
       an honest note on a Python re-derivation bug (wrongly pooling all
       6 RCS modules' `count` together instead of scoping per-module)
       caught and corrected during the analysis; the probe tooling and
