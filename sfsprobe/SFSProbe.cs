@@ -31,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.62.0";
+        public const string VersionString = "0.63.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -928,8 +928,8 @@ namespace SFSProbe
                 Syntax = "airtemp",
                 Description = "One-shot real-time read of AeroModule.GetTemperatureAndShockwave's actual air-temperature output for the active rocket (same helper the realAirTemp truth field uses), without needing telemetry recording active." },
             new ProbeCommandInfo { Name = "telemetrysnapshot", Category = "telemetry",
-                Syntax = "telemetrysnapshot",
-                Description = "A genuine one-tick peek: builds exactly the same inputs/truth JSON a real recorded sample would contain (via the SAME BuildInputsSample/BuildTruthSample functions Sample() itself uses) WITHOUT touching Telemetry state, sampleCount, or either file. Works whether recording is on, off, or already running. Writes sfs_probe_telemetry_snapshot.json." },
+                Syntax = "telemetrysnapshot | telemetrysnapshot <comma-separated fields, no spaces>",
+                Description = "A genuine one-tick peek: builds exactly the same inputs/truth JSON a real recorded sample would contain (via the SAME BuildInputsSample/BuildTruthSample functions Sample() itself uses) WITHOUT touching Telemetry state, sampleCount, or either file. Works whether recording is on, off, or already running. No args: full inputs+truth dump (unchanged pre-v0.63.0 behavior). With args (v0.63.0): scoped mode, e.g. 'telemetrysnapshot rb2d.angularDrag,rb2d.inertia' -- same field syntax as 'telemetry on <fields>' (computed:, partCount, plain dot-paths), via the SAME BuildScopedSample() real scoped recording uses, so an ad-hoc field check doesn't need a full telemetry on/off round trip. Writes sfs_probe_telemetry_snapshot.json." },
             new ProbeCommandInfo { Name = "cheat", Category = "control",
                 Syntax = "cheat <ExactCaseSensitiveCheatName> (e.g. 'cheat InfiniteFuel')",
                 Description = "Calls SandboxSettings.main.Toggle<arg>() via reflection. arg is deliberately NOT lowercased -- reflection method-name lookup is case-sensitive. Known gap: InfiniteOxygen can never work (a UI button exists but no matching Toggle... method on SandboxSettings -- a real naming inconsistency in the game itself, not fixable probe-side). Valid <arg> values are whatever Toggle* methods exist on the live SandboxSettings type; not enumerable statically." },
@@ -988,6 +988,8 @@ namespace SFSProbe
                 Description = "alphaPred * 57.29578 -- predicted angular acceleration from torque/inertia", RequestAs = "telemetry on ...,computed:aeroTorque" },
             new ProbeFieldInfo { Key = "rbInertia", Namespace = "computed", Group = "aeroTorque", Unit = "Unity rb2d.inertia units (kg*m^2-equivalent)",
                 Description = "the actual moment of inertia used in the alpha calc", RequestAs = "telemetry on ...,computed:aeroTorque" },
+            new ProbeFieldInfo { Key = "rbAngularDrag", Namespace = "computed", Group = "aeroTorque", Unit = "Unity rb2d.angularDrag units (dimensionless damping coefficient)",
+                Description = "NEW v0.63.0: real Unity Rigidbody2D angularDrag, never read before -- AddForceAtPosition (real aero torque's mechanism) is genuine Unity physics and Unity's own solver applies this damping every tick; neither TryComputeAeroTorque's hand-derived alphaPred formula nor forward_sim.py's Python replica ever modeled it", RequestAs = "telemetry on ...,computed:aeroTorque" },
             new ProbeFieldInfo { Key = "gimbalOn", Namespace = "computed", Group = "gimbal", Unit = "bool",
                 Description = "primary gimbaling engine's gimbalOn; null if no gimbaling engine exists at all. 'Primary' = first ON gimbaling engine, falling back to the first gimbaling engine found (even if off) if none are on (v0.56.1 fix)", RequestAs = "telemetry on ...,computed:gimbal" },
             new ProbeFieldInfo { Key = "gimbalThrottleOut", Namespace = "computed", Group = "gimbal", Unit = "0-1 float",
@@ -2941,10 +2943,10 @@ namespace SFSProbe
                     object rAT2 = ActiveRocket();
                     if (rAT2 == null) { ProbeMod.Result("aerotorque: no active rocket"); break; }
 
-                    float torqueZ, alphaPred, fX, fY, copWX, copWY, copAX, copAY, comXo, comYo, inertiaO, dragAO;
+                    float torqueZ, alphaPred, fX, fY, copWX, copWY, copAX, copAY, comXo, comYo, inertiaO, dragAO, angularDragO;
                     double densityO;
                     bool torqueOk = TryComputeAeroTorque(rAT2, out torqueZ, out alphaPred, out fX, out fY,
-                        out copWX, out copWY, out copAX, out copAY, out comXo, out comYo, out inertiaO, out dragAO, out densityO);
+                        out copWX, out copWY, out copAX, out copAY, out comXo, out comYo, out inertiaO, out dragAO, out densityO, out angularDragO);
 
                     if (!torqueOk)
                     {
@@ -2960,6 +2962,7 @@ namespace SFSProbe
                     atsb.Append(",\"copApplied\":{\"x\":").Append(Num(copAX)).Append(",\"y\":").Append(Num(copAY)).Append("}");
                     atsb.Append(",\"worldCenterOfMass\":{\"x\":").Append(Num(comXo)).Append(",\"y\":").Append(Num(comYo)).Append("}");
                     atsb.Append(",\"inertia\":").Append(Num(inertiaO));
+                    atsb.Append(",\"angularDrag\":").Append(Num(angularDragO));
                     atsb.Append(",\"predictedTorque\":").Append(Num(torqueZ));
                     atsb.Append(",\"predictedAngularAccelDegPerSec2\":").Append(Num(alphaPred * 57.29578f));
                     atsb.Append("}");
@@ -3646,11 +3649,36 @@ namespace SFSProbe
                     // state, sampleCount, or either file. Works identically
                     // whether continuous recording is currently on, off, or
                     // already running -- a pure peek, zero interruption either way.
+                    //
+                    // SCOPED MODE (v0.63.0, 2026-09-06): optional comma-separated
+                    // field list, e.g. 'telemetrysnapshot rb2d.angularDrag,rb2d.inertia'
+                    // -- same syntax as dragareasweep's arg. Added specifically so a
+                    // quick ad-hoc field check doesn't need a full 'telemetry on' /
+                    // 'telemetry off' round trip (which writes/archives a real file
+                    // just to peek at one or two values). Reuses BuildScopedSample(),
+                    // the SAME field-resolution logic real scoped recording uses
+                    // (computed:, partCount, plain dot-paths) -- can't silently
+                    // diverge from what a real recorded flight would show for the
+                    // same field list. No arg = unchanged full inputs+truth dump,
+                    // exactly the pre-v0.63.0 behavior, so every existing caller
+                    // keeps working unmodified.
                     object rPeek = ActiveRocket();
                     if (rPeek == null) { ProbeMod.Result("telemetrysnapshot: no active rocket"); break; }
                     object rbPeek = Get(rPeek, "rb2d");
                     object locPeek = Unwrap(Get(rPeek, "location"));
                     double tPeek = ToD(Get(locPeek, "time"));
+
+                    if (!string.IsNullOrEmpty(arg))
+                    {
+                        string[] peekFields = arg.Split(',');
+                        string scopedPeek = BuildScopedSample(rPeek, tPeek, peekFields);
+                        Write("sfs_probe_telemetry_snapshot.json", new StringBuilder(scopedPeek),
+                              "telemetrysnapshot (scoped) t=" + tPeek);
+                        ProbeMod.Result("telemetrysnapshot: t=" + tPeek + " scoped[" + peekFields.Length +
+                                         "] recording=" + (Telemetry ? "ON" : "off") +
+                                         " (not affected either way) -> sfs_probe_telemetry_snapshot.json");
+                        break;
+                    }
 
                     string inputsPeek = BuildInputsSample(rPeek, rbPeek, tPeek);
                     string truthPeek = BuildTruthSample(rPeek, rbPeek, locPeek, tPeek);
@@ -3799,44 +3827,12 @@ namespace SFSProbe
                     CheckTelemetryTriggers(r, t);
 
                     var sb3 = new StringBuilder();
-                    sb3.Append("{\"t\":").Append(Num(t));
-                    foreach (string rawField in telemetryFields)
-                    {
-                        string f = rawField.Trim();
-                        if (f.Length == 0) continue;
-                        if (f.StartsWith("computed:"))
-                        {
-                            string name = f.Substring("computed:".Length);
-                            if (!AppendComputedField(name, r, sb3))
-                                sb3.Append(",\"").Append(name).Append("Error\":\"unknown computed field\"");
-                        }
-                        else if (f == "partCount")
-                        {
-                            // Fixed 2026-09-03: "partCount" used to silently record
-                            // null forever in scoped mode -- it was only ever a
-                            // recognized pseudo-field inside GetScriptFieldValue
-                            // (the script/trigger condition evaluator), which this
-                            // loop never consulted; a bare "partCount" isn't a real
-                            // dot-path ResolvePath can walk. Same semantics as
-                            // GetScriptFieldValue's own "partCount" case and as the
-                            // full-schema mode's "partCount" key (BuildTruthSample),
-                            // kept as a literal name check (not a required dot-path)
-                            // so every existing field list using bare "partCount"
-                            // (docs, active_state.md, prior flights) keeps working
-                            // unchanged rather than needing to be rewritten to
-                            // "partHolder.parts.Count".
-                            object holderPC = Get(r, "partHolder");
-                            object partsPC = Get(holderPC, "parts");
-                            var collPC = partsPC as System.Collections.ICollection;
-                            sb3.Append(",\"partCount\":").Append(collPC != null ? collPC.Count.ToString() : "null");
-                        }
-                        else
-                        {
-                            object val = ResolvePath(r, f);
-                            sb3.Append(",\"").Append(f).Append("\":").Append(Num(val));
-                        }
-                    }
-                    sb3.Append("}");
+                    // Extracted 2026-09-06 into BuildScopedSample() -- this used
+                    // to be an inline loop here (duplicated in telemetrysnapshot's
+                    // new scoped-peek mode); factored out so both paths share one
+                    // implementation and can't silently drift apart on field
+                    // resolution (computed:, partCount, plain dot-paths).
+                    sb3.Append(BuildScopedSample(r, t, telemetryFields));
 
                     // v0.60.0: truth+inputs merged into one live file/line
                     // under the unified telemetry archive lifecycle (single
@@ -3985,6 +3981,47 @@ namespace SFSProbe
         // sampleCount or either file). Keeping this as the single source of
         // truth means peek can never silently drift out of sync with what
         // real recorded telemetry actually contains.
+        // Extracted 2026-09-06 from Sample()'s inline scoped-mode loop, so
+        // 'telemetrysnapshot <fields>' can reuse the EXACT same field-
+        // resolution logic (computed:, partCount, plain dot-paths) as real
+        // scoped recording -- one source of truth, can't silently drift.
+        // Returns just the field object, e.g. {"t":...,"rb2d.mass":...} --
+        // callers merge with BuildInputsSample() themselves if they want the
+        // control-input fields too (real scoped recording always does;
+        // telemetrysnapshot's scoped mode does not, to keep a one-shot peek
+        // fast and minimal -- request rb2d/arrowkeys paths directly instead
+        // if control inputs are needed).
+        static string BuildScopedSample(object r, double t, string[] fields)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"t\":").Append(Num(t));
+            foreach (string rawField in fields)
+            {
+                string f = rawField.Trim();
+                if (f.Length == 0) continue;
+                if (f.StartsWith("computed:"))
+                {
+                    string name = f.Substring("computed:".Length);
+                    if (!AppendComputedField(name, r, sb))
+                        sb.Append(",\"").Append(name).Append("Error\":\"unknown computed field\"");
+                }
+                else if (f == "partCount")
+                {
+                    object holderPC = Get(r, "partHolder");
+                    object partsPC = Get(holderPC, "parts");
+                    var collPC = partsPC as System.Collections.ICollection;
+                    sb.Append(",\"partCount\":").Append(collPC != null ? collPC.Count.ToString() : "null");
+                }
+                else
+                {
+                    object val = ResolvePath(r, f);
+                    sb.Append(",\"").Append(f).Append("\":").Append(Num(val));
+                }
+            }
+            sb.Append("}");
+            return sb.ToString();
+        }
+
         static string BuildInputsSample(object r, object rb, double t)
         {
             object throttle = Get(r, "throttle");
@@ -5148,11 +5185,11 @@ namespace SFSProbe
         static bool TryComputeAeroTorque(object rocket, out float torqueZ, out float alphaPred,
             out float forceX, out float forceY, out float copWorldX, out float copWorldY,
             out float copAppliedX, out float copAppliedY, out float comX, out float comY,
-            out float inertia, out float dragAreaOut, out double densityOut)
+            out float inertia, out float dragAreaOut, out double densityOut, out float angularDrag)
         {
             torqueZ = 0f; alphaPred = 0f; forceX = 0f; forceY = 0f;
             copWorldX = 0f; copWorldY = 0f; copAppliedX = 0f; copAppliedY = 0f;
-            comX = 0f; comY = 0f; inertia = 0f; dragAreaOut = 0f; densityOut = 0.0;
+            comX = 0f; comY = 0f; inertia = 0f; dragAreaOut = 0f; densityOut = 0.0; angularDrag = 0f;
             try
             {
                 object rb2d = Get(rocket, "rb2d");
@@ -5162,6 +5199,17 @@ namespace SFSProbe
                 comX = ToF(Get(worldCoMObj, "x"));
                 comY = ToF(Get(worldCoMObj, "y"));
                 inertia = ToF(Get(rb2d, "inertia"));
+                // NEW (2026-09-06, aero_torque closed-loop instability
+                // investigation): angularDrag has NEVER been read by this
+                // probe before. AddForceAtPosition (what real aero torque
+                // goes through) is genuine Unity Rigidbody2D physics, and
+                // Unity's real solver applies angularDrag damping every
+                // tick -- neither TryComputeAeroTorque's own alphaPred
+                // formula (r x F / inertia, hand-derived, not IL-read) nor
+                // forward_sim.py's Python replica has ever modeled this.
+                // Reading it now to test whether its absence explains the
+                // closed-loop runaway a pure-aero-torque replay shows.
+                angularDrag = ToF(Get(rb2d, "angularDrag"));
 
                 float dragCopVelX, dragCopVelY;
                 int allC, expC;
@@ -5701,13 +5749,14 @@ namespace SFSProbe
                     // the RCS force validation. Engine off + RCS off + no parachute
                     // deployed is required to isolate aero torque cleanly (see
                     // TryComputeAeroTorque's header comment for the parachute caveat).
-                    float torqueZ, alphaPred, fX, fY, copWX, copWY, copAX, copAY, comXo, comYo, inertiaO, dragAO;
+                    float torqueZ, alphaPred, fX, fY, copWX, copWY, copAX, copAY, comXo, comYo, inertiaO, dragAO, angularDragO;
                     double densityO;
                     bool ok = TryComputeAeroTorque(rocket, out torqueZ, out alphaPred, out fX, out fY,
-                        out copWX, out copWY, out copAX, out copAY, out comXo, out comYo, out inertiaO, out dragAO, out densityO);
+                        out copWX, out copWY, out copAX, out copAY, out comXo, out comYo, out inertiaO, out dragAO, out densityO, out angularDragO);
                     sb.Append(",\"aeroTorque\":").Append(ok ? Num(torqueZ) : "null");
                     sb.Append(",\"aeroAlphaDeg\":").Append(ok ? Num(alphaPred * 57.29578f) : "null");
                     sb.Append(",\"rbInertia\":").Append(ok ? Num(inertiaO) : "null");
+                    sb.Append(",\"rbAngularDrag\":").Append(ok ? Num(angularDragO) : "null");
                     return true;
                 }
                 case "gimbal":

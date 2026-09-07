@@ -6,6 +6,20 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-09-06 (continuation, later same session) — aero_torque root-cause dig: one wrong "fix" reverted with real data, one real bug fixed, debug tooling added, regression narrowed but not closed
+
+**Context:** continuing the same day's aero_torque regression (42° median rotation error with aero_torque ON vs 0.48° OFF, on the validated 9-second run). Four real findings, one of which is a self-correction.
+
+**1. Wrong "fix" made and reverted, real evidence not more code-reading.** Earlier the same day, `_derivative()`'s aero-torque `alpha = (torque_z / inertia) * RAD2DEG` was changed to drop RAD2DEG, reasoning Unity's Rigidbody2D is degree-native throughout. Recorded a real flight with `computed:aeroTorque` telemetry (engine off, clean coast): `aeroAlphaDeg / (aeroTorque / rbInertia) = 57.29577735756871` at every sample checked — exact RAD2DEG. Reverted; `torque_z/inertia` is genuinely radians/s² (Unity's real `AddForceAtPosition`/`rb2d.inertia` path, standard physics — NOT the degree-native `ApplyTorque` SAS/manual-turn path, a separate mechanism).
+
+**2. Real fix: gimbal no longer redirects thrust in `_engine_thrust()`.** The code still rotated thrust direction by `gimbal_deg` despite `active_state.md` claiming this was removed. Confirmed via IL (two independent reads): `MoveModule.ApplyAnimation()` writes `localEulerAngles` on `MoveData`'s own `transform` field, a SEPARATE Transform from `EngineModule`'s own — and `EngineModule.FixedUpdate()`'s real force direction uses `EngineModule`'s own transform, never touched by gimbal's animation. Fixed. Empirically tested head-to-head on a real hard-turn (`turn 1` saturated) + active-burn flight: rotation error barely moved (74.3° vs 71.5° median) — real fix, but not the dominant error source.
+
+**3. New capability: `forward_simulate`/`test_against_run_trajectory` gained `debug=True`.** Exposes per-step `force_x/y`, `cop_x/y`, `inertia`, `torque_z`, and alpha under both unit conventions; auto-attaches real `aeroTorque`/`aeroAlphaDeg`/`rbInertia` from telemetry when available for direct per-tick diffing. This is what caught finding #1.
+
+**4. Aero-torque formula validated directly; the real problem is closed-loop state drift, not the formula.** Feeding real recorded theta/velocity/omega into the torque calc (bypassing this module's own integrated state) reproduces real `aeroTorque` within a few percent, tightening over time. But the FULL replay (using this module's own predicted state each step) shows `torque_z` diverging from -0.12 to +78 within 6 seconds on the same clean window, while real torque stays smooth and bounded. Shrinking dt from 0.25 to 0.002 shrinks but does not fix this (converges to a wrong, still ~200x-too-large answer) — ruling out simple numerical/RK4 stiffness as the primary cause. Root cause NOT YET FOUND. Leading candidate, not yet tested: `inertia` is a single static pre-ignition value held constant for the whole sim; real `rbInertia` measured dropping ~20% over just 14s of burn in tonight's own data. See `bookkeeping/active_state.md` for full detail and next steps.
+
+---
+
 ## 2026-09-06 (latest) — forward_sim.py: control-schedule timing bug fixed, phantom gimbal torque removed, live torque replay added
 
 **Context:** a gimbal-torque divergence investigation (three separate real

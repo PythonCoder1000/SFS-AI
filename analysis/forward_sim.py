@@ -519,6 +519,54 @@ def _aero_force_and_cop(theta_deg: float, vx: float, vy: float, omega: float, h:
     return force_x, force_y, cop_x, cop_y, drag_area
 
 
+def _aero_torque_diagnostic(theta_deg: float, vx: float, vy: float, omega: float, h: float,
+                             aoa_table: Optional[dict], com_local: Optional[tuple],
+                             parachutes: Optional[list], body: dict, inertia: Optional[float],
+                             enable_drag: bool, enable_parachute: bool) -> dict:
+    """Standalone aero-torque diagnostic, added 2026-09-06 to make this
+    module's internals inspectable instead of a black box -- computes the
+    SAME force/CoP/torque quantities _derivative() uses internally, but as
+    a self-contained side channel that doesn't feed back into the
+    integration. Purpose: directly compare against the mod's own live
+    'computed:aeroTorque' telemetry fields (aeroTorque, aeroAlphaDeg,
+    rbInertia -- SFSProbe.cs's TryComputeAeroTorque, the already-validated
+    0.9986-correlation ground truth) on a per-tick basis, tick by tick,
+    instead of only comparing end-state trajectory error.
+
+    Reports BOTH candidate unit conventions for alpha rather than picking
+    one -- this module and the mod's own telemetry-field code disagree on
+    whether torque_z/inertia needs a RAD2DEG conversion (see
+    mod_changelog.md/SFSProbe.cs line ~5709: 'aeroAlphaDeg' is explicitly
+    documented as alphaPred*57.29578, compared against real
+    angularVelocity finite-differences -- the OPPOSITE of what this
+    module's _derivative() currently assumes after the 2026-09-06 fix).
+    Don't resolve that dispute by reading more code -- resolve it by
+    comparing alpha_torqz_over_inertia and alpha_torqz_over_inertia_x57
+    below against a real recorded aeroAlphaDeg column.
+
+    Returns: force_x, force_y, cop_x, cop_y, torque_z, inertia,
+    alpha_torqz_over_inertia (raw, no conversion -- matches this module's
+    CURRENT _derivative() formula), alpha_torqz_over_inertia_x57 (matches
+    the mod's aeroAlphaDeg telemetry field's OWN formula). All None if
+    com_local/inertia aren't available or velocity is ~zero (no aero
+    force to compute torque from).
+    """
+    fx, fy, cop_x, cop_y, _drag_area = _aero_force_and_cop(
+        theta_deg, vx, vy, omega, h, aoa_table, com_local, parachutes, body,
+        enable_drag, enable_parachute)
+    out = {"force_x": fx, "force_y": fy, "cop_x": cop_x, "cop_y": cop_y,
+           "inertia": inertia, "torque_z": None,
+           "alpha_torqz_over_inertia": None, "alpha_torqz_over_inertia_x57": None}
+    if com_local is None or cop_x is None or inertia is None or inertia <= 1e-9:
+        return out
+    comx, comy = com_local
+    torque_z = (cop_x - comx) * fy - (cop_y - comy) * fx
+    out["torque_z"] = torque_z
+    out["alpha_torqz_over_inertia"] = torque_z / inertia
+    out["alpha_torqz_over_inertia_x57"] = (torque_z / inertia) * RAD2DEG
+    return out
+
+
 def _engine_thrust(theta_deg: float, engines: Optional[list], gimbal_times: list,
                     isp_multiplier: float, enable_thrust: bool, enable_fuel_burn: bool,
                     throttle_override: Optional[float] = None
@@ -563,19 +611,26 @@ def _engine_thrust(theta_deg: float, engines: Optional[list], gimbal_times: list
         pos_local = eng.get("position_local", (0.0, 0.0))
         base_dir = eng.get("base_direction_local", (0.0, 1.0))
 
-        gimbal_deg = 0.0
-        if eng.get("has_gimbal"):
-            gimbal_time = gimbal_times[idx] if idx < len(gimbal_times) else 0.0
-            gimbal_range = eng.get("gimbal_range_deg", 0.0)
-            # time ranges -1..1 over +/-gimbal_range_deg -- confirmed live
-            # shape (B1.10): linear, tangents == chord slope.
-            gimbal_deg = gimbal_time * gimbal_range
-
-        gr = math.radians(gimbal_deg)
-        cg, sg = math.cos(gr), math.sin(gr)
-        dx = base_dir[0] * cg - base_dir[1] * sg
-        dy = base_dir[0] * sg + base_dir[1] * cg
-        world_dx, world_dy = _rotate_body_vector(dx, dy, theta_deg)
+        # FIXED 2026-09-06: gimbal deflection does NOT redirect real
+        # thrust -- confirmed TWICE independently from IL, not just
+        # "thrustNormal is never written" (already known): MoveModule's
+        # ApplyAnimation() (the gimbal animation itself) writes
+        # set_localEulerAngles on MoveData's OWN transform field, a
+        # SEPARATE Transform reference from EngineModule's own
+        # `this.transform` -- almost certainly the visual nozzle mesh, a
+        # child object. EngineModule.FixedUpdate's real force direction
+        # comes from `transform.TransformVector(thrustNormal.Value)`
+        # using EngineModule's OWN transform, which gimbal's animation
+        # never touches at all. So gimbal is cosmetic on BOTH counts:
+        # the direction vector never changes AND the transform that
+        # would apply a rotation is a different object entirely. This
+        # module previously still rotated thrust direction by
+        # gimbal_deg here -- a real bug (active_state.md claimed this
+        # was fixed 2026-09-06 but the code never actually changed) --
+        # gimbal_times is still tracked below (still useful as a
+        # diagnostic / for anything reading MoveModule.time), just no
+        # longer feeds into the force direction.
+        world_dx, world_dy = _rotate_body_vector(base_dir[0], base_dir[1], theta_deg)
 
         if enable_thrust:
             f_mag = thrust_ton * 9.8 * throttle  # section 2.2
@@ -806,6 +861,27 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
         if flags["thrust"]:
             for lx, ly, fx, fy in engine_levers:
                 torque_z += lx * fy - ly * fx
+        # REVERTED 2026-09-06 (was briefly "fixed" to remove RAD2DEG
+        # earlier the same session -- that was WRONG, confirmed and
+        # walked back with real data, not more code-reading). Live
+        # telemetry from a real coasting flight (computed:aeroTorque,
+        # engine off, turnAxis ~0, t=2.5-27s window) gives exact
+        # aeroAlphaDeg / (aeroTorque/rbInertia) = 57.29577735756871 at
+        # every sample checked -- RAD2DEG to 7 significant figures, not
+        # a coincidence. So torqueZ/inertia IS in radians/s^2 (standard
+        # physics units, Unity's real AddForceAtPosition/rb2d.inertia
+        # path -- NOT the degree-native world SAS/ApplyTorque lives in),
+        # and DOES need the conversion to compare against/drive the
+        # degree-based omega state this module tracks. The earlier
+        # "fix" reasoned from a general Unity-convention assumption
+        # instead of checking real per-tick data first -- exactly the
+        # mistake this project's data-trust rule exists to catch. Kept
+        # here as a cautionary note: the original catastrophic
+        # aero_torque regression (42 deg median, up from 0.48 deg) is
+        # NOT explained by this term after all -- root cause still open,
+        # now being chased with the debug_aero per-tick diagnostic
+        # (_aero_torque_diagnostic) cross-checked against this same real
+        # computed:aeroTorque telemetry instead of more code-reading.
         alpha = (torque_z / inertia) * RAD2DEG
 
     dm_dt = -(mass_flow_engines) if flags["fuel_burn"] else 0.0
@@ -854,7 +930,8 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
                       terrain_lookup: Optional[Callable[[float], float]] = None,
                       initial_gimbal_times: Optional[list] = None,
                       initial_heat_temp: float = 0.0,
-                      control_schedule: Optional["ControlSchedule"] = None) -> list[dict]:
+                      control_schedule: Optional["ControlSchedule"] = None,
+                      debug: bool = False) -> list[dict]:
     """Forward-integrates from a real telemetry sample's state for
     duration_s using RK4 for the continuous state and discrete post-step
     corrections for SAS/gimbal/RCS/staging/terrain. See module docstring
@@ -968,16 +1045,19 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
     staging_events = sorted(staging_events or [], key=lambda e: e["t"])
     staging_idx = 0
 
-    def state_point(t, px, py, vx, vy, theta, omega, m, heat_temp, collided=False):
+    def state_point(t, px, py, vx, vy, theta, omega, m, heat_temp, collided=False, debug_info=None):
         heading = math.degrees(math.atan2(vy, vx)) if math.hypot(vx, vy) > 1e-6 else None
         aoa = _wrap180((theta + 90.0) - heading) if heading is not None else None
         drag_area = lookup_field(aoa_table, aoa, "dragArea") if aoa is not None else 0.0
-        return {"t": t, "px": px, "py": py, "vx": vx, "vy": vy,
+        point = {"t": t, "px": px, "py": py, "vx": vx, "vy": vy,
                 "h": math.hypot(px, py) - body["radius_m"], "v": math.hypot(vx, vy),
                 "theta_deg": theta, "omega_degs": omega, "aoa_deg": aoa,
                 "dragArea": drag_area, "m": m, "heat_temp_c": heat_temp,
                 "would_destroy": heat_temp >= heat_tolerance_c,
                 "gimbal_times": list(gimbal_times), "collided": collided}
+        if debug_info is not None:
+            point["debug_aero"] = debug_info
+        return point
 
     points = [state_point(0.0, px, py, vx, vy, theta, omega, m, heat_temp)]
     steps = int(duration_s / dt)
@@ -988,6 +1068,16 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
         t_after = (i + 1) * dt
 
         throttle_override_now = control_schedule.throttle(t_before) if control_schedule else None
+
+        debug_info = None
+        if debug:
+            px0, py0, vx0, vy0, m0, theta0, omega0, heat0 = state
+            r0 = math.hypot(px0, py0)
+            h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
+            debug_info = _aero_torque_diagnostic(
+                theta0, vx0, vy0, omega0, h0, aoa_table, com_local,
+                (craft_config or {}).get("parachutes"), body, inertia,
+                flags["drag"], flags["parachute_drag"])
 
         state = _rk4_step(state, body, dt, aoa_table, com_local, inertia,
                            craft_config, gimbal_times, flags, throttle_override_now)
@@ -1107,7 +1197,7 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
 
         state = (px, py, vx, vy, m, theta, omega, heat_temp)
         points.append(state_point(round(t_after, 3), px, py, vx, vy, theta, omega,
-                                   m, heat_temp, collided=collided))
+                                   m, heat_temp, collided=collided, debug_info=debug_info))
         if collided:
             break
 
@@ -1285,7 +1375,8 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
                      start_t: float, duration_s: float, dt: float = 0.25,
                      body_name: str = "Earth", aoa_table_path: Optional[str] = None,
                      throttle_field: Optional[str] = None,
-                     flags: Optional[dict] = None) -> tuple[list[dict], float, list[dict]]:
+                     flags: Optional[dict] = None,
+                     debug: bool = False) -> tuple[list[dict], float, list[dict]]:
     """Shared setup for test_against_run and test_against_run_trajectory
     (2026-09-05 split -- both need the identical real-flight load,
     starting-state construction, and control-replay forward_simulate()
@@ -1361,7 +1452,7 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
         start_state, duration_s, dt=dt, body_name=body_name, aoa_table=aoa_table,
         inertia=craft_config["inertia"], com_local=craft_config["com_local"],
         torque_effective=craft_config["torque_effective"], flags=flags,
-        craft_config=craft_config, control_schedule=control_schedule)
+        craft_config=craft_config, control_schedule=control_schedule, debug=debug)
 
     return rows, t0, sim
 
@@ -1441,7 +1532,8 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
                                  body_name: str = "Earth", aoa_table_path: Optional[str] = None,
                                  throttle_field: Optional[str] = None,
                                  flags: Optional[dict] = None,
-                                 stride: int = 1) -> dict:
+                                 stride: int = 1,
+                                 debug: bool = False) -> dict:
     """Like test_against_run, but compares the ENTIRE predicted trajectory
     against the real flight step-by-step, not just the final point --
     built to characterize forward-integrator compounding error
@@ -1476,7 +1568,7 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
     """
     rows, t0, sim = _prepare_replay(
         flight_jsonl_path, craft_config_path, start_t, duration_s, dt,
-        body_name, aoa_table_path, throttle_field, flags=flags)
+        body_name, aoa_table_path, throttle_field, flags=flags, debug=debug)
 
     steps = []
     for point in sim[::max(1, stride)]:
@@ -1497,13 +1589,25 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
         angv_err = (abs(predicted_angv_degs - actual_angv_degs)
                     if predicted_angv_degs is not None and actual_angv_degs is not None else None)
 
-        steps.append({
+        step_entry = {
             "sim_t": point["t"], "real_t": actual_row["t"] - t0 - start_t,
             "position_offset_m": pos_err,
             "rotation_error_deg": rot_err,
             "angular_velocity_error_degs": angv_err,
             "collided": point.get("collided", False),
-        })
+        }
+        if debug and "debug_aero" in point:
+            step_entry["debug_aero"] = point["debug_aero"]
+            # Real ground truth for this same instant, if the flight was
+            # recorded with computed:aeroTorque -- lets the caller diff
+            # predicted vs. real aeroAlphaDeg/aeroTorque/rbInertia
+            # per-tick instead of only end-state trajectory error.
+            step_entry["real_aero"] = {
+                "aeroTorque": actual_row.get("aeroTorque"),
+                "aeroAlphaDeg": actual_row.get("aeroAlphaDeg"),
+                "rbInertia": actual_row.get("rbInertia"),
+            }
+        steps.append(step_entry)
 
     def _summary(key):
         vals = [s[key] for s in steps if s[key] is not None]
