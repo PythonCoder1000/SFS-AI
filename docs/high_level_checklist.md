@@ -701,7 +701,7 @@ done. What's genuinely missing is knowing how error actually compounds
 over a real multi-minute mission with real maneuvering, as opposed to
 assumed from a model.
 
-- [ ] **Run `--test_against_run` end to end against a real mission for
+- [x] **Run `--test_against_run` end to end against a real mission for
       the first time.** First attempt 2026-09-02 failed immediately
       (`KeyError: 'location.position.x'` — telemetry field list was
       missing position/mass/rotation/angularVelocity). Corrected field
@@ -717,6 +717,68 @@ assumed from a model.
       but only against tiny (<1min, mostly stationary) test flights with
       a stale craft_config. The tooling gap is closed; the actual real-
       mission run this item describes still hasn't happened.
+      **2026-09-07 update — DONE, and it found a real, severe bug.** Ran
+      a real ~70s straight-up-then-fall flight (full throttle to h=1007m,
+      cutoff, coast, fall to pad height, zero steering input throughout —
+      tagged `straight_up_predictor_test_2026-09-07`,
+      `archive/kept/telemetry_flat_2026-09-07_09-40-05.jsonl.gz`)
+      through `test_against_run_trajectory` with full Bucket-A physics
+      enabled (`aoa_table_path` supplied — see the critical tooling gotcha
+      below). Real `rb2d.rotation` stayed at ~0.0000° for the entire
+      flight (genuinely non-rotating craft, confirmed both in the raw
+      telemetry and independently via `angv` staying under 0.005°/s
+      throughout). The PREDICTED rotation (`theta_deg`), starting from the
+      same zero, diverges in a clean **exponential** pattern purely from
+      numerical/model instability — no real perturbation driving it:
+      0.004° → 0.02° → 0.06° → 0.13° → 0.28° → 0.59° → 1.26° → 2.79° →
+      6.57° → 17.66° → 93.25° by t=2.75s, predicted angular velocity
+      pinned around **23,000 deg/s** by t≈6s, theta chaotically wrapping
+      thereafter. This is almost certainly the SAME failure mode as the
+      original, unrecoverable 142.75° blowup (flight #9, lost — see
+      `bookkeeping/active_state.md`) — but now fully REPRODUCED on a
+      flight with a trivially-known-correct answer (zero rotation),
+      tagged and saved this time. The growth pattern (each ~0.25s RK4
+      step roughly doubling from a near-zero start) is the textbook
+      signature of a **positive-feedback / wrong-sign restoring-torque
+      bug** in the Bucket-A rotation model — weathercock stability should
+      be a damping (negative) feedback, and something in `forward_sim.py`
+      is amplifying instead of damping even tiny AoA perturbations. NOT
+      YET root-caused to the exact line/term — see
+      `bookkeeping/active_state.md`'s "Immediate next experiment" for the
+      concrete next step (read the Bucket-A torque/rotation integration
+      code directly, hunting for a sign error).
+
+      **Real, separate tooling gotchas found getting this test to run at
+      all (all now documented, all reusable for future tests):**
+      1. `test_against_run_trajectory` requires flat literal JSON keys
+         (`output_TurnAxisTorque`, `output_DirectionalAxis.x/y`,
+         `location.position.x/y`, `rb2d.mass`, `rb2d.rotation`,
+         `rb2d.angularVelocity`) that do NOT match what full-mode
+         `telemetry on` actually records (`turnAxis`, `directionalAxisX/Y`,
+         `px`/`py`, `m`, `rot`, `angv`) — needed a field-renaming compat
+         pass on the flight file before the tool would even accept it.
+      2. `engines` is recorded as a nested array
+         (`engines[0].throttleOut`), not a flat dotted key — a
+         `throttle_field` pointing at a literal `"engines[0].throttleOut"`
+         string silently resolves to `None`/0.0 every tick via the code's
+         own `r.get(throttle_field) or 0.0` fallback, with NO error raised.
+      3. **The most important one:** omitting `aoa_table_path` doesn't
+         just skip aero-torque accuracy — it silently routes the ENTIRE
+         simulation into an old fallback mode with gravity + frozen drag
+         ONLY, meaning **zero engines/thrust/gimbal/RCS/staging/terrain/
+         heat are modeled at all**, no error or warning either. Always
+         supply a real `aoa_table_path` for any meaningful full-physics
+         replay test.
+      4. `getforwardstartinfo`'s auto-written `AoA_drag_table_<name>.json`
+         is the RAW sweep-samples format (flat list of
+         `{aoaDeg,dragArea,dragCopX,dragCopY,...}`), NOT the "bins" dict
+         format `forward_sim.py`'s loader expects (built by
+         `aoa_dragarea.py`'s `build_table`) — needed a one-bin-per-sample
+         conversion pass. A real, clean, reusable conversion (arguably
+         better data than the noisy flight-derived kind `aoa_dragarea.py`
+         normally builds, since it's a noise-free synthetic sweep) — worth
+         promoting into a real `analysis/` script rather than staying a
+         one-off scratch conversion.
 - [ ] **Determine actual error-compounding behavior empirically, not by
       assumed model.** The only real data point so far: four 10-second
       BLIND-mode (no control replay) forward-sims from an earlier

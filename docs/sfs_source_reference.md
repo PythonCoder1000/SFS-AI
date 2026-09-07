@@ -2383,10 +2383,50 @@ gimbal.targetTime.Value = throttle_Out.Value > 0f
 
 A gimbal only deflects while `throttle_Out > 0`. `RotationDirection`
 handles mirrored parts. Deflection is expressed as a `targetTime` on a
-`MoveModule`, so gimbal geometry is an animation parameter, not an angle
-— the resulting thrust direction change shows up through
-`thrustNormal`, which is a `Composed_Vector2` recomputed from the moved
-transform.
+`MoveModule`, which drives a real, live `Transform.set_localEulerAngles`
+call every tick (`MoveModule.ApplyAnimation`, §E6.3) — a genuine scene
+rotation, not just a UI/animation-only value.
+
+**CORRECTION (2026-09-07).** This section previously claimed "the
+resulting thrust direction change shows up through `thrustNormal`, which
+is a `Composed_Vector2` recomputed from the moved transform." That is
+wrong on the specific mechanism: `EngineModule.thrustNormal` has exactly
+**one** `stfld` in the entire assembly — in the constructor, hardcoded to
+`Vector2.up` (`(0,1)`) — and is never rewritten afterward. It does NOT
+get recomputed.
+
+But the underlying behavioral claim (gimbal affects real thrust
+direction) turns out to still be correct, via a different, previously
+unread mechanism. `EngineModule.FixedUpdate()` (§D2.0) computes the
+force's WORLD direction and application point via
+`transform.TransformVector(thrustNormal.Value)` and
+`Transform_Utility.LocalToLocalPoint(this, Rb2d, thrustPosition.Value)`
+— both keyed off **`this.transform`**, the `EngineModule` component's
+own live Unity Transform, not a cached/frozen value. So even though the
+*local* `thrustNormal` vector is frozen at `(0,1)` forever, the
+*world-space* force direction still depends on `this.transform`'s
+current real-time rotation every tick.
+
+**Net effect:** IF `MoveModule.ApplyAnimation` is rotating the same
+Transform `EngineModule` sits on (or a parent of it) — a prefab-wiring
+fact, not decompilable from IL — then gimbal deflection genuinely
+redirects real thrust force in world space, live, every tick, purely as
+a side effect of rotating a shared Transform. This was confirmed
+behaviorally: turning the rocket while the engine is producing thrust is
+measurably faster than turning with the engine off, even though
+`Rocket.ApplyTorque()` (§B1.3, the direct player-rotation write) has
+**zero** engine dependency of its own — called unconditionally every
+tick from `Rocket.FixedUpdate()`, regardless of engine state. The extra
+torque while thrusting has to be coming from redirected thrust adding on
+top of `ApplyTorque`'s always-on contribution, which only happens when
+`throttle_Out > 0` (zero thrust force × any gimbal angle = zero torque)
+— matching the observed behavior exactly. The precise GameObject/prefab
+wiring that makes this true is still **[UNTESTED-LIVE]** in the strict
+sense (not visible in decompiled IL, since Unity scene hierarchy is not
+part of the assembly), but the confirmed live behavioral test is now
+strong evidence for it. A direct live check (dump the `EngineModule`
+GameObject's transform hierarchy relative to whatever `MoveData.transform`
+gimbal animates) would close this out fully.
 
 ### D2.5 `BoosterModule` — SRBs are a separate code path
 
