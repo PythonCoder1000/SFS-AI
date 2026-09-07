@@ -690,7 +690,63 @@ flagged here so whoever next touches that claim knows it's stale.
       chaining math, and whether the post-load connectivity check
       (`occupied` flags) reports clean.
 
-## Forward integrator — end-to-end calibration, NOT done
+## Forward integrator — ROOT CAUSE FOUND AND FIXED 2026-09-07
+
+**The rotation-instability bug (below, and its 2026-09-02 origin entry
+further down) is RESOLVED.** Root cause: `dragCopX/Y` in the static AoA
+sweep table are genuine absolute world coordinates, not
+position-independent offsets -- confirmed via a live setrot+dragarea
+comparison at a real flown AoA (table predicted copX=+446.68, live
+measurement gave copX=-300.70, opposite sign). The table got worse the
+further the craft moved from where it was swept, exactly matching how
+the blowup compounded with altitude. Fixed in `forward_sim.py`: a new
+`build_position_independent_aoa_table()` function rebuilds the table
+into true position-independent lever arms, wired automatically into
+`_prepare_replay`; paired with live CoM tracking (no longer frozen at
+pre-ignition) so both halves of the (cop-com) subtraction stay correct
+regardless of how far the craft has flown. Also folded in: live_inertia
+(confirmed real, mass-proportional) and a Box2D-matching rotation
+safety clamp, both real findings from the same investigation.
+
+**Validated** against the tagged straight_up_predictor_test_2026-09-07
+flight via the official `test_against_run_trajectory` tool, dt=1/60s
+(game's real physics rate), 6s window: rotation error median 0.00048
+deg / max 0.035 deg; angular velocity error median 0.0018 deg/s / max
+0.033 deg/s -- down from 179+ degrees and ~15,400 deg/s before the fix.
+Full story (every ruled-out candidate along the way -- integrator
+choice, step size, velocity source, torque formula, composition order,
+Box2D clamp alone, live inertia alone) in
+`analysis/python_changelog.md`'s 2026-09-07 entry.
+
+**Still open, separate finding, NOT part of this fix:** a real small-AoA
+(0.1-2 deg) aerodynamic instability in this specific finless craft,
+confirmed via live setrot tests showing sustained real `rb2d.rotation`
+drift (not a diagnostic artifact). Crossover to the confirmed-stable
+20+ deg regime not yet bracketed.
+
+**Follow-up same session:** added a selectable `integrator` flag
+("rk4" default, or "symplectic_euler" -- confirmed the closer match to
+what Box2D itself actually uses). Rotation accuracy is virtually
+identical between the two; translational position accuracy is 4-10x
+worse with symplectic Euler (expected -- 1st-order vs. RK4's 4th-order
+at the same dt). Also found and fixed a real 24.5x (RK4) / 12.3x
+(symplectic Euler) speedup in `aoa_dragarea.py`'s `lookup_field()` --
+was re-sorting all 721 table bins from scratch on every call; now
+sorts once and caches, uses `bisect` instead of a linear scan.
+Verified byte-for-byte identical output across the full angle range
+before promoting.
+
+**Honest scope note found while timing the above:** the fix above is
+validated for the clean 6-second ascent window specifically. A full
+600s replay of the same tagged flight correctly predicts terrain
+impact around sim_t~50s (matching the real flight's own eventual
+fall back to pad height), but rotation error in that later
+coast/descent portion is substantial (median 72 deg across the few
+samples that far out) -- plausibly the same still-open small-AoA
+instability noted above, becoming visible over a longer horizon.
+Full-flight (not just ascent) accuracy is NOT yet confirmed.
+
+## Forward integrator — end-to-end calibration, NOT done (historical entries below, kept for the record)
 
 **Added 2026-09-02, after tonight's error-compounding discussion.** All
 individual physics formulas are confirmed and validated in isolation
