@@ -6,6 +6,83 @@ Not version-numbered like the mod — dated entries, newest first.
 
 ---
 
+## 2026-09-07 (continuation, later same session) — SEVERE throttle_field bug found and fixed (silently zeroed thrust + wrong torque in every prior test this session), real_aero_override redesigned three times before it was frame-correct, sas_order execution-order test, full session hypothesis audit
+
+**SEVERE bug found and fixed: `ControlSchedule.throttle()` returned `0.0` instead of `None` on a field-name miss.** `throttle_field="throttleOut"` has NEVER existed as a top-level key in ANY recording this project has made (full mode has `thr`/`thrOn`; it's only ever nested per-engine, `engines[i]["throttleOut"]`). The old lookup (`row.get(field)` falling back to `0.0` when missing) silently returned a genuine "commanded to zero" signal instead of "no signal available" -- which downstream (`_engine_thrust`'s `if throttle <= 0: continue`, and `forward_simulate`'s `any_firing` firing-torque switch) meant **every test this session that passed `throttle_field="throttleOut"` was silently running with ZERO engine thrust and the idle (not firing) torque value, for the entire duration, regardless of the real craft's actual throttle.** Root-caused via a real flight the model predicted crashing into the ground at t=3.68s despite the real craft climbing steadily the whole time -- the tell was `pred_angv` sitting ~2.6x too small from the very first tick (idle vs firing torque ratio), and `_engine_thrust`'s zero-thrust branch confirmed directly. **Fixed**: `throttle()` now checks the top-level key first (kept for any future recording that has one), then falls back to the matching key nested inside `engines[0]` before finally returning the "no signal" `None`. Re-running the exact same crash-window test post-fix: no more fake collision, full duration completes, and the error pattern shifts from nonsensical to genuinely physics-shaped.
+
+**`real_aero_override` (the H1-followup live-vs-table diagnostic) took THREE attempts to get frame-correct -- each wrong version explained here so the mistake is never repeated:**
+1. v1 subtracted the caller's own PREDICTED `com_now` from the real absolute `dragCopX/Y` -- mixed a real ground-truth value against a diverging predicted position (the same position-contamination bug class already fixed once this session, recreated in a new spot). Produced angular-velocity errors in the thousands of deg/s.
+2. v2 subtracted the REAL recorded root position (`location.position.x/y`) instead -- still wrong: this project's own 2026-09-02 finding already documented that `dragCopX/Y` live in Unity's small-scale LOCAL physics frame (~1e2-1e3) while `location.position.x/y` is the large-scale orbital frame (~1e5-1e6). Subtracting one from the other doesn't yield a lever arm, it just reproduces the huge position value -- same symptom, still broken.
+3. **v3, correct**: added v0.65.0 mod fields `comX`/`comY` (real per-tick `rb2d.worldCenterOfMass`, same small-scale frame as `dragCopX/Y`) and `copAppliedX`/`copAppliedY` (already world-frame-converted AND Lerp(CoM,CoP,0.2)-applied, straight out of the mod's existing `TryComputeAeroTorque`, just not previously surfaced to telemetry). `ControlSchedule.real_aero()` now returns `(dragArea, copAppliedX - comX, copAppliedY - comY)` -- a lever arm computed from TWO REAL values at the SAME real tick, exact and self-consistent by construction, no separately-captured reference of any kind, no `*0.2` needed since it's already baked into `copAppliedX/Y`. This is the version now in the codebase.
+
+**With the throttle bug fixed AND `real_aero_override` frame-correct, the actual H1 comparison (table vs. live aero) on a clean 30s flight**: table median rot_err 4.86deg / max 77.01deg / max angv_err 18.68deg/s; live median rot_err 4.67deg (slightly better) / max rot_err 173.09deg / max angv_err 110.07deg/s (both much worse on tail). Live and table `dragArea`/lever-arm data confirmed nearly identical in both magnitude (2-4%) and tick-to-tick noise (ratio 1.0004-1.02) -- H_new2 (noise amplification) refuted. H_new3 (rotation-error metric mishandling multi-revolution wrapping) refuted with exact numerical test cases including 0.0000deg at exactly N full revolutions apart. H_new1/H3 (RK4 numerical stiffness) refuted at TWO different rotation rates (dt/10 barely moves the result either time).
+
+**`sas_order` flag added** (`forward_simulate(..., sas_order="before"|"after")`) -- toggles whether the direct SAS/manual `angularVelocity` write (Path A, bypasses Unity physics) happens before or after the aero/thrust RK4 step (Path B/C, genuine Unity/Box2D physics) within one tick. Motivated by a full IL audit this session confirming Unity's OWN documentation states script execution order between unrelated MonoBehaviours is NOT deterministic unless explicitly pinned via `[DefaultExecutionOrder]` or the Editor's Project Settings window -- and `deep_search` confirmed zero uses of `[DefaultExecutionOrder]` anywhere in `Assembly-CSharp.dll`. Test result on the same high-rotation-rate window: real, measurable effect on median (1.72deg vs 2.58deg rotation error) but the eventual divergence magnitude and timing are essentially unchanged (~100m position, ~25-27deg rotation by t=21s either way). **Order matters, but is not the dominant driver.**
+
+**`live_inertia` flag (scales `inertia` with live-integrated mass) was ALREADY implemented and defaults `True`** -- confirmed via `_resolve_flags`'s merge behavior (`resolved = dict(DEFAULT_FLAGS); resolved.update(flags)`), meaning it has been active in literally every test this session, including ones that only overrode `drag`/`aero_torque`. A proposed "H_final4" hypothesis (mass-scaled inertia would help) was therefore already ruled out by every test that still showed the divergence -- not a new fix to try.
+
+**Full-session IL/Box2D-source audit, done by actually reading raw bytecode and real public source this session, not trusting prior doc summaries:**
+- Confirmed directly (fresh `deep_search`/bytecode reads, this session): `ApplyTorque` is a direct `set_angularVelocity()` write, no `AddTorque`, no `inertia`/`angularDrag` reference anywhere in the method. `Aero_Rocket.AddForceAtPosition` is a 6-instruction wrapper calling straight into the EXTERNAL `[UnityEngine.Physics2DModule]Rigidbody2D::AddForceAtPosition` -- confirmed to be outside `Assembly-CSharp.dll` entirely, genuinely unreachable via this project's decompilation. `angularDrag` and `inertia` are never referenced anywhere in `Assembly-CSharp` (zero hits, exhaustive search) -- both purely Unity engine-internal.
+- Confirmed via real public Box2D source (`b2Island.cpp`, `erincatto/box2d`, multiple mirrors): `w += h*invI*torque`, damping `w *= clamp(1 - h*angularDrag, 0, 1)` (a LINEAR-clamp approximation, NOT `1/(1+h*drag)` as this session first assumed and had to correct), `b2_maxRotation = 0.5*pi` = exactly 90deg/step. Confirmed via a Unity forum thread quoting Unity's own licensing statement that Unity's 2D physics genuinely embeds a real Box2D build, not a reimplementation -- raises confidence these formulas are close to Unity's actual behavior, though the exact embedded version/patches remain unverifiable.
+- Confirmed via Unity's own official docs: `Rigidbody2D.inertia` is "automatically calculated based on the Rigidbody's mass position relative to the centerOfMass" -- confirms the mechanism is Unity-internal, no exact formula published. Script Execution Order docs explicitly state default order between unrelated scripts is non-deterministic, not guaranteed across builds/versions -- directly motivated the `sas_order` test above.
+
+**Where this leaves the sustained-high-rotation-rate divergence, honestly**: every individually-testable mechanism (table accuracy, numerical precision at two rotation rates, live-data noise, execution order, mass-scaled inertia) has been checked and is either refuted or a small/non-dominant contributor. Combined with: nearly-identical inputs (live vs table aero, 2-4% apart) producing meaningfully different tail outcomes (77deg vs 173deg max rotation error), and smooth/gradual (not discrete-jump) divergence -- this has the signature of compounding sensitivity in a dynamically sensitive regime (sustained fast rotation under velocity-dependent aero forces) rather than a single fixable formula error. NOT yet confirmed as genuine chaos in the formal sense (would need a controlled-perturbation test measuring whether the divergence rate is exponential vs. ordinary linear-ish compounding -- proposed, not run). Practical reframe agreed with Christian: split future validation into (1) atmosphere/short-horizon (drag+aero_torque active, expect and accept a short reliable window, already-good for real/sane flight profiles which don't sustain 70+deg/s the way the stress-test flight did) vs (2) space/vacuum/long-horizon (gravity+timewarp+thrust+rotation only, genuinely simpler state, should predict much further -- not yet tested this session, no vacuum-coast flight was recorded).
+
+**A rough atmosphere-regime reliable-horizon measurement was attempted** (many starting points across the stress-test flight, time-to-1%-sustained-error at each) but came out noisy/not cleanly a function of starting rotation rate alone -- because that flight had continuous NEW rapid turn inputs throughout, so horizon is dominated by "how soon does the next aggressive input arrive," not just the starting state. A cleaner measurement needs a flight with deliberately spaced, scripted turn commands (not rapid button-mashing) -- see `bookkeeping/active_state.md`'s next-experiment note.
+
+---
+
+## 2026-09-07 (continuation, later same session) — Option A implemented (index-based ControlSchedule), a real bug found and fixed along the way, H3 tested and refuted
+
+**Option A implemented: `ControlSchedule` rewritten from timestamp-comparison (bisect against real recorded `t`) to index-based (`start_idx + tick`).** Root cause this fixes: real control transitions and the simulation's own fixed-dt grid are two independently-measured clocks -- a transition landing 55 microseconds on the wrong side of a dt=1/60s grid tick caused a full real physics tick's worth of correction to apply one tick late (see the tick-alignment-artifact investigation earlier this session). Index-based lookup removes floating-point clock alignment from the picture entirely.
+
+**Result on a real 46s flight (two burns, alternating turn input, `outputTurnAxisTorque` recorded via v0.64.0):** real, but partial, improvement -- position_offset median -29% (59.0m -> 41.8m), rotation_error median -28% (25.9 -> 18.6 deg), but mean/max on rotation and angular-velocity barely moved. The dominant large-scale divergence (position reaching 1000+m by t=30s) was NOT resolved by this fix alone -- confirms tick-alignment was a real, now-closed problem, but not the main driver of the large-scale error.
+
+**Real bug found and fixed while testing H3 (below), not swept under the rug.** `ControlSchedule._row_for_t`'s index math (`tick = round(t / self.dt)`) used the SAME `dt` as the physics integrator -- correct only when the integrator's step size happens to match the real recording's own sample interval (true at the native 1/60s rate, which is what every test until this point used). The instant a caller (this session's H3 numerical-stiffness test, dt/10) used a different integrator dt, tick indices still advanced 1-per-integrator-step, silently fast-forwarding through the real recorded rows 10x faster than real time actually elapsed -- feeding scrambled control data into the physics. Symptom: a dt/10 run that should have been MORE accurate came back dramatically WORSE (position error median jumped from ~42m to ~536m on the same window) and completed suspiciously fast (0.3s wall time for 10,800 steps). **Fixed** by decoupling: `ControlSchedule` now takes an explicit `sample_dt` (the REAL recording's own tick interval), resolved via a new `_infer_sample_dt()` helper that prefers the actually-recorded `fdt` field (`Time.fixedDeltaTime`, present on every full-mode sample since the mod's earliest versions) over a jitter-robust median-of-real-timestamp-gaps fallback for older/scoped recordings that never captured `fdt`. `_prepare_replay` now resolves and passes this real sample_dt explicitly, completely independent of whatever `dt` the caller requests for RK4 stepping. **Regression-verified**: re-ran the exact same 46s native-rate (dt=1/60) test post-fix -- byte-identical summary to the pre-fix result, confirming this was a true no-op at the rate every prior test actually used.
+
+**H3 (RK4 numerical stiffness during the fast sustained spin) tested properly after the fix, and REFUTED.** Re-ran the first 18s of the same flight at dt/10 (0.1667ms vs the native 1.667ms) -- if discretization error were a real driver, a 4th-order method at 10x finer step should cut truncation error by roughly 10,000x. It didn't move in any meaningful way: same regime-change onset (~t=16s), same peak magnitude (12.09 deg vs 12.62 deg rotation error at t=16s), same overall shape throughout. **Whatever is causing this divergence is a genuine physics-model mismatch, not a numerical-resolution artifact** -- strengthens the standing H1 hypothesis (aero-torque model accuracy at extreme/rapidly-varying AoA -- real telemetry during this window showed AoA sweeping through nearly the full +/-180deg range repeatedly during a sustained ~171deg, ~-68deg/s spin) as the more likely remaining candidate, since a genuine formula gap would not improve with finer time-stepping either. H1 not yet directly tested (aero_torque/drag flags off for this same window) -- next logical step.
+
+---
+
+## 2026-09-07 (continuation, later same session) — H1 confirmed: `torque_effective` is live-parametric on engine firing state, not a frozen pre-ignition constant. Fixed, tested, mixed-but-mostly-positive result.
+
+**Context.** The 10s real curving-flight validation (this session's earlier entry) found `predicted alpha ≈ -10.08°/s²` vs. `real alpha ≈ -26.2°/s²` from literally the first tick — a fixed ~2.6x ratio, not compounding drift, pointing at a constant multiplicative gap in the torque input itself rather than integration error. Per this project's hypothesis-discipline convention, generated competing hypotheses (H1: engine's own `TorqueModule.torque` is live-parametric on firing state; H2: Capsule's is; H3: probe's `SumEnabledTorque` doesn't match the real `GetTorque()` sum; H4: dt/timewarp mismatch) before testing any of them.
+
+**H1 test, live:** read `computed:torque`'s `torqueEffectiveLive` on the loaded rocket at throttle=0 (idle) vs. throttle=1 (actually firing). Idle: `torqueEffectiveLive=5`, matching the static snapshot exactly. Firing: `torqueEffectiveLive=13`. Confirmed via a fresh `getforwardstartinfo` at each state which module changed: **Hawk_Engine's `TorqueModule.torque` reads 0 idle → 8 firing; Capsule's stays fixed at 5 in both states.** H1 confirmed, H2 refuted. `13/5 = 2.6` — matches the observed alpha ratio almost exactly (`-10.08 × 2.6 = -26.2`), fully explaining the gap.
+
+**Patch, `forward_sim.py`:**
+- `load_craft_config_from_getforwardstartinfo(path, firing_snapshot_path=None)` — new optional second arg, a `getforwardstartinfo` dump captured while actually thrusting. Only its scalar `torqueEffectiveRaw` is pulled out (stored as `craft_config["torque_effective_firing"]`) — deliberately NOT its `com_local`/`mass`/other fields, see the bug below for why that distinction mattered.
+- `forward_simulate`'s main loop: new `torque_effective_now` selection — switches to `torque_effective_firing` whenever any engine is firing THIS tick (using the same `throttle_override_now`/real per-engine `throttle` signal already gating thrust and fuel-burn elsewhere in the loop), else uses the static idle value. This is a **firing/not-firing SWITCH between two directly-measured states**, explicitly NOT an assumed continuous function of throttle fraction — partial-throttle scaling was never tested and isn't claimed.
+- `firing_snapshot_path` threaded through `_prepare_replay` and `test_against_run_trajectory` too, so the fix is available through the normal replay entry points, not just `forward_simulate` directly.
+
+**Real process bug caught mid-verification, not a physics bug:** the first patched re-run made results dramatically WORSE (angular-velocity error median jumped to 817°/s, sign of the predicted alpha flipped positive on tick 1). Root cause: the "idle" craft_config used for the retest was a *freshly recaptured* `getforwardstartinfo` snapshot, taken on whatever rocket instance/position currently sits on the pad — NOT the same craft state as flight #16's actual pre-ignition moment. `worldCenterOfMass` differed by hundreds of units between the two (`(-299.5, -92.6)` original vs. `(130.0, -301.0)` fresh recapture) — the rocket had clearly been reset/respawned elsewhere on the map at some point between sessions. Since aero torque depends on the absolute `cop - com` lever arm, this silently fed the replay a geometrically nonsensical aero-torque term (confirmed directly via the `debug=True` per-tick `debug_aero` diagnostic: `alpha_torqz_over_inertia_x57 = +120.27°/s²`, wildly large and wrong-signed). Fixed by reverting `craft_config_path` back to the ORIGINAL flight-#16-matching pre-ignition snapshot (recreated from this session's own recorded values, since the live file itself had since been overwritten several times) and keeping the firing snapshot ONLY for its scalar `torque_effective_firing` value, which is engine-state-dependent, not position-dependent, so pulling just that one number out is safe. General lesson, matches `docs/high_level_checklist.md`'s existing craft_config caveat ("MUST be from the SAME craft configuration as start_t") — extend that same rule to any *auxiliary* snapshot too, not just the primary one.
+
+**Result, same 10s window (idx 2763-3363), re-run correctly:**
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| position_offset median | 213.1m | 117.0m | -45% |
+| position_offset mean | 389.9m | 121.4m | -69% |
+| position_offset max | 1363.4m | 283.6m | -79% |
+| angular_velocity_error median | 68.1°/s | 29.5°/s | -57% |
+| angular_velocity_error mean | 73.4°/s | 28.8°/s | -61% |
+| angular_velocity_error max | 193.3°/s | 80.0°/s | -59% |
+| rotation_error median | 44.6° | 90.0° | +102% (WORSE) |
+| rotation_error mean | 67.2° | 85.9° | +28% (worse) |
+| rotation_error max | 179.8° | 179.6° | ~unchanged |
+
+Position and angular-velocity (rate) accuracy both improved substantially — the model now applies much closer to the real rotational authority throughout the burn. Rotation ANGLE error got worse on the median despite the rate improving, which is not necessarily contradictory: rotation_error is a cumulative phase comparison that behaves like a beat-frequency artifact between two things spinning at different rates (established last session) — a closer rate match can still land at a different point in that beat cycle by t=10s depending on exact timing, purely by coincidence. Angular velocity is the more directly diagnostic metric here and it improved across the board. **Not claiming this is fully resolved** — the rotation_error regression is real and unexplained, not swept under the rug.
+
+**Follow-up same session — the "declining alpha" concern above was investigated and turned out to be a red herring, not a real gap:**
+
+Christian correctly pushed back on the framing above — the 10s test window's throttle went 0→1 once and stayed there, but that's not the same as `turnAxis` staying constant. Checked directly: `turnAxis` over the full 10s window ranges 0 to 1 (mean 0.68, stddev 0.47), **dropping from 1 to exactly 0 at t≈0.95s** (the pilot held full turn for under a second, then released it) and staying mostly 0 for the rest of the window. Since `apply_rotation_update` returns `omega` completely unchanged whenever `turn_axis == 0` (short-circuits before touching torque at all), a window that's "full turn briefly, then released" will naturally show a large initial alpha followed by near-zero average alpha for the remainder — fully explaining the "declining average alpha" pattern without needing torque_effective itself to vary. The earlier framing conflated "throttle held at 1" with "turn input held at 1"; they're independent signals, and only the former was actually constant.
+
+**Directly tested the real remaining question — new script, `analysis/poll_torque_during_burn.py`** — ignites/throttles the live rocket and polls `computed:torque`'s `torqueEffectiveLive` at a fixed 1s interval over a sustained 10s full-throttle burn (turn input irrelevant this time — torque_effective depends on firing state, not turnAxis). **Result: `torqueEffectiveLive=13` at every single poll, t=0.00s through t=9.00s, zero drift** (`throttleOut` also pinned at 1 the whole time, `partCount` stable at 6 — clean, controlled test). **This closes out the open item: `torque_effective_firing` is a genuine constant once firing, not a signal that continues to drift with time-since-ignition, fuel level, or anything else tested.** The firing/idle binary switch the patch implements is correct as a model of what's actually happening, not an approximation of some smoother underlying signal.
+
+**Still genuinely open, not addressed by any of the above:**
+- Whether Capsule's or other parts' torque values are parametric on some OTHER live variable not tested here (only engine on/off was varied).
+- The rotation_error median regression itself (44.6° → 90.0°) — still unexplained, most likely (not confirmed) the beat-frequency artifact described above, but not directly tested.
+
 ## 2026-09-07 (continuation, later same session) — integrator flag added + lookup_field speedup (24.5x), plus an honest longer-horizon caveat found while timing it
 
 **Context:** after the position-contamination fix above, tested whether symplectic (semi-implicit) Euler -- confirmed earlier the same investigation to be what Box2D itself actually uses -- changes anything now that the model is actually correct (earlier tests of RK4 vs. symplectic Euler were run against the BROKEN pre-fix model).
@@ -1420,56 +1497,7 @@ buried -- see the integration report for the full writeup:**
   geometry/edge-matching (`HoldGrid.CollectSurfaceSnaps`) is a separate,
   harder, deliberately-deferred problem — see the checklist.
 
-- **Added `sfsprobe_build_stack_blueprint`** to `sfsprobe_mcp` — the live
-  orchestration on top of the pure module: scout-place → read real
-  magnet points via the mod's `getplacedmagnets` (v0.35.5) → compute the
-  correct stack → write and load the final blueprint → re-verify real
-  connectivity via the `occupied` flag rather than assuming success from
-  a successful load call alone. Compiles and imports clean. **Not yet
-  live-tested end to end** — the underlying primitives
-  (`loadblueprintbuild`, `getplacedmagnets`) are each individually
-  confirmed working; this specific new orchestration hasn't been run.
-
-## 2026-08-29 — reference_audit.py (template compliance checker)
-
-- **New `python/reference_audit.py`.** Mechanically enforces the
-  `Preconditions` rule added to `docs/sfs_reference_plan.md` the same day:
-  every `#### ` method entry under a **FULL**-depth type must carry a
-  `- **Preconditions:**` bullet. An absent field looks identical to "not
-  checked yet", which is precisely the gap behind the `loadblueprint`
-  `World_PC`/`Build_PC` incident, so it is checked by a script rather than
-  by discipline.
-- Also reports FULL-depth types that document **no** method entries at all.
-  Not a failure — many types genuinely have none beyond a
-  compiler-generated constructor — but a FULL-depth type with no methods
-  written up is worth eyeballing.
-- Two modes, matching `reference_index.py`'s convention:
-
-  ```bash
-  python3 python/reference_audit.py            # full report
-  python3 python/reference_audit.py --check    # silent on pass, exit 1 on fail
-  ```
-
-- **First run found 166 of 216 FULL-depth method entries missing the
-  field** — every one of them in the 43 files produced by Phase 1 Step 1
-  (migration), which predates the rule. The four Step 2 files written on
-  2026-08-29 pass. Backfilling the migrated corpus is tracked in the
-  session handoff, not done here.
-- Skips the five standalone files (`INVENTORY.md`, `INDEX.md`,
-  `METHODOLOGY.md`, `REFLECTION_TOOLKIT.md`, `CORRECTIONS.md`), which
-  deliberately do not follow the per-class template.
-
----
-
-## 2026-08-29 — blueprints/ folder + sfsprobe_load_blueprint tool
-
-- **Created `blueprints/`** at the project root, split into `research/`
-  (usable now — hand-crafted/exploratory designs, including the first
-  test blueprint `single_capsule`) and `live/` (not used yet — reserved
-  for once the design agent is built and connected, kept separate so
-  it's always clear which designs came from a human/manual process vs.
-  the agent itself).
-- **`sfsprobe_load_blueprint`** added to `sfsprobe_mcp` (Stage 12) —
+- **Added `sfsprobe_build_stack_blueprint`** to `sfsprobe_mcp` (Stage 12) —
   wraps the new mod command (`loadblueprint`, v0.30.0). Resolves a
   blueprint by `name` (looked up in `blueprints/research/`) or an
   explicit `path`, sends the command, and maps the mod's distinct

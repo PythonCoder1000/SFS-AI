@@ -9,6 +9,18 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.64.0 -- real resolved `output_TurnAxisTorque` + `hasControl`/`IsOnSurface` added to full-mode telemetry (H1 SAS-engagement finding)
+
+**2026-09-07, later same session.** Every flight this project has recorded so far only ever captured raw `arrowkeys.turnAxis` (the `turnAxis` field) in full-mode telemetry -- which reads exactly 0 the instant a player releases the stick. A live test this session (turn burst, then release, while airborne) confirmed directly that the REAL resolved value `Rocket.ApplyTorque` actually uses, `output_TurnAxisTorque`, goes fully saturated (+-1) at that exact moment if SAS has auto-engaged (confirmed IL gate: `hasControl && !IsOnSurface`, `sfs_source_reference.md` B1.3) -- a completely different signal from raw `turnAxis`, not a smaller/noisier version of it. Any Python-side control-schedule replay built from `turnAxis` alone (as every replay this project has run so far has been) silently drops all SAS activity, which turned out to be the real root cause of a large compounding rotation-prediction error found during a curving-flight validation this same session (see `analysis/python_changelog.md`'s H1 entries for the full investigation).
+
+**Fix:** `BuildInputsSample()` now also reads and records `hasControl`, `isOnSurface`, and `outputTurnAxisTorque` (camelCase JSON keys, matching this file's existing style) alongside the pre-existing `turnAxis`/`directionalAxisX/Y` fields -- full-mode (`telemetry on`, no field list) only, `inputs.jsonl`. Uses the exact same `GetWrapped2(Get(r, name))` access pattern `ResolvePath()` already uses for scoped dotted-path reads, which was directly confirmed live before being wired in here (a `telemetrysnapshot hasControl,IsOnSurface,output_TurnAxisTorque,rb2d.angularVelocity` round trip during the SAS test this session).
+
+`FieldRegistry` gained matching entries for all three, `inputs` namespace, so `light_search`/`sfsprobe_registry_audit` stay in sync (no drift introduced).
+
+**Verification:** compiled clean (`mcs`, 3 pre-existing unrelated warnings on lines 2856-2859, untouched by this change), installed via `build.sh`. **Live-verified same session, post-reload:** `ping` confirms `modVersion=0.64.0` live; a real `telemetrysnapshot` (full mode, no args, rocket on the pad) shows all three new fields populated correctly -- `hasControl:true, isOnSurface:true, outputTurnAxisTorque:0`, matching the expected grounded/no-correction-needed state exactly. **Still not yet verified through an actual recorded flight file** (`telemetry on` -> fly -> `telemetry off` -> read the archive) -- that's the next real test, ideally one that repeats the turn-burst-then-release maneuver from this session's live SAS test so `outputTurnAxisTorque`'s divergence from `turnAxis` shows up in a real recording, not just a live snapshot.
+
+---
+
 ## v0.63.0 — `rb2d.angularDrag` reachable (turned out unnecessary, real fields already sufficed), `telemetrysnapshot` scoped-peek mode
 
 **2026-09-06, aero_torque root-cause continuation.** Two changes, one of which turned out to be avoidable in hindsight -- noted honestly, not hidden.

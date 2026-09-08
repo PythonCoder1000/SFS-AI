@@ -1,0 +1,579 @@
+"""
+forward_sim.py -- forward-integrates the CONFIRMED gravity+drag(+aero-
+torque) formulas starting from a real telemetry sample, for a given
+duration. Built 2026-08-29; extended 2026-09-02 to replace the frozen-
+dragArea coast-only simplification with a rotating-state model.
+
+RK4 integration, not Euler -- accurate enough at a moderate timestep
+(default dt=0.25s) to predict minutes ahead without needing to match
+the real telemetry's own 60Hz sampling rate.
+
+--------------------------------------------------------------------
+STATE MODEL, 2026-09-02 -- what changed and why
+--------------------------------------------------------------------
+The original version froze dragArea at the starting sample's value for
+the whole prediction window: fine for a short, roughly-fixed-
+orientation coast, wrong in principle for a general powered+rotating
+predictor (the actual stated goal -- see bookkeeping/active_state.md's
+"Abandoned paths"). dragArea depends only on AoA (angle of attack) for
+a fixed rigid craft, so the state vector now includes rotation (theta,
+omega) and dragArea is looked up from an AoA table
+(analysis/aoa_dragarea.py) at every RK4 sub-step, instead of staying
+frozen.
+
+**Translational part (dragArea(AoA) -> drag force magnitude) is fully
+wired and requires no extra live data** -- dragArea is pure geometry,
+confirmed via IL to have zero altitude/density dependency
+(AeroModule.CalculateDragForce, sfs_source_reference.md section C1.4).
+
+**Rotational part (aero TORQUE, driving omega's evolution) is
+implemented but requires two additional per-craft constants this
+module cannot supply on its own:**
+
+1. `inertia` -- Unity's real `rb2d.inertia`. NOT derivable from a
+   dragArea/AoA table; must come from a live `aerotorque` probe read
+   (sfsprobe v0.49.0+) for the SPECIFIC craft being simulated. A
+   mismatched-craft inertia is worse than none -- this module refuses
+   to guess one. If not supplied, rotation still evolves kinematically
+   (theta += omega * dt) but omega itself stays frozen (zero torque),
+   which is honest about what's NOT being modeled rather than silently
+   wrong.
+
+2. `com_local` -- rb2d.worldCenterOfMass, in Unity's LOCAL physics
+   frame. **This is a genuinely important, previously-undocumented
+   coordinate-frame gotcha, found while wiring this up and verified
+   against a real `aerotorque` probe snapshot
+   (sfs_probe_aerotorque.json):** `dragCopX`/`dragCopY` (and the
+   `worldCenterOfMass` the confirmed torque formula needs, see
+   sfs_source_reference.md section C1.10) live in Unity's small-scale
+   LOCAL physics coordinates (floating-origin-relative, order ~10^2-
+   10^3), NOT the same frame as `Location.position` (px, py -- the
+   huge orbital-scale coordinates, order ~10^5-10^6, used everywhere
+   else in this module for gravity). Mixing them (e.g. treating px,py
+   as worldCenterOfMass) silently produces a nonsense torque. This
+   module keeps the two frames strictly separate and requires
+   `com_local` as an explicit input for exactly this reason -- see
+   `compute_aero_torque()`'s docstring below for the numeric proof
+   this was checked, not assumed.
+
+**Why this module cannot self-calibrate inertia/com_local from the
+existing AoA table's source flight:** that flight
+(flight01_truth_2026-08-31_19-57-17.jsonl) spans h=81,510-91,078m,
+entirely above Earth's 30,000m atmosphere ceiling -- real atmospheric
+density (and therefore real aero force/torque) is exactly zero
+throughout. The wide AoA sweep in that data is the craft freely
+tumbling in vacuum from momentum conservation after stage separation,
+not atmosphere-driven weathercocking. Confirmed by checking every
+sample's `h` against the atmosphere ceiling. A flight with real
+atmospheric descent (h < 30,000m) is needed to derive or validate
+`inertia` for a given craft -- or, more simply, a single live
+`aerotorque` probe read while that craft is in real atmosphere, the
+same way the original 2026-08-31 validation obtained it.
+
+**dragArea(AoA)+torque formula, verified numerically against
+`sfs_probe_aerotorque.json`'s real live-read snapshot (a DIFFERENT
+craft's read, used only to check the arithmetic, not reused as this
+craft's inertia):** torqueZ = (copApplied-com) x force reproduced
+11.018437336 against the probe's own 11.018437386 (float32 rounding
+only), and alpha_deg = torqueZ/inertia * 57.29578 reproduced
+1.5770399538 against the probe's 1.5770399570. The rad->deg factor is
+NOT explicit in the doc's pseudocode but is required and confirmed
+here -- Unity's `AddForceAtPosition`-driven rotation is genuinely
+radian-based internally (unlike player-commanded rotation, which never
+touches inertia at all -- sfs_physics_reference.md section 2.4).
+
+--------------------------------------------------------------------
+SAS, added 2026-09-02 (same session) -- what it covers and what it doesn't
+--------------------------------------------------------------------
+SAS (sfs_physics_reference.md section 2.4 / sfs_source_reference.md
+section B1.3) is a CONFIRMED deadbeat controller: whenever
+hasControl && !IsOnSurface and there's no manual turn input, it writes
+rb2d.angularVelocity DIRECTLY (never touches inertia, unlike aero
+torque) toward zero, using at most one real physics tick's worth of a
+craft's torque_effective/mass authority per tick:
+
+    delta       = torque_effective * 57.29578 / mass * dt   (one tick)
+    turn_axis   = clamp(omega / delta, -1, 1)      (0 if delta == 0)
+    omega      -= torque_effective * 57.29578 / mass * turn_axis * dt
+
+**Proven and empirically confirmed this session that a SINGLE big-step
+application of this formula (using the RK4 step's own dt in place of
+one real physics tick) gives the mathematically EXACT same end-of-
+window omega as chaining the real per-tick formula many times** --
+provided SAS is the only thing changing omega. (Telescoping proof: in
+the "saturated" branch the real per-tick law is a constant-rate
+decrease, which sums linearly regardless of step granularity; in the
+"nullable" branch both the big-step and fine-grained versions land on
+exactly 0. Confirmed empirically too: re-running the fine-grained
+per-real-tick chained version against the same real flight gave
+IDENTICAL results to the big-step version, differing only in the 17th
+decimal place.) So apply_sas() below applies the formula ONCE per RK4
+outer step -- no inner tick loop needed, and it's not an approximation
+of the pure-SAS mechanism.
+
+**Validated against this exact craft's own real flight data**
+(flight01_truth_2026-08-31_19-57-17.jsonl + its paired inputs.jsonl,
+the same flight the AoA table was built from -- and conveniently
+entirely in vacuum, so there's no aero-torque confound to separate
+out): using this craft's own real "torque" field (=5, SumEnabledTorque,
+confirmed via sfsprobe/SFSProbe.cs; no mass-based divisor applies since
+this craft's mass stays under 200t throughout) and real per-tick mass,
+single-tick predictions across all 4,168 real hands-off (turnAxis == 0)
+ticks in the flight: median error was EXACTLY 0.0 deg/s, mean 0.15,
+p90 0.61, max 0.75.
+
+**BUT that aggregate hides a real, honest gap.** Digging into where the
+non-zero error concentrates: it's not spread evenly -- it clusters
+specifically in stretches where |omega| >= 2 deg/s, with a fairly
+consistent ~0.45-0.61 deg/s UNDER-prediction of the real deceleration
+rate, PER TICK, compounding to tens of degrees/s of error over a
+multi-second window (e.g. one stretch went from omega=-76.8 to a real
+-35.6 over 1s; this model alone predicts only -68.9). The likely
+mechanism, and it's a real, separate, CONFIRMED one:
+RcsModule.TorqueThrust (sfs_source_reference.md section D3.2) fires RCS
+thrusters for rotational damping whenever |angularVelocity| >= 2 deg/s
+-- exactly the regime where the extra error shows up -- and this
+craft's own recorded rcsFiring field confirms 5 of its 6 RCS thrusters
+were actively firing throughout the high-omega stretches checked. RCS's
+torque contribution is a SEPARATE mechanism from SAS: it applies real
+force via AddForceAtPosition (genuine Unity physics, needing
+per-thruster position and rb2d.inertia -- the same class of missing
+ingredient as the aero-torque model above), not a direct
+angularVelocity write. **Not modeled here.** So: SAS alone (this
+function) is accurate when |omega| stays under ~2 deg/s (or on any
+craft with RCS disabled/empty); it UNDER-predicts real hands-off
+damping rate on an RCS-equipped craft at higher spin rates.
+
+torque_effective is a craft-design constant (like inertia), not
+derivable from the AoA table. Required as an explicit parameter for the
+same reason inertia is -- this module never fabricates or reuses a
+mismatched craft's value. For THIS specific craft (the AoA table's
+craft) it's legitimately available from the SAME flight's own
+inputs.jsonl (torque=5), not borrowed from anywhere else.
+--------------------------------------------------------------------
+"""
+
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).parent))
+from aoa_dragarea import angle_of_attack as _table_aoa  # noqa: E402 (path setup above)
+from aoa_dragarea import lookup_field  # noqa: E402
+
+PLANET_CONSTANTS = {
+    "Earth": {
+        "radius_m": 314970.0,
+        "mu": 972219788820.0,
+        "atmosphere_height_m": 30000.0,
+        "rho0": 0.005,
+        "curve": 10.0,
+    },
+}
+
+RAD2DEG = 57.29578
+
+# Isolation flags -- added 2026-09-02, so a divergence between predicted and
+# real can be narrowed down to ONE physics component instead of guessed at.
+# Each defaults to True (matches prior behavior exactly when combined with
+# supplying the relevant data); explicitly setting one False disables that
+# component's CONTRIBUTION even if its required data (aoa_table, inertia,
+# com_local, torque_effective) is present -- "I have the data but want this
+# off for a test" is a different thing from "I don't have the data" (the
+# existing None-means-off behavior), and both are supported independently.
+DEFAULT_FLAGS = {"gravity": True, "drag": True, "aero_torque": True, "sas": True}
+
+
+def _resolve_flags(flags: Optional[dict]) -> dict:
+    resolved = dict(DEFAULT_FLAGS)
+    if flags:
+        unknown = set(flags) - set(DEFAULT_FLAGS)
+        if unknown:
+            raise ValueError(f"unknown physics flag(s): {sorted(unknown)}; "
+                              f"valid flags are {sorted(DEFAULT_FLAGS)}")
+        resolved.update(flags)
+    return resolved
+
+
+def atmospheric_density(h: float, body: dict) -> float:
+    """Verbatim copy of sfs_telemetry.py's confirmed formula."""
+    H = body["atmosphere_height_m"]
+    if h < 0 or h > H:
+        return 0.0
+    curve = body["curve"]
+    return (math.exp(-curve * h / H) - math.exp(-curve)) * body["rho0"]
+
+
+def _wrap180(deg: float) -> float:
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def drag_area_for_state(theta_deg: float, vx: float, vy: float,
+                         aoa_table: Optional[dict]) -> float:
+    """dragArea looked up from the AoA table for the CURRENT integrator
+    state (theta, velocity), falling back to 0.0 if no table is
+    supplied or velocity is ~zero (heading undefined, matches
+    aoa_dragarea.angle_of_attack's own None case)."""
+    if aoa_table is None:
+        return 0.0
+    if math.hypot(vx, vy) < 1e-6:
+        return 0.0
+    heading = math.degrees(math.atan2(vy, vx))
+    aoa = _wrap180((theta_deg + 90.0) - heading)
+    val = lookup_field(aoa_table, aoa, "dragArea")
+    return val if val is not None else 0.0
+
+
+def compute_aero_torque(theta_deg: float, vx: float, vy: float, h: float,
+                         aoa_table: dict, inertia: float,
+                         com_local: tuple[float, float], body: dict) -> float:
+    """Predicted angular acceleration (deg/s^2) from aero torque alone,
+    following sfs_source_reference.md section C1.10's confirmed
+    TryComputeAeroTorque exactly:
+
+        cop_world   = Matrix2x2.Angle(velocityAngle - pi/2) * (dragCopX, dragCopY)
+        cop_applied = Lerp(com_local, cop_world, 0.2)
+        torqueZ     = (cop_applied - com_local) x F_drag        (2D cross product)
+        alpha_deg   = (torqueZ / inertia) * 57.29578            (rad->deg, confirmed
+                                                                  empirically, see
+                                                                  module docstring)
+
+    `com_local` MUST be in the same local physics frame as the AoA
+    table's dragCopX/dragCopY (i.e. a live rb2d.worldCenterOfMass read
+    for this exact craft) -- NOT (px, py). Passing (px, py) here will
+    silently produce a nonsense torque; see module docstring.
+    """
+    v = math.hypot(vx, vy)
+    if v < 1e-6:
+        return 0.0
+    heading_rad = math.atan2(vy, vx)
+    aoa_deg = _wrap180((theta_deg + 90.0) - math.degrees(heading_rad))
+
+    drag_area = lookup_field(aoa_table, aoa_deg, "dragArea")
+    cop_x_vel = lookup_field(aoa_table, aoa_deg, "dragCopX")
+    cop_y_vel = lookup_field(aoa_table, aoa_deg, "dragCopY")
+    if drag_area is None or cop_x_vel is None or cop_y_vel is None:
+        return 0.0
+
+    density = atmospheric_density(h, body)
+    if density <= 0:
+        return 0.0  # matches the vacuum-tumble case this project already found
+
+    # Rotate (dragCopX, dragCopY) out of velocity-aligned space into the
+    # local physics frame -- confirmed non-negated angle, C1.10.
+    a = heading_rad - math.pi / 2
+    ca, sa = math.cos(a), math.sin(a)
+    cop_world_x = ca * cop_x_vel - sa * cop_y_vel
+    cop_world_y = sa * cop_x_vel + ca * cop_y_vel
+
+    comx, comy = com_local
+    cop_applied_x = comx + (cop_world_x - comx) * 0.2
+    cop_applied_y = comy + (cop_world_y - comy) * 0.2
+
+    f_mag = 1.5 * drag_area * v * v * density
+    force_x = -(vx / v) * f_mag
+    force_y = -(vy / v) * f_mag
+
+    torque_z = (cop_applied_x - comx) * force_y - (cop_applied_y - comy) * force_x
+    return (torque_z / inertia) * RAD2DEG
+
+
+def accel(px: float, py: float, vx: float, vy: float, m: float,
+          theta_deg: float, aoa_table: Optional[dict], body: dict,
+          enable_gravity: bool = True, enable_drag: bool = True) -> tuple[float, float]:
+    """Translational acceleration (gravity + drag), world-frame (x,y)
+    m/s^2. dragArea comes from the AoA table at the CURRENT theta/
+    velocity state (not frozen) when a table is supplied; falls back to
+    0 drag (gravity-only) with no table, same as an empty coast.
+
+    enable_gravity/enable_drag: isolation flags (see DEFAULT_FLAGS) --
+    force that component's contribution to exactly 0 regardless of
+    whether the data to compute it is available."""
+    r = math.hypot(px, py)
+    if r == 0:
+        return 0.0, 0.0
+    if enable_gravity:
+        g_mag = body["mu"] / (r * r)
+        gx, gy = -g_mag * (px / r), -g_mag * (py / r)
+    else:
+        gx, gy = 0.0, 0.0
+    ax_drag = ay_drag = 0.0
+    if enable_drag:
+        v_mag = math.hypot(vx, vy)
+        h = r - body["radius_m"]
+        density = atmospheric_density(h, body)
+        drag_area = drag_area_for_state(theta_deg, vx, vy, aoa_table)
+        if v_mag > 0 and density > 0 and drag_area > 0:
+            drag_force_mag = 1.5 * drag_area * v_mag * v_mag * density
+            ax_drag = -(vx / v_mag) * drag_force_mag / m
+            ay_drag = -(vy / v_mag) * drag_force_mag / m
+    return gx + ax_drag, gy + ay_drag
+
+
+def apply_sas(omega: float, mass: float, torque_effective: float, dt: float) -> float:
+    """Discrete deadbeat SAS correction (sfs_source_reference.md section
+    B1.3's GetStopRotationTurnAxis + ApplyTorque, confirmed), applied
+    ONCE using dt directly -- see module docstring's SAS section for the
+    telescoping proof/validation showing this is exact (for the pure-SAS
+    mechanism) rather than an approximation, and for the honest gap
+    (RCS's separate torque-thrust auto-damping, not modeled here) this
+    does NOT cover at |omega| >= ~2 deg/s on an RCS-equipped craft.
+
+    torque_effective: this craft's Sum(enabled TorqueModule.torque),
+    ALREADY divided by (mass/200)^0.35 if mass > 200 (t) -- i.e. exactly
+    what sfs_physics_reference.md section 2.4/B1.3's `torque_effective`
+    means, a craft-design constant. Caller's job to apply the >200t
+    divisor if relevant; this function does not (mass here is the
+    CURRENT state mass, used only for the /mass term, and re-deriving
+    the divisor from a possibly-already-divided torque_effective would
+    double-apply it).
+    """
+    if dt <= 0 or mass <= 0:
+        return omega
+    delta = torque_effective * RAD2DEG / mass * dt
+    if delta == 0:
+        return omega
+    turn_axis = max(-1.0, min(1.0, omega / delta))
+    return omega - torque_effective * RAD2DEG / mass * turn_axis * dt
+
+
+def _rk4_step(px, py, vx, vy, m, theta, omega, body, dt,
+              aoa_table, inertia, com_local, torque_effective, flags):
+    def deriv(px, py, vx, vy, theta, omega):
+        ax, ay = accel(px, py, vx, vy, m, theta, aoa_table, body,
+                        enable_gravity=flags["gravity"], enable_drag=flags["drag"])
+        if (flags["aero_torque"] and aoa_table is not None
+                and inertia is not None and com_local is not None):
+            r = math.hypot(px, py)
+            h = r - body["radius_m"]
+            alpha = compute_aero_torque(theta, vx, vy, h, aoa_table, inertia, com_local, body)
+        else:
+            alpha = 0.0  # disabled, or no torque model available -- omega stays constant, theta still advances
+        return vx, vy, ax, ay, omega, alpha
+
+    k1 = deriv(px, py, vx, vy, theta, omega)
+    k2 = deriv(px + k1[0]*dt/2, py + k1[1]*dt/2, vx + k1[2]*dt/2, vy + k1[3]*dt/2,
+               theta + k1[4]*dt/2, omega + k1[5]*dt/2)
+    k3 = deriv(px + k2[0]*dt/2, py + k2[1]*dt/2, vx + k2[2]*dt/2, vy + k2[3]*dt/2,
+               theta + k2[4]*dt/2, omega + k2[5]*dt/2)
+    k4 = deriv(px + k3[0]*dt, py + k3[1]*dt, vx + k3[2]*dt, vy + k3[3]*dt,
+               theta + k3[4]*dt, omega + k3[5]*dt)
+
+    px2 = px + (dt/6) * (k1[0] + 2*k2[0] + 2*k3[0] + k4[0])
+    py2 = py + (dt/6) * (k1[1] + 2*k2[1] + 2*k3[1] + k4[1])
+    vx2 = vx + (dt/6) * (k1[2] + 2*k2[2] + 2*k3[2] + k4[2])
+    vy2 = vy + (dt/6) * (k1[3] + 2*k2[3] + 2*k3[3] + k4[3])
+    theta2 = theta + (dt/6) * (k1[4] + 2*k2[4] + 2*k3[4] + k4[4])
+    omega2 = omega + (dt/6) * (k1[5] + 2*k2[5] + 2*k3[5] + k4[5])
+
+    if flags["sas"] and torque_effective is not None:
+        # Discrete SAS correction, applied AFTER the continuous
+        # (aero-torque) step for this dt -- operator splitting; see
+        # module docstring's SAS section.
+        omega2 = apply_sas(omega2, m, torque_effective, dt)
+
+    return px2, py2, vx2, vy2, theta2, omega2
+
+
+def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
+                      body_name: str = "Earth", aoa_table: Optional[dict] = None,
+                      inertia: Optional[float] = None,
+                      com_local: Optional[tuple[float, float]] = None,
+                      torque_effective: Optional[float] = None,
+                      flags: Optional[dict] = None) -> list[dict]:
+    """Forward-integrates from a real telemetry sample's state (px, py,
+    vx, vy, m, rot, angv) for duration_s using RK4.
+
+    aoa_table: output of aoa_dragarea.build_table(...) for the SPECIFIC
+    craft being simulated. If None, falls back to the old frozen-
+    dragArea behavior (starting sample's dragArea held constant, no
+    rotation dynamics) for backward compatibility.
+
+    inertia, com_local: required together to activate the aero-torque
+    model (see module docstring for what these are and why they can't
+    be inferred from aoa_table alone). If either is missing, theta
+    still advances kinematically from the starting angv, but omega
+    stays frozen at its starting value (zero torque assumed) rather
+    than silently guessing a wrong torque.
+
+    torque_effective: this craft's SAS authority constant (see module
+    docstring's SAS section). If given, SAS is applied every RK4 step
+    on top of whatever else is changing omega that step (aero torque,
+    if active). If None, SAS is not modeled -- omega evolves purely
+    from aero torque (or stays frozen, if that's not active either).
+    Only requires `aoa_table` is NOT required to be non-None for SAS to
+    apply on its own (SAS works with or without the aero-torque model
+    active).
+
+    flags: isolation switches, e.g. flags={"drag": False} to test
+    whether a divergence traces back to drag specifically. Any subset
+    of DEFAULT_FLAGS's keys ("gravity", "drag", "aero_torque", "sas");
+    unset keys default to True. Distinct from passing None for
+    aoa_table/inertia/com_local/torque_effective -- those mean "I don't
+    have this data"; flags=False means "I have it, turn it off anyway".
+    Raises ValueError on an unrecognized flag name (fails loud, not
+    silently ignored).
+
+    Returns a list of {t, px, py, vx, vy, h, v, theta_deg, omega_degs,
+    aoa_deg, dragArea} points, first entry being the (unmodified)
+    starting state itself.
+    """
+    flags = _resolve_flags(flags)
+    body = PLANET_CONSTANTS[body_name]
+    px, py, vx, vy, m = start["px"], start["py"], start["vx"], start["vy"], start["m"]
+    theta = start.get("rot", 0.0)
+    omega = start.get("angv", 0.0)
+
+    if aoa_table is None:
+        # Backward-compatible fallback: frozen dragArea, no rotation.
+        frozen_drag_area = start.get("dragArea") or 0.0
+
+        def frozen_accel(px, py, vx, vy):
+            r = math.hypot(px, py)
+            if r == 0:
+                return 0.0, 0.0
+            if flags["gravity"]:
+                g_mag = body["mu"] / (r * r)
+                gx, gy = -g_mag * (px / r), -g_mag * (py / r)
+            else:
+                gx, gy = 0.0, 0.0
+            if flags["drag"]:
+                v_mag = math.hypot(vx, vy)
+                h = r - body["radius_m"]
+                density = atmospheric_density(h, body)
+                if v_mag > 0 and density > 0:
+                    f = 1.5 * frozen_drag_area * v_mag * v_mag * density
+                    return gx - (vx / v_mag) * f / m, gy - (vy / v_mag) * f / m
+            return gx, gy
+
+        def frozen_rk4(px, py, vx, vy, dt):
+            def deriv(px, py, vx, vy):
+                ax, ay = frozen_accel(px, py, vx, vy)
+                return vx, vy, ax, ay
+            k1 = deriv(px, py, vx, vy)
+            k2 = deriv(px+k1[0]*dt/2, py+k1[1]*dt/2, vx+k1[2]*dt/2, vy+k1[3]*dt/2)
+            k3 = deriv(px+k2[0]*dt/2, py+k2[1]*dt/2, vx+k2[2]*dt/2, vy+k2[3]*dt/2)
+            k4 = deriv(px+k3[0]*dt, py+k3[1]*dt, vx+k3[2]*dt, vy+k3[3]*dt)
+            return (px + (dt/6)*(k1[0]+2*k2[0]+2*k3[0]+k4[0]),
+                    py + (dt/6)*(k1[1]+2*k2[1]+2*k3[1]+k4[1]),
+                    vx + (dt/6)*(k1[2]+2*k2[2]+2*k3[2]+k4[2]),
+                    vy + (dt/6)*(k1[3]+2*k2[3]+2*k3[3]+k4[3]))
+
+        points = [{"t": 0.0, "px": px, "py": py, "vx": vx, "vy": vy,
+                   "h": math.hypot(px, py) - body["radius_m"], "v": math.hypot(vx, vy),
+                   "theta_deg": theta, "omega_degs": omega, "aoa_deg": None,
+                   "dragArea": frozen_drag_area}]
+        steps = int(duration_s / dt)
+        for i in range(steps):
+            px, py, vx, vy = frozen_rk4(px, py, vx, vy, dt)
+            if flags["sas"] and torque_effective is not None:
+                omega = apply_sas(omega, m, torque_effective, dt)
+            theta = _wrap180(theta + omega * dt)
+            t = (i + 1) * dt
+            points.append({"t": round(t, 3), "px": px, "py": py, "vx": vx, "vy": vy,
+                            "h": math.hypot(px, py) - body["radius_m"], "v": math.hypot(vx, vy),
+                            "theta_deg": theta, "omega_degs": omega, "aoa_deg": None,
+                            "dragArea": frozen_drag_area})
+        return points
+
+    def state_point(t, px, py, vx, vy, theta, omega):
+        heading = math.degrees(math.atan2(vy, vx)) if math.hypot(vx, vy) > 1e-6 else None
+        aoa = _wrap180((theta + 90.0) - heading) if heading is not None else None
+        drag_area = lookup_field(aoa_table, aoa, "dragArea") if aoa is not None else 0.0
+        return {"t": t, "px": px, "py": py, "vx": vx, "vy": vy,
+                "h": math.hypot(px, py) - body["radius_m"], "v": math.hypot(vx, vy),
+                "theta_deg": theta, "omega_degs": omega, "aoa_deg": aoa,
+                "dragArea": drag_area}
+
+    points = [state_point(0.0, px, py, vx, vy, theta, omega)]
+    steps = int(duration_s / dt)
+    for i in range(steps):
+        px, py, vx, vy, theta, omega = _rk4_step(
+            px, py, vx, vy, m, theta, omega, body, dt, aoa_table, inertia, com_local,
+            torque_effective, flags)
+        theta = _wrap180(theta)
+        t = round((i + 1) * dt, 3)
+        points.append(state_point(t, px, py, vx, vy, theta, omega))
+    return points
+
+
+def prep_demo_data(src_path: str, out_path: str, n_downsample: int = 2500,
+                    aoa_table_path: Optional[str] = None,
+                    inertia: Optional[float] = None,
+                    com_local: Optional[tuple[float, float]] = None,
+                    torque_effective: Optional[float] = None) -> dict:
+    """Loads a real archived flight, downsamples it for embedding in an
+    interactive artifact, and runs a self-test (10s forward-sim from a
+    mid-flight sample, compared against the REAL recorded trajectory at
+    the matching later timestamp) so the demo ships with a known,
+    reported accuracy figure. If aoa_table_path is given, uses the
+    rotating-state model (still frozen-omega unless inertia+com_local
+    are ALSO given, per forward_simulate's rules above).
+    """
+    samples = []
+    with open(src_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    samples.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    aoa_table = None
+    if aoa_table_path:
+        aoa_table = json.loads(Path(aoa_table_path).read_text())
+
+    n = len(samples)
+    step = max(1, n // n_downsample)
+    t0 = samples[0]["t"]
+    downsampled = []
+    for i in range(0, n, step):
+        s = samples[i]
+        downsampled.append({
+            "idx": i, "t": round(s["t"] - t0, 3), "h": s.get("h"),
+            "px": s.get("px"), "py": s.get("py"), "vx": s.get("vx"), "vy": s.get("vy"),
+            "m": s.get("m"), "dragArea": s.get("dragArea"), "vv": s.get("vv"),
+            "rot": s.get("rot"), "angv": s.get("angv"),
+        })
+
+    test_idx = n // 3
+    test_start = samples[test_idx]
+    sim = forward_simulate(test_start, 10.0, dt=0.1, aoa_table=aoa_table,
+                            inertia=inertia, com_local=com_local,
+                            torque_effective=torque_effective)
+    target_t = test_start["t"] + 10.0
+    real_at_target = min(samples, key=lambda s: abs(s["t"] - target_t))
+    pred_final = sim[-1]
+    h_error_pct = abs(pred_final["h"] - real_at_target["h"]) / max(abs(real_at_target["h"]), 1) * 100
+
+    result = {
+        "meta": {
+            "total_real_samples": n,
+            "downsampled_count": len(downsampled),
+            "t0_absolute": t0,
+            "planet_constants": PLANET_CONSTANTS["Earth"],
+            "rotating_model": aoa_table is not None,
+            "torque_model_active": aoa_table is not None and inertia is not None and com_local is not None,
+            "sas_active": torque_effective is not None,
+            "self_test": {
+                "start_idx": test_idx, "start_t_rel": round(test_start["t"] - t0, 2),
+                "duration_s": 10.0,
+                "predicted_h": pred_final["h"], "real_h": real_at_target["h"],
+                "h_error_pct": h_error_pct,
+            },
+        },
+        "samples": downsampled,
+    }
+    Path(out_path).write_text(json.dumps(result))
+    return result["meta"]
+
+
+if __name__ == "__main__":
+    meta = prep_demo_data(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 2500)
+    print(f"wrote {sys.argv[2]}: {meta['downsampled_count']} downsampled points "
+          f"from {meta['total_real_samples']} real samples")
+    print(f"self-test: 10s forward-sim from idx {meta['self_test']['start_idx']} -> "
+          f"h_error_pct={meta['self_test']['h_error_pct']:.4f}%")

@@ -1087,8 +1087,7 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
                       control_schedule: Optional["ControlSchedule"] = None,
                       debug: bool = False,
                       integrator: str = "rk4",
-                      use_real_aero: bool = False,
-                      sas_order: str = "before") -> list[dict]:
+                      use_real_aero: bool = False) -> list[dict]:
     """Forward-integrates from a real telemetry sample's state for
     duration_s using RK4 for the continuous state and discrete post-step
     corrections for SAS/gimbal/RCS/staging/terrain. See module docstring
@@ -1297,59 +1296,25 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
             turn_axis = compute_turn_axis(omega0, m0, torque_effective_now, dt)
             directional_axis_now = (0.0, 0.0)
 
-        # 2026-09-07 H_final1 test (see python_changelog.md) -- Unity's
-        # OWN documentation confirms script execution order between
-        # unrelated MonoBehaviours (Rocket.FixedUpdate vs. the part
-        # modules' own FixedUpdates) is NOT guaranteed unless explicitly
-        # pinned, and this project confirmed via IL that SFS does NOT
-        # pin it (zero [DefaultExecutionOrder] usage anywhere). This
-        # model always applied the direct SAS/manual write BEFORE the
-        # aero/thrust RK4 step; sas_order="after" flips that, to test
-        # whether ordering sensitivity is a real contributor at high
-        # sustained rotation rate (a low-rate test earlier this project
-        # found it "inert" -- never tested at rate this high).
-        if sas_order == "before":
-            omega_after_sas = omega0
-            if flags["sas"] and torque_effective_now is not None:
-                omega_after_sas = apply_rotation_update(omega0, m0, torque_effective_now, turn_axis, dt)
-            state = (px0, py0, vx0, vy0, m0, theta0, omega_after_sas, heat0)
+        omega_after_sas = omega0
+        if flags["sas"] and torque_effective_now is not None:
+            omega_after_sas = apply_rotation_update(omega0, m0, torque_effective_now, turn_axis, dt)
+        state = (px0, py0, vx0, vy0, m0, theta0, omega_after_sas, heat0)
 
-            debug_info = None
-            if debug:
-                r0 = math.hypot(px0, py0)
-                h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
-                debug_info = _aero_torque_diagnostic(
-                    theta0, vx0, vy0, omega_after_sas, h0, aoa_table, com_local,
-                    (craft_config or {}).get("parachutes"), body, inertia,
-                    flags["drag"], flags["parachute_drag"])
+        debug_info = None
+        if debug:
+            r0 = math.hypot(px0, py0)
+            h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
+            debug_info = _aero_torque_diagnostic(
+                theta0, vx0, vy0, omega_after_sas, h0, aoa_table, com_local,
+                (craft_config or {}).get("parachutes"), body, inertia,
+                flags["drag"], flags["parachute_drag"])
 
-            state = step_fn(state, body, dt, aoa_table, com_local, inertia,
-                             craft_config, gimbal_times, flags, throttle_override_now,
-                             start_pos=start_pos, real_aero_override=real_aero_override_now)
-            px, py, vx, vy, m, theta, omega, heat_temp = state
-            theta = _wrap180(theta)
-        elif sas_order == "after":
-            state = (px0, py0, vx0, vy0, m0, theta0, omega0, heat0)
-
-            debug_info = None
-            if debug:
-                r0 = math.hypot(px0, py0)
-                h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
-                debug_info = _aero_torque_diagnostic(
-                    theta0, vx0, vy0, omega0, h0, aoa_table, com_local,
-                    (craft_config or {}).get("parachutes"), body, inertia,
-                    flags["drag"], flags["parachute_drag"])
-
-            state = step_fn(state, body, dt, aoa_table, com_local, inertia,
-                             craft_config, gimbal_times, flags, throttle_override_now,
-                             start_pos=start_pos, real_aero_override=real_aero_override_now)
-            px, py, vx, vy, m, theta, omega_post_aero, heat_temp = state
-            theta = _wrap180(theta)
-            omega = omega_post_aero
-            if flags["sas"] and torque_effective_now is not None:
-                omega = apply_rotation_update(omega_post_aero, m, torque_effective_now, turn_axis, dt)
-        else:
-            raise ValueError(f"unknown sas_order: {sas_order!r} (expected 'before' or 'after')")
+        state = step_fn(state, body, dt, aoa_table, com_local, inertia,
+                         craft_config, gimbal_times, flags, throttle_override_now,
+                         start_pos=start_pos, real_aero_override=real_aero_override_now)
+        px, py, vx, vy, m, theta, omega, heat_temp = state
+        theta = _wrap180(theta)
 
         # Box2D rotation-safety clamp (2026-09-07, confirmed via public
         # Box2D source, b2_maxRotation = 0.5*pi = 90deg per physics
@@ -1854,8 +1819,7 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
                      debug: bool = False,
                      integrator: str = "rk4",
                      firing_snapshot_path: Optional[str] = None,
-                     use_real_aero: bool = False,
-                     sas_order: str = "before") -> tuple[list[dict], float, list[dict]]:
+                     use_real_aero: bool = False) -> tuple[list[dict], float, list[dict]]:
     """Shared setup for test_against_run and test_against_run_trajectory
     (2026-09-05 split -- both need the identical real-flight load,
     starting-state construction, and control-replay forward_simulate()
@@ -1956,7 +1920,7 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
         inertia=craft_config["inertia"], com_local=craft_config["com_local"],
         torque_effective=craft_config["torque_effective"], flags=flags,
         craft_config=craft_config, control_schedule=control_schedule, debug=debug,
-        integrator=integrator, use_real_aero=use_real_aero, sas_order=sas_order)
+        integrator=integrator, use_real_aero=use_real_aero)
 
     return rows, t0, sim
 
@@ -2041,8 +2005,7 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
                                  debug: bool = False,
                                  integrator: str = "rk4",
                                  firing_snapshot_path: Optional[str] = None,
-                                 use_real_aero: bool = False,
-                                 sas_order: str = "before") -> dict:
+                                 use_real_aero: bool = False) -> dict:
     """Like test_against_run, but compares the ENTIRE predicted trajectory
     against the real flight step-by-step, not just the final point --
     built to characterize forward-integrator compounding error
@@ -2079,7 +2042,7 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
         flight_jsonl_path, craft_config_path, start_t, duration_s, dt,
         body_name, aoa_table_path, throttle_field, flags=flags, debug=debug,
         integrator=integrator, firing_snapshot_path=firing_snapshot_path,
-        use_real_aero=use_real_aero, sas_order=sas_order)
+        use_real_aero=use_real_aero)
 
     steps = []
     for point in sim[::max(1, stride)]:

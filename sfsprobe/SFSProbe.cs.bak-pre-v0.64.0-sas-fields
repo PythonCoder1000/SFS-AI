@@ -31,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.65.0";
+        public const string VersionString = "0.63.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -990,14 +990,6 @@ namespace SFSProbe
                 Description = "the actual moment of inertia used in the alpha calc", RequestAs = "telemetry on ...,computed:aeroTorque" },
             new ProbeFieldInfo { Key = "rbAngularDrag", Namespace = "computed", Group = "aeroTorque", Unit = "Unity rb2d.angularDrag units (dimensionless damping coefficient)",
                 Description = "NEW v0.63.0: real Unity Rigidbody2D angularDrag, never read before -- AddForceAtPosition (real aero torque's mechanism) is genuine Unity physics and Unity's own solver applies this damping every tick; neither TryComputeAeroTorque's hand-derived alphaPred formula nor forward_sim.py's Python replica ever modeled it", RequestAs = "telemetry on ...,computed:aeroTorque" },
-            new ProbeFieldInfo { Key = "comX", Namespace = "computed", Group = "aeroTorque", Unit = "Unity small-scale local physics frame meters",
-                Description = "NEW v0.65.0: real per-tick rb2d.worldCenterOfMass.x -- was already computed inside TryComputeAeroTorque, just not previously surfaced. Needed to convert dragCopX/Y (VELOCITY-ALIGNED frame, confirmed) into a valid lever arm without reusing a stale pre-ignition com_local snapshot.", RequestAs = "telemetry on ...,computed:aeroTorque" },
-            new ProbeFieldInfo { Key = "comY", Namespace = "computed", Group = "aeroTorque", Unit = "Unity small-scale local physics frame meters",
-                Description = "NEW v0.65.0: real per-tick rb2d.worldCenterOfMass.y -- see comX.", RequestAs = "telemetry on ...,computed:aeroTorque" },
-            new ProbeFieldInfo { Key = "copAppliedX", Namespace = "computed", Group = "aeroTorque", Unit = "world-frame meters",
-                Description = "NEW v0.65.0: real per-tick center-of-drag AFTER both the real localToWorld rotation (dragCopX/Y's raw value is velocity-aligned, not world-frame) and the confirmed Lerp(CoM,CoP,0.2) blend -- directly usable as cop_x for a torque calc, no further transformation needed.", RequestAs = "telemetry on ...,computed:aeroTorque" },
-            new ProbeFieldInfo { Key = "copAppliedY", Namespace = "computed", Group = "aeroTorque", Unit = "world-frame meters",
-                Description = "NEW v0.65.0: real per-tick center-of-drag, y component -- see copAppliedX.", RequestAs = "telemetry on ...,computed:aeroTorque" },
             new ProbeFieldInfo { Key = "gimbalOn", Namespace = "computed", Group = "gimbal", Unit = "bool",
                 Description = "primary gimbaling engine's gimbalOn; null if no gimbaling engine exists at all. 'Primary' = first ON gimbaling engine, falling back to the first gimbaling engine found (even if off) if none are on (v0.56.1 fix)", RequestAs = "telemetry on ...,computed:gimbal" },
             new ProbeFieldInfo { Key = "gimbalThrottleOut", Namespace = "computed", Group = "gimbal", Unit = "0-1 float",
@@ -1105,15 +1097,6 @@ namespace SFSProbe
                 Description = "Rocket.output_DirectionalAxis.x (confirmed NOT on arrowkeys -- a distinct field needed for RcsModule.DirectionThrust reconstruction)", RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
             new ProbeFieldInfo { Key = "directionalAxisY", Namespace = "inputs", Unit = "unitless direction component",
                 Description = "Rocket.output_DirectionalAxis.y", RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
-            new ProbeFieldInfo { Key = "hasControl", Namespace = "inputs", Unit = "bool",
-                Description = "Rocket.hasControl -- NEW v0.64.0, one of SAS's two gate conditions (GetTurnAxis, sfs_source_reference.md B1.3). Needed alongside isOnSurface/outputTurnAxisTorque to distinguish real SAS auto-correction from a hands-off no-op.",
-                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
-            new ProbeFieldInfo { Key = "isOnSurface", Namespace = "inputs", Unit = "bool",
-                Description = "Rocket.IsOnSurface -- NEW v0.64.0, SAS's other gate condition (GetTurnAxis requires hasControl && !IsOnSurface). Grounded (true) structurally blocks SAS regardless of hasControl.",
-                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
-            new ProbeFieldInfo { Key = "outputTurnAxisTorque", Namespace = "inputs", Unit = "-1 to 1 float, saturating",
-                Description = "Rocket.output_TurnAxisTorque -- NEW v0.64.0, the REAL resolved turn-axis value ApplyTorque actually uses (manual input if nonzero, else SAS's own deadbeat correction, else 0). NOT the same as turnAxis (raw arrowkeys input only) -- confirmed live 2026-09-07 this can be fully saturated (+-1) while raw turnAxis reads exactly 0, whenever SAS has auto-engaged.",
-                RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
             new ProbeFieldInfo { Key = "engines", Namespace = "inputs", Unit = "array of objects", Description = "same schema as computed:engines",
                 RequestAs = "telemetry on (full mode, no field list) -- inputs.jsonl" },
         };
@@ -4062,25 +4045,6 @@ namespace SFSProbe
             float dirAxisX = ToF(Get(outputDirAxis, "x"));
             float dirAxisY = ToF(Get(outputDirAxis, "y"));
 
-            // NEW v0.64.0 -- H1 SAS-engagement finding (see analysis/
-            // python_changelog.md's 2026-09-07 H1 entries). Every flight this
-            // project has recorded so far only ever captured raw
-            // arrowkeys.turnAxis (above), which reads 0 the instant a player
-            // releases the stick -- but the REAL resolved value ApplyTorque
-            // actually uses, Rocket.output_TurnAxisTorque, can be fully
-            // saturated (+-1) at that exact moment if SAS has auto-engaged
-            // (confirmed live 2026-09-07: GetTurnAxis's manual-vs-SAS branch,
-            // gated on hasControl && !IsOnSurface). Any control-schedule
-            // replay built from turnAxis alone silently drops all SAS
-            // activity. Recording all three together (the resolved output
-            // plus its own two gate conditions) closes that gap for every
-            // future flight -- same ResolvePath-equivalent access pattern
-            // (GetWrapped2(Get(r, name))) already confirmed live via
-            // telemetrysnapshot before this was wired in here.
-            bool hasControl = ToB(GetWrapped2(Get(r, "hasControl")));
-            bool isOnSurface = ToB(GetWrapped2(Get(r, "IsOnSurface")));
-            float outputTurnAxisTorque = ToF(GetWrapped2(Get(r, "output_TurnAxisTorque")));
-
             var si = new StringBuilder();
             si.Append("{\"t\":").Append(Num(t));
             si.Append(",\"fdt\":").Append(fdt.ToString("R"));
@@ -4093,9 +4057,6 @@ namespace SFSProbe
             si.Append(",\"rcsFiring\":").Append(rcsFiring);
             si.Append(",\"directionalAxisX\":").Append(Num(dirAxisX));
             si.Append(",\"directionalAxisY\":").Append(Num(dirAxisY));
-            si.Append(",\"hasControl\":").Append(hasControl ? "true" : "false");
-            si.Append(",\"isOnSurface\":").Append(isOnSurface ? "true" : "false");
-            si.Append(",\"outputTurnAxisTorque\":").Append(Num(outputTurnAxisTorque));
             si.Append(",\"engines\":[").Append(string.Join(",", ((List<string>)eng).ToArray())).Append("]");
             si.Append("}");
             return si.ToString();
@@ -5796,27 +5757,6 @@ namespace SFSProbe
                     sb.Append(",\"aeroAlphaDeg\":").Append(ok ? Num(alphaPred * 57.29578f) : "null");
                     sb.Append(",\"rbInertia\":").Append(ok ? Num(inertiaO) : "null");
                     sb.Append(",\"rbAngularDrag\":").Append(ok ? Num(angularDragO) : "null");
-                    // NEW v0.65.0 -- H1-followup diagnostic (see
-                    // analysis/python_changelog.md's 2026-09-07 H1
-                    // entries). comXo/comYo (real per-tick
-                    // rb2d.worldCenterOfMass) and copAX/copAY (the
-                    // world-frame, Lerp(CoM,CoP,0.2)-APPLIED center of
-                    // drag) were ALREADY computed inside
-                    // TryComputeAeroTorque for the torque calc above --
-                    // just not previously surfaced to telemetry. Exposes
-                    // the REAL per-tick CoM the Python side needs to
-                    // correctly convert dragCopX/Y (confirmed
-                    // VELOCITY-ALIGNED space, see TryComputeAeroTorque's
-                    // own header comment) into a lever arm without
-                    // reusing a stale pre-ignition snapshot -- two
-                    // earlier attempts at this diagnostic (using a
-                    // frozen pre-ignition com_local, or the wrong-frame
-                    // location.position.x/y) both produced spurious,
-                    // exploding results for exactly this reason.
-                    sb.Append(",\"comX\":").Append(ok ? Num(comXo) : "null");
-                    sb.Append(",\"comY\":").Append(ok ? Num(comYo) : "null");
-                    sb.Append(",\"copAppliedX\":").Append(ok ? Num(copAX) : "null");
-                    sb.Append(",\"copAppliedY\":").Append(ok ? Num(copAY) : "null");
                     return true;
                 }
                 case "gimbal":

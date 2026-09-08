@@ -227,11 +227,6 @@ DEFAULT_FLAGS = {
     "gravity": True, "drag": True, "aero_torque": True, "sas": True,
     "thrust": True, "fuel_burn": True, "gimbal": True, "rcs": True,
     "parachute_drag": True, "heat": True, "terrain": True, "staging": True,
-    # NEW 2026-09-07, both confirmed real during the rotation-blowup
-    # root-cause investigation (see python_changelog.md's 2026-09-07
-    # entry for the full story):
-    "live_inertia": True,          # scale inertia with live-integrated mass
-    "box2d_rotation_clamp": True,  # cap per-step rotation to 90deg (b2_maxRotation)
 }
 
 
@@ -438,8 +433,7 @@ def _heat_derivative(heat_temp: float, air_temp: float, exposed_surface: float) 
 def _aero_force_and_cop(theta_deg: float, vx: float, vy: float, omega: float, h: float,
                          aoa_table: Optional[dict], com_local: Optional[tuple],
                          parachutes: Optional[list], body: dict,
-                         enable_drag: bool, enable_parachute: bool,
-                         real_aero_override: Optional[tuple[float, float, float]] = None
+                         enable_drag: bool, enable_parachute: bool
                          ) -> tuple[float, float, Optional[float], Optional[float], float]:
     """Base drag (section 2.3) + parachute blending (section 2.8),
     confirmed formulas, combined into ONE implementation shared by both
@@ -450,58 +444,7 @@ def _aero_force_and_cop(theta_deg: float, vx: float, vy: float, omega: float, h:
     Returns (force_x, force_y, cop_applied_x, cop_applied_y, drag_area).
     cop_applied_* is None if com_local wasn't supplied (translation
     doesn't need it; only torque does) or if velocity is ~zero.
-
-    real_aero_override: Optional (drag_area, real_cop_x_world, real_cop_y_world)
-    -- 2026-09-07 H1-followup diagnostic (see python_changelog.md). Instead
-    of deriving dragArea/CoP from the STATIC synthetic AoA sweep table via
-    this replay's own (possibly-diverged) predicted theta/velocity, use the
-    REAL recorded per-tick dragArea/dragCopX/dragCopY the game itself
-    computed live at that instant -- already captured in full-mode
-    telemetry, no new game calls needed. Tests whether the static table
-    itself (which has no way to represent any rotation-RATE-dependent
-    aerodynamic effect, only instantaneous-AoA-dependent ones) is a real
-    source of error during a fast/sustained spin, as opposed to the
-    physics chain downstream of drag_area/CoP (torque_z/inertia, SAS,
-    etc.) being the problem. real_cop_x/y_world are the TRUE (pre-Lerp)
-    absolute-world-frame center of drag -- IL-confirmed this session,
-    same as the raw sweep table's own dragCopX/Y before
-    build_position_independent_aoa_table's correction -- so the SAME
-    Lerp(CoM, CoP, 0.2) step the table path applies is applied here too,
-    toward the CURRENT live-tracked CoM, keeping this apples-to-apples
-    with the normal formula rather than a different one."""
-    if real_aero_override is not None and enable_drag:
-        v = math.hypot(vx, vy)
-        if v < 1e-9:
-            cx, cy = (com_local if com_local else (None, None))
-            return 0.0, 0.0, cx, cy, 0.0
-        # CORRECTED THREE TIMES, 2026-09-07 -- see
-        # ControlSchedule.real_aero()'s own docstring for the two
-        # earlier broken designs (a predicted-vs-real position mixup,
-        # then a small-scale-vs-large-scale frame mixup). THIS version:
-        # the override tuple is (drag_area, lever_x, lever_y), already
-        # computed by the caller from TWO REAL per-tick values at the
-        # SAME tick (v0.65.0's copAppliedX/Y minus comX/Y) -- exact and
-        # self-consistent by construction, no separately-captured
-        # reference of any kind. copAppliedX/Y is ALREADY
-        # Lerp(CoM,CoP,0.2)-applied by the mod itself, so that factor is
-        # ALREADY baked into this lever -- do NOT multiply by 0.2 again
-        # here (an earlier version of this exact line did, silently
-        # shrinking the real lever to 4% of its true size).
-        drag_area, lever_world_x, lever_world_y = real_aero_override
-        pre_density_force = drag_area * 1.5 * v * v
-        cop_x = cop_y = None
-        if com_local is not None:
-            comx, comy = com_local
-            cop_x = comx + lever_world_x
-            cop_y = comy + lever_world_y
-        density = atmospheric_density(h, body)
-        force_mag = pre_density_force * density
-        if force_mag <= 0:
-            return 0.0, 0.0, cop_x, cop_y, drag_area
-        force_x = -(vx / v) * force_mag
-        force_y = -(vy / v) * force_mag
-        return force_x, force_y, cop_x, cop_y, drag_area
-
+    """
     if aoa_table is None or not enable_drag:
         cx, cy = (com_local if com_local else (None, None))
         return 0.0, 0.0, cx, cy, 0.0
@@ -527,42 +470,15 @@ def _aero_force_and_cop(theta_deg: float, vx: float, vy: float, omega: float, h:
     cop_x = cop_y = None
     if com_local is not None:
         comx, comy = com_local
-        # FIXED 2026-09-07 -- root cause of the multi-session rotation-
-        # blowup investigation. dragCopX/Y are confirmed via IL
-        # (GetDragSurfaces uses Transform.TransformPoint) to be genuine
-        # ABSOLUTE WORLD coordinates, NOT small position-independent
-        # offsets from CoM as this code previously assumed. The static
-        # AoA sweep table, built by rotating this large absolute
-        # position by a synthetic heading per bin (holding the craft's
-        # real position fixed at pre-ignition), therefore produced a
-        # "cop" value dominated by a spuriously-rotated huge position
-        # term -- worse the further the craft had moved from where it
-        # was swept, exactly matching how the blowup compounded with
-        # altitude. `aoa_table` here MUST be the position-independent
-        # table from build_position_independent_aoa_table() (done
-        # automatically in _prepare_replay for the official replay
-        # path) -- its stored dragCopX/Y are already the TRUE lever arm
-        # (cop_true - com_at_sweep_time), expressed in that bin's own
-        # sweep-frame, so a plain rotation by today's real heading
-        # reconstructs today's correct lever arm regardless of how far
-        # the craft has since moved. `com_local` here must also be the
-        # LIVE current CoM (see _derivative's start_pos tracking, Part
-        # 2 of the same fix), not a frozen pre-ignition snapshot --
-        # matching what the real game's TryComputeAeroTorque does by
-        # re-reading rb2d.worldCenterOfMass fresh every call.
-        lever_x_vel = lookup_field(aoa_table, aoa_deg, "dragCopX")
-        lever_y_vel = lookup_field(aoa_table, aoa_deg, "dragCopY")
-        if lever_x_vel is not None and lever_y_vel is not None:
+        cop_x_vel = lookup_field(aoa_table, aoa_deg, "dragCopX")
+        cop_y_vel = lookup_field(aoa_table, aoa_deg, "dragCopY")
+        if cop_x_vel is not None and cop_y_vel is not None:
             a = heading_rad - math.pi / 2
             ca, sa = math.cos(a), math.sin(a)
-            lever_world_x = ca * lever_x_vel - sa * lever_y_vel
-            lever_world_y = sa * lever_x_vel + ca * lever_y_vel
-            # Lerp(CoM, CoP, 0.2) == CoM + lever_true*0.2 (confirmed
-            # C1.5), applied directly to the now-position-independent
-            # lever arm instead of subtracting comx/comy from an
-            # absolute position (there isn't one anymore).
-            cop_x = comx + lever_world_x * 0.2
-            cop_y = comy + lever_world_y * 0.2
+            cop_world_x = ca * cop_x_vel - sa * cop_y_vel
+            cop_world_y = sa * cop_x_vel + ca * cop_y_vel
+            cop_x = comx + (cop_world_x - comx) * 0.2
+            cop_y = comy + (cop_world_y - comy) * 0.2
         else:
             cop_x, cop_y = comx, comy
 
@@ -890,9 +806,7 @@ _STATE_LEN = 8
 def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
                  com_local: Optional[tuple], inertia: Optional[float],
                  craft_config: Optional[dict], gimbal_times: list, flags: dict,
-                 throttle_override: Optional[float] = None,
-                 start_pos: Optional[tuple] = None,
-                 real_aero_override: Optional[tuple[float, float, float]] = None
+                 throttle_override: Optional[float] = None
                  ) -> tuple:
     """One RK4 sub-evaluation. Returns the derivative of every
     continuous state element, same order as `state`. Guards against
@@ -927,34 +841,9 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
     else:
         gx, gy = 0.0, 0.0
 
-    # Part 2 of the 2026-09-07 position-contamination fix: track how
-    # far the craft's root has moved since the start of this replay
-    # (start_pos), and translate the frozen pre-ignition com_local by
-    # that same displacement -- matching what the real game does
-    # naturally by re-reading rb2d.worldCenterOfMass fresh every tick.
-    # Falls back to the frozen value if start_pos wasn't supplied
-    # (old callers / no position tracking available).
-    com_now = com_local
-    if com_local is not None and start_pos is not None:
-        com_now = (com_local[0] + (px - start_pos[0]),
-                   com_local[1] + (py - start_pos[1]))
-
-    # live_inertia (2026-09-07): real rbInertia/mass ratio confirmed
-    # constant to <0.05% across a real recorded partial burn (mass
-    # 28.8->23.05t, inertia 220.42->176.37 -- a 25% swing over just a
-    # 20% mass drop), matching getforwardstartinfo's own pre-ignition
-    # inertia0/mass0 ratio exactly. This module used to freeze inertia
-    # at the pre-ignition constant for the whole sim even though mass
-    # is live-integrated -- scale it here instead.
-    inertia_now = inertia
-    if flags.get("live_inertia") and inertia is not None and craft_config:
-        mass0 = craft_config.get("mass")
-        if mass0:
-            inertia_now = inertia * (m / mass0)
-
     fx_aero, fy_aero, cop_x, cop_y, _drag_area = _aero_force_and_cop(
-        theta, vx, vy, omega, h, aoa_table, com_now, parachutes, body,
-        flags["drag"], flags["parachute_drag"], real_aero_override=real_aero_override)
+        theta, vx, vy, omega, h, aoa_table, com_local, parachutes, body,
+        flags["drag"], flags["parachute_drag"])
 
     fx_thr, fy_thr, mass_flow_engines, engine_levers = _engine_thrust(
         theta, engines, gimbal_times, isp_multiplier, flags["thrust"], flags["fuel_burn"],
@@ -964,8 +853,8 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
     ay = gy + (fy_aero + fy_thr) / m_safe
 
     alpha = 0.0
-    if inertia_now is not None and com_now is not None and inertia_now > 1e-9:
-        comx, comy = com_now
+    if inertia is not None and com_local is not None and inertia > 1e-9:
+        comx, comy = com_local
         torque_z = 0.0
         if flags["aero_torque"] and cop_x is not None:
             torque_z += (cop_x - comx) * fy_aero - (cop_y - comy) * fx_aero
@@ -993,7 +882,7 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
         # now being chased with the debug_aero per-tick diagnostic
         # (_aero_torque_diagnostic) cross-checked against this same real
         # computed:aeroTorque telemetry instead of more code-reading.
-        alpha = (torque_z / inertia_now) * RAD2DEG
+        alpha = (torque_z / inertia) * RAD2DEG
 
     dm_dt = -(mass_flow_engines) if flags["fuel_burn"] else 0.0
 
@@ -1011,13 +900,10 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
 def _rk4_step(state: tuple, body: dict, dt: float, aoa_table: Optional[dict],
               com_local: Optional[tuple], inertia: Optional[float],
               craft_config: Optional[dict], gimbal_times: list, flags: dict,
-              throttle_override: Optional[float] = None,
-              start_pos: Optional[tuple] = None,
-              real_aero_override: Optional[tuple[float, float, float]] = None) -> tuple:
+              throttle_override: Optional[float] = None) -> tuple:
     def deriv(s):
         return _derivative(s, body, aoa_table, com_local, inertia, craft_config,
-                            gimbal_times, flags, throttle_override, start_pos=start_pos,
-                            real_aero_override=real_aero_override)
+                            gimbal_times, flags, throttle_override)
 
     def plus(s, k, scale):
         return tuple(si + scale * ki for si, ki in zip(s, k))
@@ -1033,46 +919,6 @@ def _rk4_step(state: tuple, body: dict, dt: float, aoa_table: Optional[dict],
     )
 
 
-def _symplectic_euler_step(state: tuple, body: dict, dt: float, aoa_table: Optional[dict],
-                            com_local: Optional[tuple], inertia: Optional[float],
-                            craft_config: Optional[dict], gimbal_times: list, flags: dict,
-                            throttle_override: Optional[float] = None,
-                            start_pos: Optional[tuple] = None,
-                            real_aero_override: Optional[tuple[float, float, float]] = None) -> tuple:
-    """Semi-implicit (symplectic) Euler -- ONE derivative evaluation per
-    step (vs. RK4's four), velocity-like state (vx, vy, omega) updated
-    from the OLD state's derivative, then position-like state (px, py,
-    theta) updated using the NEW velocity -- the defining trait of
-    symplectic Euler. Added 2026-09-07 as a selectable alternative,
-    NOT because RK4 was ever found to be the problem (confirmed earlier
-    the same investigation: RK4 vs. this scheme produced near-identical
-    divergence on the BROKEN pre-fix model, ruling out integrator choice
-    as the blowup's cause), but because this is genuinely what Box2D
-    itself uses (confirmed via public Box2D source, b2Island::Solve:
-    `v += h*(...)`, `w += h*invI*torque`) -- kept as an option for
-    anyone who wants the closer engine-match rather than RK4's higher
-    numerical accuracy for a given dt. state order: (px, py, vx, vy, m,
-    theta, omega, heat_temp), matching _derivative's own contract."""
-    dpx, dpy, ax, ay, dm_dt, dtheta_placeholder, alpha, d_heat_dt = _derivative(
-        state, body, aoa_table, com_local, inertia, craft_config,
-        gimbal_times, flags, throttle_override, start_pos=start_pos,
-        real_aero_override=real_aero_override)
-    px, py, vx, vy, m, theta, omega, heat_temp = state
-
-    new_vx = vx + ax * dt
-    new_vy = vy + ay * dt
-    new_omega = omega + alpha * dt
-    new_m = m + dm_dt * dt
-    new_heat = heat_temp + d_heat_dt * dt
-    # Position-like state uses the NEW velocity -- symplectic, not
-    # explicit (matches Box2D's own real integration order).
-    new_px = px + new_vx * dt
-    new_py = py + new_vy * dt
-    new_theta = theta + new_omega * dt
-
-    return (new_px, new_py, new_vx, new_vy, new_m, new_theta, new_omega, new_heat)
-
-
 def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
                       body_name: str = "Earth", aoa_table: Optional[dict] = None,
                       inertia: Optional[float] = None,
@@ -1085,10 +931,7 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
                       initial_gimbal_times: Optional[list] = None,
                       initial_heat_temp: float = 0.0,
                       control_schedule: Optional["ControlSchedule"] = None,
-                      debug: bool = False,
-                      integrator: str = "rk4",
-                      use_real_aero: bool = False,
-                      sas_order: str = "before") -> list[dict]:
+                      debug: bool = False) -> list[dict]:
     """Forward-integrates from a real telemetry sample's state for
     duration_s using RK4 for the continuous state and discrete post-step
     corrections for SAS/gimbal/RCS/staging/terrain. See module docstring
@@ -1131,16 +974,11 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
     fallback), the list stops early at the colliding point (that point
     has "collided": True).
     """
-    if integrator not in ("rk4", "symplectic_euler"):
-        raise ValueError(f"unknown integrator {integrator!r}, must be 'rk4' or 'symplectic_euler'")
-    step_fn = _rk4_step if integrator == "rk4" else _symplectic_euler_step
-
     flags = _resolve_flags(flags)
     body = PLANET_CONSTANTS[body_name]
     px, py, vx, vy, m = start["px"], start["py"], start["vx"], start["vy"], start["m"]
     theta = start.get("rot", 0.0)
     omega = start.get("angv", 0.0)
-    start_pos = (px, py)  # Part 2 of the 2026-09-07 position-contamination fix
 
     if aoa_table is None:
         # Backward-compatible fallback: frozen dragArea, no rotation, no
@@ -1231,149 +1069,40 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
 
         throttle_override_now = control_schedule.throttle(t_before) if control_schedule else None
 
-        # 2026-09-07 H1-followup diagnostic (see _aero_force_and_cop's own
-        # docstring and python_changelog.md for the full story): use the
-        # REAL recorded per-tick dragArea/dragCopX/dragCopY the game
-        # itself computed live, instead of this replay's own static-table
-        # lookup -- tests whether the table's inability to represent any
-        # rotation-RATE-dependent aero effect (only instantaneous-AoA
-        # ones) is a real source of error during a fast/sustained spin.
-        # 2026-09-07 H1-followup diagnostic, third design (see
-        # ControlSchedule.real_aero()'s own docstring for the two
-        # earlier broken attempts). real_aero() now returns an
-        # ALREADY-COMPUTED lever arm (from two real per-tick values at
-        # the SAME tick, self-consistent by construction) -- no
-        # craft_config/static-reference conversion needed here anymore.
-        real_aero_override_now = control_schedule.real_aero(t_before) if (
-            use_real_aero and control_schedule is not None) else None
+        debug_info = None
+        if debug:
+            px0, py0, vx0, vy0, m0, theta0, omega0, heat0 = state
+            r0 = math.hypot(px0, py0)
+            h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
+            debug_info = _aero_torque_diagnostic(
+                theta0, vx0, vy0, omega0, h0, aoa_table, com_local,
+                (craft_config or {}).get("parachutes"), body, inertia,
+                flags["drag"], flags["parachute_drag"])
 
-        # --- Composition-order fix (2026-09-07, IL-confirmed -- see
-        # python_changelog.md's 2026-09-07 entry for the full trace).
-        # Rocket.ApplyTorque (SAS/manual) is a DIRECT, synchronous write
-        # to rb2d.angularVelocity that happens during Unity's
-        # FixedUpdate script phase. Aero/thrust torque only ACCUMULATES
-        # into Box2D's internal m_torque via AddForceAtPosition, and
-        # isn't actually integrated into angularVelocity until Unity's
-        # physics-solve phase, which (confirmed public Unity/Box2D
-        # behavior, not visible in SFS's own IL) runs AFTER every
-        # script's FixedUpdate has completed for that tick. So the real
-        # order, every tick, is: SAS corrects the PREVIOUS tick's omega
-        # FIRST, then THIS tick's aero/thrust delta is added on top --
-        # the OPPOSITE of this module's order before this fix (aero
-        # folded into the continuous RK4 step first, SAS applied after
-        # on the already-aero-perturbed value). turn_axis is looked up
-        # at t_after either way (matching a real recorded flight's own
-        # per-tick output_TurnAxisTorque value for that tick, when
-        # replaying) -- this fix is about WHEN the correction is
-        # APPLIED relative to aero, not which t it's sampled at.
-        # FIRING-STATE-AWARE torque_effective (2026-09-07 fix, H1
-        # confirmation -- see python_changelog.md for the full story).
-        # torque_effective used to be a single frozen constant read once
-        # from getforwardstartinfo's PRE-IGNITION snapshot and held for
-        # the whole simulated flight -- confirmed root cause of a 2.6x
-        # real-vs-predicted angular-acceleration gap during a real
-        # powered-ascent replay (this craft's Hawk_Engine TorqueModule
-        # reads 0 idle, 8 while firing; total torque_effective 5 -> 13).
-        # Switches to craft_config["torque_effective_firing"] (if
-        # supplied -- see load_craft_config_from_getforwardstartinfo)
-        # whenever any engine is actually firing THIS tick, using the
-        # SAME throttle signal already gating thrust/fuel-burn below --
-        # a measured on/off switch between two directly-tested states,
-        # not an assumed continuous throttle-fraction scaling.
-        torque_effective_now = torque_effective
-        if craft_config and craft_config.get("torque_effective_firing") is not None:
-            if control_schedule is not None:
-                any_firing = throttle_override_now is not None and throttle_override_now > 0
-            else:
-                any_firing = any(e.get("throttle", 0.0) > 0 for e in engines)
-            if any_firing:
-                torque_effective_now = craft_config["torque_effective_firing"]
+        state = _rk4_step(state, body, dt, aoa_table, com_local, inertia,
+                           craft_config, gimbal_times, flags, throttle_override_now)
+        px, py, vx, vy, m, theta, omega, heat_temp = state
+        theta = _wrap180(theta)
 
-        px0, py0, vx0, vy0, m0, theta0, omega0, heat0 = state
+        # --- Discrete post-step corrections, in the confirmed real order:
+        # output_TurnAxisTorque (SAS or manual) is computed FIRST from the
+        # pre-correction omega, THEN used to both correct omega (SAS) AND
+        # as gimbal's target (same broadcast signal, B1.10) -- so turn_axis
+        # must be computed once, before SAS mutates omega, and reused for
+        # both. When a control_schedule is active, turn_axis is the REAL
+        # recorded output_TurnAxisTorque instead of predicted here (see
+        # forward_simulate's own docstring) -- this collapses the
+        # manual-vs-SAS distinction entirely, since the recorded value is
+        # already the resolved combination of both.
         if control_schedule is not None:
             turn_axis = control_schedule.turn_axis(t_after)
             directional_axis_now = control_schedule.directional_axis(t_after)
         else:
-            turn_axis = compute_turn_axis(omega0, m0, torque_effective_now, dt)
+            turn_axis = compute_turn_axis(omega, m, torque_effective, dt)
             directional_axis_now = (0.0, 0.0)
 
-        # 2026-09-07 H_final1 test (see python_changelog.md) -- Unity's
-        # OWN documentation confirms script execution order between
-        # unrelated MonoBehaviours (Rocket.FixedUpdate vs. the part
-        # modules' own FixedUpdates) is NOT guaranteed unless explicitly
-        # pinned, and this project confirmed via IL that SFS does NOT
-        # pin it (zero [DefaultExecutionOrder] usage anywhere). This
-        # model always applied the direct SAS/manual write BEFORE the
-        # aero/thrust RK4 step; sas_order="after" flips that, to test
-        # whether ordering sensitivity is a real contributor at high
-        # sustained rotation rate (a low-rate test earlier this project
-        # found it "inert" -- never tested at rate this high).
-        if sas_order == "before":
-            omega_after_sas = omega0
-            if flags["sas"] and torque_effective_now is not None:
-                omega_after_sas = apply_rotation_update(omega0, m0, torque_effective_now, turn_axis, dt)
-            state = (px0, py0, vx0, vy0, m0, theta0, omega_after_sas, heat0)
-
-            debug_info = None
-            if debug:
-                r0 = math.hypot(px0, py0)
-                h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
-                debug_info = _aero_torque_diagnostic(
-                    theta0, vx0, vy0, omega_after_sas, h0, aoa_table, com_local,
-                    (craft_config or {}).get("parachutes"), body, inertia,
-                    flags["drag"], flags["parachute_drag"])
-
-            state = step_fn(state, body, dt, aoa_table, com_local, inertia,
-                             craft_config, gimbal_times, flags, throttle_override_now,
-                             start_pos=start_pos, real_aero_override=real_aero_override_now)
-            px, py, vx, vy, m, theta, omega, heat_temp = state
-            theta = _wrap180(theta)
-        elif sas_order == "after":
-            state = (px0, py0, vx0, vy0, m0, theta0, omega0, heat0)
-
-            debug_info = None
-            if debug:
-                r0 = math.hypot(px0, py0)
-                h0 = r0 - body["radius_m"] if r0 >= 1.0 else 0.0
-                debug_info = _aero_torque_diagnostic(
-                    theta0, vx0, vy0, omega0, h0, aoa_table, com_local,
-                    (craft_config or {}).get("parachutes"), body, inertia,
-                    flags["drag"], flags["parachute_drag"])
-
-            state = step_fn(state, body, dt, aoa_table, com_local, inertia,
-                             craft_config, gimbal_times, flags, throttle_override_now,
-                             start_pos=start_pos, real_aero_override=real_aero_override_now)
-            px, py, vx, vy, m, theta, omega_post_aero, heat_temp = state
-            theta = _wrap180(theta)
-            omega = omega_post_aero
-            if flags["sas"] and torque_effective_now is not None:
-                omega = apply_rotation_update(omega_post_aero, m, torque_effective_now, turn_axis, dt)
-        else:
-            raise ValueError(f"unknown sas_order: {sas_order!r} (expected 'before' or 'after')")
-
-        # Box2D rotation-safety clamp (2026-09-07, confirmed via public
-        # Box2D source, b2_maxRotation = 0.5*pi = 90deg per physics
-        # step, scaling angular velocity itself down if a step would
-        # exceed it -- "used to prevent numerical problems"). Real, and
-        # now modeled, but only matters once things are already badly
-        # wrong: confirmed during this same investigation that it does
-        # NOT explain or hide a genuine divergence's onset (identical
-        # trajectories with/without it through the point where things
-        # first go wrong) -- it only limits how extreme the TAIL of a
-        # real runaway can get, matching what the real engine would
-        # have allowed.
-        if flags.get("box2d_rotation_clamp"):
-            rotation_this_step = omega * dt
-            if rotation_this_step * rotation_this_step > 90.0 * 90.0:
-                omega *= 90.0 / abs(rotation_this_step)
-
         # RCS: discrete kick (see _rcs_force's docstring for why this is
-        # discrete, not part of the continuous derivative). NOT
-        # restructured for composition order this pass -- the craft/
-        # flight this fix was validated against had zero RCS modules,
-        # so this is untested territory; flagged as a separate, open
-        # consideration for an RCS-heavy craft, not assumed fine by
-        # extension.
+        # discrete, not part of the continuous derivative).
         if flags["rcs"] and rcs_modules:
             fx_rcs, fy_rcs, rcs_levers = _rcs_force(
                 theta, turn_axis, omega, directional_axis_now, rcs_modules, True)
@@ -1393,11 +1122,20 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
                     )
                     m -= rcs_mass_flow * dt
 
-        # NOTE: the SAS/manual omega correction used to run HERE, after
-        # the RK4 step -- moved to BEFORE _rk4_step (see the
-        # composition-order fix comment above the top of this loop
-        # iteration) as of 2026-09-07. Applying it a second time here
-        # would double-correct; intentionally not present anymore.
+        # SAS is never applied when replaying a real control_schedule --
+        # turn_axis is already the game's own fully-resolved value (manual
+        # or SAS, whichever it really was), so predicting it again would be
+        # wrong. But the ROTATION PHYSICS UPDATE itself (apply_rotation_update)
+        # must still run either way -- turn_axis, wherever it came from, is
+        # what DRIVES omega via the confirmed formula; skipping this step
+        # entirely when a schedule is active would silently stop integrating
+        # rotation at all (a real bug caught via a smoke test against an
+        # actual flight, 2026-09-02 -- ~39 degree theta divergence over 5s
+        # traced to exactly this). flags["sas"] remains the master gate for
+        # this whole mechanism either way -- isolation-flag testing ("turn
+        # rotation off entirely") still works identically for both sources.
+        if flags["sas"] and torque_effective is not None:
+            omega = apply_rotation_update(omega, m, torque_effective, turn_axis, dt)
 
         if flags["gimbal"] and engines:
             for idx, eng in enumerate(engines):
@@ -1466,195 +1204,56 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
     return points
 
 
-def _infer_sample_dt(rows: list, start_idx: int) -> float:
-    """Real recording tick interval, preferring the ACTUAL recorded
-    Time.fixedDeltaTime (rows[i]["fdt"], present on every full-mode
-    sample -- the authoritative real physics rate, not inferred) over a
-    fallback median of consecutive real timestamp gaps (needed only for
-    older flights recorded before "fdt" existed, or scoped-mode
-    recordings that didn't request it). The timestamp-gap fallback is
-    deliberately a MEDIAN, not a mean -- this project already confirmed
-    real recorded "t" gaps jitter tick-to-tick even though the true
-    physics rate is steady, so a median is far more robust to that
-    jitter than an arithmetic mean would be."""
-    fdt = rows[start_idx].get("fdt")
-    if fdt:
-        return float(fdt)
-    gaps = [rows[i + 1]["t"] - rows[i]["t"] for i in range(len(rows) - 1)
-            if rows[i + 1]["t"] - rows[i]["t"] > 0]
-    if gaps:
-        return statistics.median(gaps)
-    return 1.0 / 60.0  # last-resort fallback, matches this project's known standard physics rate
-
-
 class ControlSchedule:
-    """Wraps REAL recorded control INPUTS/OUTPUTS from a flight's
-    telemetry, exposed as sim-relative-time -> value lookups.
+    """Wraps REAL recorded control INPUTS (not outputs) from a flight's
+    telemetry (2026-09-02), exposed as t -> value lookups. Deliberately
+    a STEP function (nearest-earlier sample, via bisect), not
+    interpolated -- a real control input is genuinely discontinuous
+    between physics ticks (the game reads it once per FixedUpdate), not
+    a smooth signal, so interpolating between two real values would
+    fabricate control states that never happened.
 
-    INDEX-BASED lookup (2026-09-07 rewrite -- "Option A" fix, see
-    python_changelog.md's tick-alignment-artifact entry for the full
-    story). The ORIGINAL version compared the simulation's own exact
-    fixed-dt grid (t_after = i*dt) against the real flight's own
-    recorded timestamps via bisect -- which broke on a real flight this
-    session: a control transition landed 55 MICROSECONDS on the wrong
-    side of a dt=1/60s grid tick, causing one full real physics tick's
-    worth of correction (~0.44 deg/s on the craft tested) to be applied
-    one tick late. Small in isolation, but this project's own earlier
-    finding (real per-sample Delta-omega is remarkably uniform even when
-    the LOGGED t gaps between samples jitter -- i.e. the true physics
-    tick rate is a steady 1/60s and the recorded "t" field is a noisy
-    wall-clock proxy, not reliable for sub-tick alignment) means ANY
-    control transition can land on the wrong side of the boundary by
-    pure recording-jitter luck -- and a flight with frequent control
-    changes (e.g. alternating turn input) rolls those dice many times,
-    compounding into meaningful rotation error.
+    Built by load_control_schedule() from a real flight's truth.jsonl.
+    See forward_simulate's own control_schedule docstring for how this
+    changes the sim's behavior."""
 
-    FIX: map simulation tick i directly to real sample ROW
-    (start_idx + i) by COUNT, never by comparing floating-point
-    timestamps. This is exact by construction -- no jitter, no boundary
-    cases -- PROVIDED every real physics tick that occurred was also
-    recorded as a row. That assumption is well-supported (the
-    per-sample Delta-omega uniformity finding above) but NOT proof
-    against a genuinely DROPPED tick (a frame hitch severe enough that
-    the game itself skipped physics steps, not just delayed writing the
-    log line) -- this flight's own recording had two real gaps >0.05s
-    (~8x nominal spacing) that were NOT specifically checked for missing
-    ticks before this fix shipped. If dropped ticks turn out to be real,
-    this index mapping would silently drift out of alignment after each
-    one -- flagged as a known, untested risk, not silently assumed
-    away. See _prepare_replay's own gap-detection note.
+    def __init__(self, times: list, turn_axis_vals: list,
+                 dir_axis_x_vals: list, dir_axis_y_vals: list,
+                 throttle_vals: Optional[list] = None):
+        self.times = times
+        self.turn_axis_vals = turn_axis_vals
+        self.dir_axis_x_vals = dir_axis_x_vals
+        self.dir_axis_y_vals = dir_axis_y_vals
+        self.throttle_vals = throttle_vals
 
-    Deliberately still a STEP function, not interpolated -- a real
-    control input is genuinely discontinuous between physics ticks (the
-    game reads it once per FixedUpdate), so interpolating between two
-    real values would fabricate control states that never happened;
-    this property is unchanged from the original bisect-based version."""
-
-    def __init__(self, rows: list, start_idx: int, sample_dt: float,
-                 throttle_field: Optional[str] = None):
-        """sample_dt is the REAL RECORDING's own tick interval (e.g.
-        rows[start_idx]["fdt"] -- Time.fixedDeltaTime, recorded on every
-        full-mode sample) -- NOT the physics integrator's dt. These are
-        two genuinely different things that a first version of this
-        class (2026-09-07) conflated by reusing forward_simulate's own
-        step size for both, which happened to work for every test run
-        at the recording's native ~1/60s rate but broke silently (no
-        error, just WRONG data) the instant a caller (this session's H3
-        numerical-stiffness test) used a finer integrator dt: tick
-        indices still advanced 1-per-integrator-step, fast-forwarding
-        through the real recorded rows far faster than real time
-        actually elapsed, feeding scrambled control data into the
-        physics. Decoupling them here: sample_dt always reflects how
-        far apart the REAL rows actually are, regardless of what step
-        size the integrator uses to walk between them."""
-        self.rows = rows
-        self.start_idx = start_idx
-        self.sample_dt = sample_dt
-        self.throttle_field = throttle_field
-        self.n = len(rows)
-
-    def _row_for_t(self, t: float) -> dict:
-        tick = int(round(t / self.sample_dt)) if self.sample_dt > 0 else 0
-        idx = self.start_idx + tick
-        idx = max(0, min(idx, self.n - 1))
-        return self.rows[idx]
+    def _lookup(self, arr: list, t: float):
+        if not arr:
+            return None
+        i = bisect.bisect_right(self.times, t) - 1
+        i = max(0, min(i, len(arr) - 1))
+        return arr[i]
 
     def turn_axis(self, t: float) -> float:
-        v = self._row_for_t(t).get("output_TurnAxisTorque")
+        v = self._lookup(self.turn_axis_vals, t)
         return v if v is not None else 0.0
 
     def directional_axis(self, t: float) -> tuple[float, float]:
-        r = self._row_for_t(t)
-        x = r.get("output_DirectionalAxis.x")
-        y = r.get("output_DirectionalAxis.y")
+        x = self._lookup(self.dir_axis_x_vals, t)
+        y = self._lookup(self.dir_axis_y_vals, t)
         return (x if x is not None else 0.0, y if y is not None else 0.0)
 
     def throttle(self, t: float) -> Optional[float]:
         """None means "no real throttle signal available, fall back to
         craft_config's constant per-engine throttle" -- NOT the same as
-        0.0, which means "really was throttled to zero at this t".
-
-        FIXED 2026-09-07 -- SEVERE bug found via the H1-followup crash
-        investigation. This previously did a TOP-LEVEL row.get(field)
-        lookup only, treating a miss as a genuine 0.0 rather than "field
-        not found". But throttle_field is always something like
-        "throttleOut", which has NEVER existed as a top-level key in any
-        recording this project has made (full mode has "thr"/"thrOn";
-        it's only ever nested per-engine, engines[i]["throttleOut"]).
-        The lookup was silently missing every time, returning 0.0 as if
-        the engine were genuinely commanded off -- which downstream
-        (_engine_thrust's `if throttle <= 0: continue`, and
-        forward_simulate's `any_firing` firing-torque switch) means the
-        engine contributed ZERO thrust force and the idle (not firing)
-        torque_effective value, for the ENTIRE duration of every test
-        that used this parameter, regardless of the real craft's actual
-        throttle. Confirmed as the root cause of a fast, fake predicted
-        terrain collision on a real flight the craft actually survived
-        30+ seconds. Fixed: try the top-level key first (kept for any
-        future recording that might have one), then fall back to the
-        first engine's own nested value -- only return the "no signal"
-        None if BOTH are genuinely absent."""
-        if self.throttle_field is None:
+        0.0, which means "really was throttled to zero at this t"."""
+        if self.throttle_vals is None:
             return None
-        row = self._row_for_t(t)
-        v = row.get(self.throttle_field)
-        if v is None:
-            engines = row.get("engines")
-            if engines:
-                v = engines[0].get(self.throttle_field)
-        return v if v is not None else 0.0
-
-    def real_aero(self, t: float) -> Optional[tuple[float, float, float]]:
-        """(dragArea, lever_x, lever_y) at this tick -- 2026-09-07
-        H1-followup diagnostic, THIRD and (hopefully) final design (see
-        python_changelog.md's H1 entries for the two earlier broken
-        attempts). Requires v0.65.0 telemetry's comX/comY (real per-tick
-        rb2d.worldCenterOfMass) and copAppliedX/Y (real per-tick center
-        of drag, ALREADY world-frame-converted AND Lerp(CoM,CoP,0.2)-
-        applied by TryComputeAeroTorque -- not the raw dragCopX/Y, which
-        are velocity-aligned frame, confirmed via this project's own
-        earlier-session finding and the mod's own TryComputeAeroTorque
-        header comment).
-
-        lever_x/y = copAppliedX/Y - comX/Y -- computed from TWO REAL
-        values at the SAME real tick, so it's exact and self-consistent
-        by construction: no stale reference, no frame mismatch, no
-        dependency on any separately-captured craft_config snapshot.
-        The 0.2 Lerp factor is ALREADY baked into copAppliedX/Y, so the
-        caller must NOT apply it again -- this lever, added directly to
-        the caller's own predicted CoM, reproduces the real applied-
-        force geometry exactly.
-
-        None if any required field is missing (older/full-mode
-        recordings, or a row where TryComputeAeroTorque itself returned
-        null -- e.g. near-zero real velocity, same gate as everywhere
-        else this session)."""
-        r = self._row_for_t(t)
-        da = r.get("dragArea")
-        comx, comy = r.get("comX"), r.get("comY")
-        capx, capy = r.get("copAppliedX"), r.get("copAppliedY")
-        if da is None or comx is None or comy is None or capx is None or capy is None:
-            return None
-        return (da, capx - comx, capy - comy)
+        return self._lookup(self.throttle_vals, t)
 
 
-def load_control_schedule(flight_jsonl_path: str, start_t: float = 0.0,
-                          sample_dt: Optional[float] = None,
+def load_control_schedule(flight_jsonl_path: str, t0_abs: Optional[float] = None,
                           throttle_field: Optional[str] = None) -> ControlSchedule:
-    """Standalone convenience loader -- reads a flight file itself and
-    builds an index-based ControlSchedule (see that class's docstring
-    for the 2026-09-07 rewrite this is part of). Picks the row nearest
-    start_t as the tick-0 anchor via the same nearest-match approach
-    _prepare_replay uses for its own starting state, so a schedule built
-    this way stays consistent with a state built the same way.
-
-    NOT used by _prepare_replay itself anymore -- that function already
-    has rows/start_idx loaded for the starting state and constructs
-    ControlSchedule(rows, start_idx, dt, ...) directly, reusing the
-    EXACT SAME anchor row rather than computing a second, potentially
-    different one here. This function exists for any external/
-    standalone caller that wants a schedule without going through the
-    full replay setup.
+    """Builds a ControlSchedule from a real flight's truth.jsonl.
 
     REQUIRES output_TurnAxisTorque and output_DirectionalAxis.x/y in the
     telemetry field list (see mod_changelog.md's v0.53.0/telemetry
@@ -1666,8 +1265,20 @@ def load_control_schedule(flight_jsonl_path: str, start_t: float = 0.0,
     only fix, there's no reasonable fallback.
 
     throttle_field: optional telemetry field name for a throttle replay
-    signal. None (default) means no throttle replay at all -- engines
-    fall back to craft_config's constant throttle assumption."""
+    signal, e.g. "gimbalThrottleOut" (computed:gimbal's per-tick field)
+    -- the ONLY throttle-like signal any flight this project has logged
+    actually captured, and even that is scoped to a single
+    representative gimbaling engine (TryGetPrimaryGimbal), not every
+    engine individually (see _engine_thrust's throttle_override
+    docstring). None (default) means no throttle replay at all --
+    engines fall back to craft_config's constant throttle assumption,
+    same as before this feature existed.
+
+    t0_abs: the flight's absolute start time (samples[0]["t"]) to
+    convert real absolute t into the sim-relative t forward_simulate
+    uses. None (default) uses this file's own first sample as t0 --
+    correct when the craft_config's own starting sample came from the
+    SAME flight file, which is the expected/normal use."""
     rows = st.load_samples(Path(flight_jsonl_path))
     if not rows:
         raise ValueError(f"no samples found in {flight_jsonl_path}")
@@ -1679,14 +1290,21 @@ def load_control_schedule(flight_jsonl_path: str, start_t: float = 0.0,
             "load_control_schedule's docstring). Re-record telemetry with "
             "these fields in the list; there is no reasonable fallback.")
 
-    t0 = rows[0]["t"]
-    start_idx = min(range(len(rows)), key=lambda i: abs(rows[i]["t"] - t0 - start_t))
-    resolved_sample_dt = sample_dt if sample_dt is not None else _infer_sample_dt(rows, start_idx)
-    return ControlSchedule(rows, start_idx, resolved_sample_dt, throttle_field=throttle_field)
+    t0 = t0_abs if t0_abs is not None else rows[0]["t"]
+    times, turns, dxs, dys = [], [], [], []
+    throttles = [] if throttle_field else None
+    for r in rows:
+        times.append(r["t"] - t0)
+        turns.append(r["output_TurnAxisTorque"])
+        dxs.append(r["output_DirectionalAxis.x"])
+        dys.append(r["output_DirectionalAxis.y"])
+        if throttle_field:
+            throttles.append(r.get(throttle_field) or 0.0)
+
+    return ControlSchedule(times, turns, dxs, dys, throttles)
 
 
-def load_craft_config_from_getforwardstartinfo(path: str,
-                                                firing_snapshot_path: Optional[str] = None) -> dict:
+def load_craft_config_from_getforwardstartinfo(path: str) -> dict:
     """Translates the probe's getforwardstartinfo JSON output
     (sfs_probe_forwardstartinfo.json, v0.54.0+) into forward_simulate's
     craft_config dict format. This is the "finally finished, fully
@@ -1743,107 +1361,14 @@ def load_craft_config_from_getforwardstartinfo(path: str,
         })
 
     com = raw.get("worldCenterOfMass") or {}
-
-    # NEW 2026-09-07 (H1 confirmation, see python_changelog.md): a
-    # craft's TorqueModule.torque can be genuinely LIVE-PARAMETRIC on
-    # real engine firing state, not a fixed pre-ignition constant --
-    # live-confirmed on this test craft via two getforwardstartinfo
-    # snapshots (idle: Hawk_Engine torque=0, total=5; firing at full
-    # throttle: Hawk_Engine torque=8, total=13 -- the OTHER torque
-    # module on this craft, the Capsule's, stayed fixed at 5 in both
-    # states). firing_snapshot_path, if supplied, is a SECOND
-    # getforwardstartinfo dump captured while the engine was actually
-    # thrusting -- its own torqueEffectiveRaw is stored as
-    # "torque_effective_firing" for forward_simulate to switch to while
-    # any engine is firing. This is a firing/not-firing SWITCH between
-    # two directly-measured states, NOT an assumed continuous function
-    # of throttle fraction -- partial-throttle scaling was never tested.
-    torque_effective_firing = None
-    if firing_snapshot_path:
-        raw_firing = json.loads(Path(firing_snapshot_path).read_text())
-        torque_effective_firing = raw_firing.get("torqueEffectiveRaw")
-
     return {
         "engines": engines,
         "rcs_modules": rcs_modules,
         "torque_effective": raw.get("torqueEffectiveRaw"),
-        "torque_effective_firing": torque_effective_firing,
         "inertia": raw.get("inertia"),
         "com_local": (com.get("x", 0.0), com.get("y", 0.0)),
         "mass": raw.get("mass"),
-        # NEW 2026-09-07: the real craft rotation AT THE MOMENT this
-        # snapshot (and its paired AoA sweep table, if any) was
-        # captured -- required by build_position_independent_aoa_table
-        # to correctly reconstruct each table bin's synthetic sweep
-        # angle. See that function's docstring for why this matters.
-        "rotation_deg": raw.get("rotationDeg", 0.0),
     }
-
-
-def build_position_independent_aoa_table(aoa_table: dict, com_local: tuple[float, float],
-                                          rotation_deg_at_sweep: float) -> dict:
-    """FIXES the root cause of the 2026-09 rotation-blowup investigation
-    (see python_changelog.md's 2026-09-07 entry for the full story).
-
-    dragCopX/Y in a raw AoA sweep table (from dragareasweep /
-    getforwardstartinfo's auto-generated table) are confirmed via IL
-    (GetDragSurfaces uses Transform.TransformPoint) to be genuine
-    ABSOLUTE WORLD coordinates -- NOT small position-independent
-    offsets from CoM, which is what every caller of this table
-    previously assumed. The sweep is built by rotating this large
-    absolute position by a different SYNTHETIC heading per bin (while
-    holding the craft's REAL position/rotation fixed at whatever they
-    were when the sweep ran, normally pre-ignition) -- so each bin's
-    raw dragCopX/Y is dominated by a spuriously-rotated huge position
-    term that has nothing to do with the true, small (tens-of-units)
-    aero lever arm. Confirmed directly: a live setrot+dragarea test at
-    a real flown AoA gave copX=-300.70, while the raw table predicted
-    copX=+446.68 for that same AoA -- opposite sign, not just noise.
-
-    This function rebuilds the table so each bin stores the TRUE,
-    position-independent lever arm (cop_true_world - com_at_sweep_time)
-    instead, expressed in that bin's own synthetic sweep-frame -- so a
-    plain rotation by TODAY's real heading (exactly what
-    _aero_force_and_cop already does) correctly reconstructs today's
-    lever arm regardless of how far the craft has since moved. Must be
-    paired with live CoM tracking (see _derivative's start_pos
-    parameter, Part 2 of the same fix) -- fixing only the table without
-    also un-freezing com_local reintroduces the same class of error via
-    the other half of the (cop - com) subtraction.
-
-    rotation_deg_at_sweep: the real craft rotation (rb2d.rotation) at
-    the moment the sweep was captured -- from
-    load_craft_config_from_getforwardstartinfo's "rotation_deg" key
-    (sourced from getforwardstartinfo's own "rotationDeg" field, the
-    SAME snapshot the sweep table itself is generated from in the same
-    probe call). Each bin's own synthetic heading is reconstructed from
-    this plus that bin's aoa_center, matching the probe's own
-    TryComputeDragAreaAtAoA formula exactly (aoaDeg =
-    wrap((theta+90)-headingDeg) => syntheticHeadingDeg = theta_real +
-    90 - aoaTarget).
-
-    Verified end-to-end 2026-09-07: with this fix (+ live CoM
-    tracking), a 6s forward-sim replay of the tagged
-    straight_up_predictor_test flight -- which previously diverged to
-    179+ degrees and clamped at 5400 deg/s -- stayed under 0.05 degrees
-    the entire window, matching the real flight's near-zero rotation.
-    """
-    comx, comy = com_local
-    fixed_bins = []
-    for b in aoa_table["bins"]:
-        aoa = b["aoa_center"]
-        a_bin = math.radians(rotation_deg_at_sweep - aoa)
-        cop_x_vel, cop_y_vel = b["median_dragCopX"], b["median_dragCopY"]
-        ca, sa = math.cos(-a_bin), math.sin(-a_bin)
-        com_in_bin_frame_x = ca * comx - sa * comy
-        com_in_bin_frame_y = sa * comx + ca * comy
-        nb = dict(b)
-        nb["median_dragCopX"] = cop_x_vel - com_in_bin_frame_x
-        nb["median_dragCopY"] = cop_y_vel - com_in_bin_frame_y
-        fixed_bins.append(nb)
-    fixed_table = dict(aoa_table)
-    fixed_table["bins"] = fixed_bins
-    return fixed_table
 
 
 def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
@@ -1851,11 +1376,7 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
                      body_name: str = "Earth", aoa_table_path: Optional[str] = None,
                      throttle_field: Optional[str] = None,
                      flags: Optional[dict] = None,
-                     debug: bool = False,
-                     integrator: str = "rk4",
-                     firing_snapshot_path: Optional[str] = None,
-                     use_real_aero: bool = False,
-                     sas_order: str = "before") -> tuple[list[dict], float, list[dict]]:
+                     debug: bool = False) -> tuple[list[dict], float, list[dict]]:
     """Shared setup for test_against_run and test_against_run_trajectory
     (2026-09-05 split -- both need the identical real-flight load,
     starting-state construction, and control-replay forward_simulate()
@@ -1899,7 +1420,7 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
     start_state["vx"] = (r1["location.position.x"] - r0["location.position.x"]) / dt_v
     start_state["vy"] = (r1["location.position.y"] - r0["location.position.y"]) / dt_v
 
-    craft_config = load_craft_config_from_getforwardstartinfo(craft_config_path, firing_snapshot_path)
+    craft_config = load_craft_config_from_getforwardstartinfo(craft_config_path)
     # FIXED 2026-09-06: control_schedule's own internal clock must be
     # zero-based from start_t (matching forward_simulate's internal
     # t_before/t_after loop variable, which is always 0-indexed from
@@ -1923,40 +1444,15 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
     # even during a real full-throttle hard turn (see
     # docs/high_level_checklist.md's forward-integrator section for the
     # full story and the walked-back "sign bug" theory this bug caused).
-    # 2026-09-07: build ControlSchedule directly from the rows/start_idx
-    # ALREADY loaded above for the starting state, instead of going
-    # through load_control_schedule (which would re-read the file AND
-    # potentially compute a slightly different anchor row) -- guarantees
-    # tick 0 of the control schedule is the EXACT SAME row the starting
-    # state itself came from. See ControlSchedule's own docstring for
-    # the index-based-lookup rewrite this is part of.
-    #
-    # CRITICAL: pass the REAL recording's own sample interval here, NOT
-    # `dt` (the integrator's step size) -- these are different things a
-    # first version of this fix conflated, which broke silently the
-    # moment a caller used a non-native dt (e.g. a finer step for a
-    # numerical-stiffness test). See ControlSchedule's own docstring.
-    real_sample_dt = _infer_sample_dt(rows, start_idx)
-    control_schedule = ControlSchedule(rows, start_idx, real_sample_dt, throttle_field=throttle_field)
+    control_schedule = load_control_schedule(flight_jsonl_path, t0_abs=t0 + start_t, throttle_field=throttle_field)
 
     aoa_table = json.loads(Path(aoa_table_path).read_text()) if aoa_table_path else None
-    if aoa_table is not None:
-        # 2026-09-07 position-contamination fix, Part 1: rebuild the
-        # raw table's dragCopX/Y into position-independent lever arms
-        # before use -- see build_position_independent_aoa_table's
-        # docstring for the full story. Applied here so BOTH
-        # test_against_run and test_against_run_trajectory (the two
-        # callers of _prepare_replay) get the fix automatically,
-        # without needing to remember to call it themselves.
-        aoa_table = build_position_independent_aoa_table(
-            aoa_table, craft_config["com_local"], craft_config["rotation_deg"])
 
     sim = forward_simulate(
         start_state, duration_s, dt=dt, body_name=body_name, aoa_table=aoa_table,
         inertia=craft_config["inertia"], com_local=craft_config["com_local"],
         torque_effective=craft_config["torque_effective"], flags=flags,
-        craft_config=craft_config, control_schedule=control_schedule, debug=debug,
-        integrator=integrator, use_real_aero=use_real_aero, sas_order=sas_order)
+        craft_config=craft_config, control_schedule=control_schedule, debug=debug)
 
     return rows, t0, sim
 
@@ -1965,8 +1461,7 @@ def test_against_run(flight_jsonl_path: str, craft_config_path: str,
                      start_t: float, duration_s: float, dt: float = 0.25,
                      body_name: str = "Earth", aoa_table_path: Optional[str] = None,
                      throttle_field: Optional[str] = None,
-                     flags: Optional[dict] = None,
-                     integrator: str = "rk4") -> dict:
+                     flags: Optional[dict] = None) -> dict:
     """The --test_against_run entry point: forward-simulates from a real
     flight sample at start_t, REPLAYING that same flight's real control
     inputs (rotation, RCS, and optionally throttle -- see
@@ -1994,7 +1489,7 @@ def test_against_run(flight_jsonl_path: str, craft_config_path: str,
     goal; this single call is one data point)."""
     rows, t0, sim = _prepare_replay(
         flight_jsonl_path, craft_config_path, start_t, duration_s, dt,
-        body_name, aoa_table_path, throttle_field, flags=flags, integrator=integrator)
+        body_name, aoa_table_path, throttle_field, flags=flags)
     predicted = sim[-1]
 
     target_t_abs = t0 + start_t + duration_s
@@ -2038,11 +1533,7 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
                                  throttle_field: Optional[str] = None,
                                  flags: Optional[dict] = None,
                                  stride: int = 1,
-                                 debug: bool = False,
-                                 integrator: str = "rk4",
-                                 firing_snapshot_path: Optional[str] = None,
-                                 use_real_aero: bool = False,
-                                 sas_order: str = "before") -> dict:
+                                 debug: bool = False) -> dict:
     """Like test_against_run, but compares the ENTIRE predicted trajectory
     against the real flight step-by-step, not just the final point --
     built to characterize forward-integrator compounding error
@@ -2077,9 +1568,7 @@ def test_against_run_trajectory(flight_jsonl_path: str, craft_config_path: str,
     """
     rows, t0, sim = _prepare_replay(
         flight_jsonl_path, craft_config_path, start_t, duration_s, dt,
-        body_name, aoa_table_path, throttle_field, flags=flags, debug=debug,
-        integrator=integrator, firing_snapshot_path=firing_snapshot_path,
-        use_real_aero=use_real_aero, sas_order=sas_order)
+        body_name, aoa_table_path, throttle_field, flags=flags, debug=debug)
 
     steps = []
     for point in sim[::max(1, stride)]:
