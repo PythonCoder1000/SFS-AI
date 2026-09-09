@@ -31,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.65.0";
+        public const string VersionString = "0.66.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -831,6 +831,12 @@ namespace SFSProbe
             new ProbeCommandInfo { Name = "ignite", Category = "control",
                 Syntax = "ignite",
                 Description = "Sets EngineModule.engineOn = true on every engine on the active rocket (bypasses staging). Independent of throttle amount and master ignition." },
+            new ProbeCommandInfo { Name = "stage", Category = "control",
+                Syntax = "stage <0-based index into staging.stages>",
+                Description = "v0.66.0. Programmatic staging activation, confirmed via IL from StagingDrawer.UseStage(Stage): fires the given stage's parts through the real Rocket.UseParts(true, regions) entry point (PolygonData always null, confirmed). Requires WorldTime.realtimePhysics == true (fails explicitly otherwise, matching the game's own gate) -- won't fire on rails/during timewarp. Index is into the CURRENT staging.stages list, not Stage.stageId; use 'stages' first to see it. Does NOT replicate StagingDrawer's own useStageIdentifier UI bookkeeping (confirmed non-physics). Writes result only, no file." },
+            new ProbeCommandInfo { Name = "stages", Category = "diagnostics",
+                Syntax = "stages",
+                Description = "v0.66.0. Read-only listing of staging.stages (index, stageId, part count, part names) -- run before/after 'stage' to confirm which index actually fired. Writes sfs_probe_stages.json." },
             new ProbeCommandInfo { Name = "revert", Category = "control",
                 Syntax = "revert",
                 Description = "Calls GameManager.RevertToLaunch(false) via reflection." },
@@ -1404,6 +1410,148 @@ namespace SFSProbe
                         }
                     }
                     ProbeMod.Result("ignite: " + lit + " engine(s) armed");
+                    break;
+                }
+
+                case "stage":
+                {
+                    // Programmatic staging activation -- v0.66.0, confirmed via IL
+                    // (scratch/full_il.txt) from SFS.World.StagingDrawer.UseStage(Stage),
+                    // the real method bound to the game's own staging input:
+                    //   1. Requires WorldTime.main.realtimePhysics == true -- silently
+                    //      no-ops on rails/during timewarp in the real game, so we
+                    //      surface that as an explicit failure instead of a silent nop.
+                    //   2. Builds (Part, PolygonData) tuples for every part in the
+                    //      target Stage, with PolygonData confirmed ALWAYS null for
+                    //      this path (StagingDrawer's own <UseStage>b__38_0 lambda:
+                    //      "ldarg.1; ldnull; newobj ValueTuple<Part,PolygonData>" --
+                    //      PolygonData is click-geometry, unused by non-UI activation).
+                    //   3. Calls the public static SFS.World.Rocket.UseParts(true, regions)
+                    //      -- this is the real, confirmed, general "activate these parts"
+                    //      entry point (also used for toggles/docking); it fires each
+                    //      part's own onPartUsed event, which is whatever module
+                    //      (DetachModule for a stage separator) actually does the work.
+                    // NOT replicated: StagingDrawer's own static useStageIdentifier
+                    // counter bump / Stage.useStageIdentifier stamp -- confirmed to be
+                    // UI-only staleness bookkeeping (drives StagingDrawer's redraw),
+                    // not physics. Documented simplification, not silently assumed inert.
+                    // NOT checked: PlayerController.HasControl -- assumed true for the
+                    // single player-controlled probe-testing rocket this command is
+                    // built for; flagged here rather than silently baked in.
+                    //
+                    // arg: 0-based index into staging.stages (NOT Stage.stageId).
+                    // Whether index 0 is really "next to fire" was UNVERIFIED in this
+                    // project's own notes (sfs_source_reference.md B7.1) -- run 'stages'
+                    // before/after to check empirically rather than assume.
+                    object r = ActiveRocket();
+                    if (r == null) { ProbeMod.Result("stage: no active rocket"); break; }
+
+                    Type wtType = FindType("SFS.World.WorldTime");
+                    object wtMain = wtType != null ? Get(wtType, "main") : null;
+                    object realtimeField = wtMain != null ? Get(wtMain, "realtimePhysics") : null;
+                    object realtimeVal = realtimeField != null ? GetWrapped2(realtimeField) : null;
+                    if (realtimeVal == null)
+                        ProbeMod.Log("stage: could not read WorldTime.realtimePhysics -- proceeding anyway, unconfirmed gate state");
+                    else if (!(realtimeVal is bool) || !(bool)realtimeVal)
+                    {
+                        ProbeMod.Result("stage: FAILED -- WorldTime.realtimePhysics is false (on rails / timewarp); staging only works in real-time physics, matching StagingDrawer.UseStage's own confirmed gate");
+                        break;
+                    }
+
+                    object staging = Get(r, "staging");
+                    object stagesListObj = staging != null ? Get(staging, "stages") : null;
+                    var stagesEn = stagesListObj as System.Collections.IEnumerable;
+                    if (stagesEn == null) { ProbeMod.Result("stage: no staging.stages found"); break; }
+                    var stagesArr = new List<object>();
+                    foreach (object s in stagesEn) stagesArr.Add(s);
+
+                    int idx;
+                    if (!int.TryParse(arg, out idx) || idx < 0 || idx >= stagesArr.Count)
+                    {
+                        ProbeMod.Result("stage: FAILED -- invalid index '" + arg + "' (staging.stages has " + stagesArr.Count + " entries; run 'stages' to list them)");
+                        break;
+                    }
+                    object targetStage = stagesArr[idx];
+                    int stageId = (int)Get(targetStage, "stageId");
+                    object stageParts = Get(targetStage, "parts");
+                    var partsEn = stageParts as System.Collections.IEnumerable;
+                    var partsList = new List<object>();
+                    if (partsEn != null) foreach (object p in partsEn) partsList.Add(p);
+
+                    if (partsList.Count == 0)
+                    {
+                        ProbeMod.Result("stage: stage index " + idx + " (stageId=" + stageId + ") has 0 parts -- nothing to activate");
+                        break;
+                    }
+
+                    Type partType = FindType("SFS.Parts.Part");
+                    Type polyType = FindType("SFS.Parts.Modules.PolygonData");
+                    Type rocketType = FindType("SFS.World.Rocket");
+                    if (partType == null || polyType == null || rocketType == null)
+                    {
+                        ProbeMod.Result("stage: FAILED -- could not resolve Part/PolygonData/Rocket types");
+                        break;
+                    }
+
+                    Type tupleType = typeof(System.ValueTuple<,>).MakeGenericType(partType, polyType);
+                    Array regions = Array.CreateInstance(tupleType, partsList.Count);
+                    for (int i = 0; i < partsList.Count; i++)
+                    {
+                        object tuple = Activator.CreateInstance(tupleType, new object[] { partsList[i], null });
+                        regions.SetValue(tuple, i);
+                    }
+
+                    object useResult = InvokeStatic(rocketType, "UseParts",
+                        new Type[] { typeof(bool), tupleType.MakeArrayType() },
+                        new object[] { true, regions });
+
+                    int returned = (useResult is Array) ? ((Array)useResult).Length : 0;
+                    ProbeMod.Result("stage: activated stage index " + idx + " (stageId=" + stageId + ", " +
+                        partsList.Count + " part(s)), Rocket.UseParts returned " + returned + " UsePartData");
+                    break;
+                }
+
+                case "stages":
+                {
+                    // Read-only listing companion to 'stage' -- run before/after firing
+                    // a stage to see the live staging.stages order and confirm which
+                    // index actually fired (see 'stage' case's own comment on why this
+                    // isn't assumed rather than checked).
+                    object r2 = ActiveRocket();
+                    if (r2 == null) { ProbeMod.Result("stages: no active rocket"); break; }
+                    object staging2 = Get(r2, "staging");
+                    object stagesListObj2 = staging2 != null ? Get(staging2, "stages") : null;
+                    var en2 = stagesListObj2 as System.Collections.IEnumerable;
+                    var sb = new StringBuilder();
+                    sb.Append("[\n");
+                    int idx2 = 0;
+                    bool first = true;
+                    if (en2 != null)
+                    {
+                        foreach (object s in en2)
+                        {
+                            int sid = (int)Get(s, "stageId");
+                            object sp = Get(s, "parts");
+                            var pen = sp as System.Collections.IEnumerable;
+                            var pnames = new List<string>();
+                            if (pen != null)
+                                foreach (object p in pen)
+                                {
+                                    string pname = "?";
+                                    try { pname = (string)Get(Get(p, "displayName"), "TranslatableName"); } catch { }
+                                    pnames.Add(pname);
+                                }
+                            if (!first) sb.Append(",\n");
+                            first = false;
+                            sb.Append("  {\"index\":").Append(idx2).Append(",\"stageId\":").Append(sid)
+                              .Append(",\"partCount\":").Append(pnames.Count)
+                              .Append(",\"parts\":[\"").Append(string.Join("\",\"", pnames.ToArray())).Append("\"]}");
+                            idx2++;
+                        }
+                    }
+                    sb.Append("\n]");
+                    Write("sfs_probe_stages.json", sb, "staging.stages dump");
+                    ProbeMod.Result("stages: " + idx2 + " stage(s) -> sfs_probe_stages.json");
                     break;
                 }
 

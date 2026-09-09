@@ -9,6 +9,27 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.66.0 -- programmatic staging: `stage <index>` + `stages` (read-only listing)
+
+**2026-09-08.** No command existed to activate a stage in-flight -- every flight this project has scripted so far was a single unstaged craft. Blocked by not knowing the real activation mechanism; the existing `sfs_source_reference.md` B7 section on `Staging`/`Stage` documents field layout and edit-time mutator signatures only, explicitly marked `[PARTIAL]`, bodies not read.
+
+**Found via IL** (`scratch/full_il.txt`, this session): the real activation path is `SFS.World.StagingDrawer.UseStage(Stage stageToUse)` -- the method actually bound to the game's own staging input. Confirmed:
+- Gates on `WorldTime.main.realtimePhysics == true` (silently no-ops otherwise -- on rails / during timewarp, staging does nothing in the real game).
+- Builds `(Part, PolygonData)` tuples for every part in the target `Stage`, with `PolygonData` **always null** for this path (`<UseStage>b__38_0`'s body is exactly `ldarg.1; ldnull; newobj ValueTuple<Part,PolygonData>`) -- PolygonData is click-geometry, irrelevant to non-UI activation.
+- Calls the public static `SFS.World.Rocket.UseParts(true, regions)` -- the real, general "activate these parts" entry point (also used for toggles/docking, not staging-specific): constructs a `UsePartData` per part and invokes that part's own `onPartUsed` event, which is whatever module (a separator's `DetachModule`) actually does the work.
+
+**New commands:**
+- `stage <0-based index into staging.stages>` -- builds the `(Part,PolygonData)[]` array via reflection (`Type.MakeGenericType`/`Activator.CreateInstance`/`Array`, since this file has no compile-time `using SFS.*`) and calls `Rocket.UseParts` directly. Fails explicitly (not silently) if `realtimePhysics` is false, or the index is out of range.
+- `stages` -- read-only dump of the live `staging.stages` list (index, `stageId`, part count, part names) to `sfs_probe_stages.json`, meant to be run before/after `stage` to see what actually fired.
+
+**Documented simplification, not silently assumed inert:** `StagingDrawer`'s own `useStageIdentifier` static counter bump and `Stage.useStageIdentifier` stamp are NOT replicated -- that's UI-only staleness bookkeeping (drives `StagingDrawer`'s redraw), not physics, but flagged here rather than silently dropped. `PlayerController.HasControl` is also not checked -- assumed true for the single player-controlled probe-testing rocket this is built for.
+
+**Open question this was explicitly built to let us check empirically, not assume:** whether `staging.stages[0]` is really "the next stage to fire" -- unverified in this project's own notes (`sfs_source_reference.md` B7.1, marked `[OPEN]`). `stage` takes an explicit list index specifically so this can be tested live with `stages` before/after, rather than baked in as an assumption.
+
+**Verification:** compiled clean (`mcs`, same 3 pre-existing unrelated warnings as v0.65.0, untouched by this change), installed via `build.sh`. **Not yet live-tested** -- requires a mod reload (game restart or mod-loader reload) before `stage`/`stages` are callable; that's the next step.
+
+---
+
 ## v0.64.0 -- real resolved `output_TurnAxisTorque` + `hasControl`/`IsOnSurface` added to full-mode telemetry (H1 SAS-engagement finding)
 
 **2026-09-07, later same session.** Every flight this project has recorded so far only ever captured raw `arrowkeys.turnAxis` (the `turnAxis` field) in full-mode telemetry -- which reads exactly 0 the instant a player releases the stick. A live test this session (turn burst, then release, while airborne) confirmed directly that the REAL resolved value `Rocket.ApplyTorque` actually uses, `output_TurnAxisTorque`, goes fully saturated (+-1) at that exact moment if SAS has auto-engaged (confirmed IL gate: `hasControl && !IsOnSurface`, `sfs_source_reference.md` B1.3) -- a completely different signal from raw `turnAxis`, not a smaller/noisier version of it. Any Python-side control-schedule replay built from `turnAxis` alone (as every replay this project has run so far has been) silently drops all SAS activity, which turned out to be the real root cause of a large compounding rotation-prediction error found during a curving-flight validation this same session (see `analysis/python_changelog.md`'s H1 entries for the full investigation).
