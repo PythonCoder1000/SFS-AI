@@ -1,24 +1,46 @@
-"""Deterministic inner controller -- Checkpoint B (Stage 0).
+"""Deterministic inner controller -- Checkpoint B (Stage 0) + Checkpoint C
+residual/replan-gate wiring.
 
-Zero LLM in the loop. Flies straight up to a target altitude using a
-PD throttle controller, plus a minimal staging state machine.
+Zero LLM in the loop still (the supervisor call itself is the next
+piece, spec sec 7). This file now also issues rolling predict() calls,
+compares them against reality via hackathon/residual.py, and logs what
+the replan trigger WOULD do -- so the gate can be watched against a
+real flight before an LLM is ever wired to act on its output.
 
-Imports the real observe()/act() from analysis/agent_interface.py --
-that file is pre-existing hackathon-prep plumbing (see its own
-docstring), not something we rebuild here.
+Imports the real observe()/act()/predict() from
+analysis/agent_interface.py -- that file is pre-existing hackathon-prep
+plumbing (see its own docstring), not something we rebuild here.
 """
 
+import json
 import math
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "analysis"))
 
 import forward_sim as fsim  # noqa: E402  (path set above)
-from agent_interface import observe, observe_to_state, act  # noqa: E402
+from agent_interface import observe, observe_to_state, act, predict  # noqa: E402
+from residual import (  # noqa: E402
+    ReplanTrigger, ResidualTrend, compute_residual, classify_cause,
+)
 
 EARTH_RADIUS_M = fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
+
+# Real craft config + AoA table, same source as offline_pd_test.py's
+# validated harness -- gives predict() the actual thrust/mass/drag
+# model instead of its crude no-config fallback, so residuals reflect
+# real prediction error, not "we didn't tell it what the rocket is".
+CFG = fsim.load_craft_config_from_getforwardstartinfo(
+    str(ROOT / "analysis/sfs_probe_forwardstartinfo_prediction_test.json"),
+    firing_snapshot_path=str(ROOT / "analysis/sfs_probe_forwardstartinfo_firing.json"))
+CFG["dry_mass_t"] = 8.0  # not in the dump; keeps fuel finite, matches offline harness
+AOA = json.load(open(ROOT / "analysis/aoa_dragarea_table_prediction_test_flight.json"))
+
+PREDICT_HORIZON_S = 5.0  # how far ahead each rolling prediction looks
 
 # --- staging state machine -------------------------------------------------
 # Known safety-critical finding (see hackathon spec sec 1): firing all
@@ -159,7 +181,17 @@ def run_ascent(
 
     controller = AltitudePD(target_altitude_m)
     dt = 1.0 / poll_hz
-    deadline = time.monotonic() + max_duration_s
+    t_start = time.monotonic()
+    deadline = t_start + max_duration_s
+
+    # Checkpoint C wiring: rolling predict() -> compare -> classify -> gate.
+    # No LLM call happens on a fire yet -- this just proves the gate
+    # reacts correctly against a real flight before anything acts on it.
+    trigger = ReplanTrigger()
+    trigger.reset_phase("ASCENT")
+    trend = ResidualTrend()
+    pending_prediction = None  # {"due_t", "predicted_final", "confidence"}
+    throttle_history = deque(maxlen=5)  # for actuator-saturation detection
 
     last_snapshot = None
     try:
@@ -167,15 +199,56 @@ def run_ascent(
             snapshot = observe()
             last_snapshot = snapshot
             altitude_m, vspeed = _altitude_and_vspeed(snapshot)
+            t_now = time.monotonic() - t_start
+            state_now = observe_to_state(snapshot)
 
             maybe_stage(snapshot)  # no-op placeholder, see TODO above
+
+            actuator_saturated = (
+                len(throttle_history) == throttle_history.maxlen
+                and (all(t <= 0.0 for t in throttle_history)
+                     or all(t >= 1.0 for t in throttle_history))
+            )
+
+            # Consume a due prediction: compare it against reality, classify,
+            # and check the gate -- before issuing the next rolling prediction.
+            if pending_prediction is not None and t_now >= pending_prediction["due_t"]:
+                res = compute_residual(pending_prediction["predicted_final"], state_now)
+                confidence = pending_prediction["confidence"]
+                trend_info = trend.update(t_now, res["position_error_m"])
+                cause = classify_cause(
+                    res["position_error_m"], res["speed_error_mps"],
+                    confidence, actuator_saturated, just_staged=False,
+                )
+                decision = trigger.update(res["position_error_m"], t_now, confidence)
+                marker = "  <-- REPLAN" if decision.should_replan else ""
+                print(f"  [residual] pos_err={res['position_error_m']:6.1f}m "
+                      f"spd_err={res['speed_error_mps']:5.1f}m/s "
+                      f"trend={trend_info['trend']:<8} conf={confidence:<5} "
+                      f"cause={cause:<20} gate={decision.reason}{marker}")
+                pending_prediction = None
 
             if abs(target_altitude_m - altitude_m) <= tolerance_m:
                 break
 
             throttle = controller.throttle_for(altitude_m, vspeed)
             act(f"throttle {throttle}")
+            throttle_history.append(throttle)
             print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
+
+            # Issue the next rolling prediction: "if I hold this throttle for
+            # PREDICT_HORIZON_S seconds with no further input, where do I end
+            # up?" -- a hypothetical, not a real replay of the actual plan.
+            if pending_prediction is None:
+                result = predict(
+                    state_now, waypoints=[], duration_s=PREDICT_HORIZON_S,
+                    craft_config=CFG, aoa_table=AOA, default_throttle=throttle,
+                )
+                pending_prediction = {
+                    "due_t": t_now + PREDICT_HORIZON_S,
+                    "predicted_final": result["final"],
+                    "confidence": result["confidence"],
+                }
 
             time.sleep(dt)
     finally:
