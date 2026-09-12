@@ -254,6 +254,8 @@ def run_ascent(
     induce_fault_throttle: float = 0.0,
     inject_bad_stage_request_at_t: float = None,
     inject_bad_stage_request_at_ts: list = None,
+    force_supervisor_timeout_at_t: float = None,
+    simulate_midcall_stage_transition_at_t: float = None,
 ) -> dict:
     """Fly straight up to target_altitude_m. Returns the last observed
     snapshot. Checkpoint C: when the replan gate fires, this now
@@ -286,6 +288,29 @@ def run_ascent(
     discriminates a real bad streak from a few unlucky, unrelated
     rejections scattered across a flight. Takes priority over the
     single-time parameter if both are given.
+
+    force_supervisor_timeout_at_t: Checkpoint E fault-injection gate,
+    category 1/4 ("forced API timeout ... must reach safe-hold without
+    manual repair"). At the first replan cycle at or after this many
+    seconds, the supervisor call is made with an impossibly short
+    timeout_s (1ms) -- a REAL timeout against the REAL API, not a
+    simulated stand-in for one. call_supervisor()'s own try/except
+    catches it and returns None exactly like any other failure, so this
+    exercises the actual code path a real network hiccup would hit, not
+    a mock of it.
+
+    simulate_midcall_stage_transition_at_t: Checkpoint E fault-injection
+    gate, category 2 ("mid-call stage transition"). At the first replan
+    cycle at or after this many seconds, right after the supervisor call
+    returns but BEFORE the gateway evaluates it, _stage_state's
+    expected_stage is bumped by 1 -- simulating some other process (or a
+    real staging event) changing the world out from under this cycle
+    while the LLM call was in flight. Proves the gateway reads
+    expected_stage LIVE at evaluation time, not a value memoized when
+    the state summary was built seconds earlier -- if a correction's
+    stage_request happens to reference the now-STALE expected_stage, it
+    must be rejected as a mismatch, not honored because "it was valid
+    when the LLM was asked."
 
     induce_fault_at_t: if set, forces throttle to induce_fault_throttle
     (default 0.0, a hard cutout) for induce_fault_duration_s seconds
@@ -342,6 +367,8 @@ def run_ascent(
     harm_count = 0
     bad_stage_injected = False  # Checkpoint D live test: single-time hook fires at most once
     pending_injection_ts = sorted(inject_bad_stage_request_at_ts) if inject_bad_stage_request_at_ts else []
+    timeout_forced = False  # Checkpoint E live test: fires at most once
+    stage_transition_simulated = False  # Checkpoint E live test: fires at most once
 
     last_snapshot = None
     try:
@@ -456,7 +483,24 @@ def run_ascent(
                                   f"stage_request={bad_stage} (expected_stage="
                                   f"{_stage_state['expected_stage']}) -- should be REJECTED by gateway")
                         else:
-                            correction = call_supervisor(summary, decision.reason)
+                            if (force_supervisor_timeout_at_t is not None and not timeout_forced
+                                    and t_now >= force_supervisor_timeout_at_t):
+                                timeout_forced = True
+                                print(f"  [TEST] forcing a REAL supervisor timeout (timeout_s=0.001) "
+                                      f"-- should fail safely to deterministic layer, no hang/crash")
+                                correction = call_supervisor(summary, decision.reason, timeout_s=0.001)
+                            else:
+                                correction = call_supervisor(summary, decision.reason)
+
+                        if (simulate_midcall_stage_transition_at_t is not None and not stage_transition_simulated
+                                and t_now >= simulate_midcall_stage_transition_at_t):
+                            stage_transition_simulated = True
+                            old_expected = _stage_state["expected_stage"]
+                            _stage_state["expected_stage"] += 1
+                            print(f"  [TEST] simulating a mid-call stage transition: expected_stage "
+                                  f"{old_expected} -> {_stage_state['expected_stage']} (right after the "
+                                  f"supervisor call returned, before the gateway evaluates it)")
+
                         if correction is not None:
                             proposed_action_dict = correction.to_dict()
                             llm_latency_total_ms += correction.latency_ms
