@@ -33,7 +33,7 @@ from agent_interface import observe, observe_to_state, act, predict  # noqa: E40
 from residual import (  # noqa: E402
     ReplanTrigger, ResidualTrend, compute_residual, classify_cause,
 )
-from supervisor import build_state_summary, call_supervisor  # noqa: E402
+from supervisor import build_state_summary, call_supervisor, Correction  # noqa: E402
 from gateway import GuardrailGateway, DisablementLatch  # noqa: E402
 
 # Eligibility requirement (spec sec 0) -- get this in on day one so a time
@@ -252,11 +252,26 @@ def run_ascent(
     induce_fault_at_t: float = None,
     induce_fault_duration_s: float = 3.0,
     induce_fault_throttle: float = 0.0,
+    inject_bad_stage_request_at_t: float = None,
 ) -> dict:
     """Fly straight up to target_altitude_m. Returns the last observed
     snapshot. Checkpoint C: when the replan gate fires, this now
     actually calls the LLM supervisor and applies its correction --
     previously it only logged what the gate would have done.
+
+    inject_bad_stage_request_at_t: Checkpoint D live exit test. At the
+    first replan cycle at or after this many seconds into the flight, a
+    DELIBERATELY ILLEGAL Correction is substituted for the real first
+    supervisor call -- stage_request set to expected_stage+1 (guaranteed
+    mismatch, per the staging FSM). Everything downstream is completely
+    real: the gateway evaluates it for real, the retry-with-cause-fed-
+    back call goes to the REAL LLM, and the disablement latch records
+    the rejection for real. Only the first attempt is fabricated -- a
+    well-behaved LLM proposing sensible throttle corrections during a
+    normal ascent is very unlikely to spontaneously trigger a rejection
+    on its own, so this is how we get a real, repeatable, on-camera
+    "illegal command rejected, safe fallback engaged" moment instead of
+    just trusting the offline gateway_corpus_test.py coverage.
 
     induce_fault_at_t: if set, forces throttle to induce_fault_throttle
     (default 0.0, a hard cutout) for induce_fault_duration_s seconds
@@ -273,15 +288,6 @@ def run_ascent(
     later), the fault window has already closed on its own, so the
     supervisor's correction naturally applies to the AFTERMATH, not a
     fight against the fault itself.
-
-    IMPORTANT, still true: there is NO guardrail gateway yet
-    (Checkpoint D -- schema/staging-FSM/clamp/mandatory-predict-sanity-
-    check). A Correction's target_throttle goes straight to act(),
-    protected only by agent_interface.act()'s existing rate clamp
-    (MAX_THROTTLE_STEP=0.3/call) -- nothing here vets whether the LLM's
-    suggestion is actually a good idea. That's a deliberate, known gap
-    at this checkpoint, not an oversight -- don't leave this running
-    unsupervised.
 
     2026-09-12 live-test finding: `throttle <amount>` only sets
     throttlePercent -- it does NOT arm the rocket-wide master ignition
@@ -320,6 +326,7 @@ def run_ascent(
     pending_effectiveness = None  # {"error_before", "fired_at_t"}
     total_corrections = 0
     harm_count = 0
+    bad_stage_injected = False  # Checkpoint D live test: fires at most once
 
     last_snapshot = None
     try:
@@ -408,7 +415,20 @@ def run_ascent(
                         proposed_action_dict = None
                         rejection_cause_value = None
                         llm_latency_total_ms = 0.0
-                        correction = call_supervisor(summary, decision.reason)
+                        if (inject_bad_stage_request_at_t is not None and not bad_stage_injected
+                                and t_now >= inject_bad_stage_request_at_t):
+                            bad_stage_injected = True
+                            bad_stage = _stage_state["expected_stage"] + 1
+                            correction = Correction(
+                                no_change=False, reason_code="TEST_INJECTED_bad_stage_request",
+                                target_throttle=(throttle_history[-1] if throttle_history else 0.5),
+                                stage_request=bad_stage, commit_ms=1000, latency_ms=0.0,
+                            )
+                            print(f"  [TEST] injecting deliberately illegal correction: "
+                                  f"stage_request={bad_stage} (expected_stage="
+                                  f"{_stage_state['expected_stage']}) -- should be REJECTED by gateway")
+                        else:
+                            correction = call_supervisor(summary, decision.reason)
                         if correction is not None:
                             proposed_action_dict = correction.to_dict()
                             llm_latency_total_ms += correction.latency_ms
