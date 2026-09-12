@@ -31,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.68.0";
+        public const string VersionString = "0.69.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -141,7 +141,7 @@ namespace SFSProbe
             catch { }
 
             poll += Time.deltaTime;
-            if (poll > 0.5f) { poll = 0f; PollCommands(); }
+            if (poll > 0.05f) { poll = 0f; PollCommands(); }
 
             if (!Probe.WroteWorld)
             {

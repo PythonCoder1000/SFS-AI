@@ -9,6 +9,10 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.69.0 -- command-poll interval tightened 0.5s -> 0.05s
+
+**2026-09-12.** Functional change. `ProbeRunner.Update()` was only checking `command.txt` for a new command once every 0.5s (`poll > 0.5f`), which measured as ~520ms median observe()/act() round-trip latency from the hackathon controller's own IPC latency test -- the poll interval, not Python-side or file I/O overhead, was the dominant cost. Tightened the threshold to 0.05f (still throttled, not every frame, to avoid a File.Exists() check at full framerate). Expected effect: round-trip latency should drop roughly in proportion, down toward tens of ms. Needs a fresh measure_latency.py run post-restart to confirm the real number.
+
 ## v0.68.0 -- `ignite`'s description now warns about real destroyed-craft risk on multi-stage rockets
 
 **2026-09-11.** Docs-only change -- no functional code touched. `ignite` arms EVERY engine on the rocket across ALL stages at once (this was already documented, but not the danger). Confirmed live, twice, destroying a real 279.5t/27-part/3-stage craft both times: on a STACKED multi-stage rocket, an upper-stage engine (Titan/Valiant, sitting above still-attached lower-stage tanks) fires directly into the unstaged structure below it the instant `ignite`+throttle is applied, since `ignite` bypasses the normal stage-by-stage activation `stage <index>` provides. Real signature: `partCount` collapsing hard within 1-2s of full throttle (27 -> 7 -> 6 -> 4 in one live test, 27 -> 4-ish even faster on a repeat) with nothing looking wrong from the commands themselves -- the failure only shows up in telemetry (or visually) after the fact, not in any command response. Root-caused by Christian watching a repeat live. Safe usage: single-stage craft, or `stage <index>` to progress stage-by-stage on anything with engines stacked above/below other engines -- don't reach for blanket `ignite` on those.
