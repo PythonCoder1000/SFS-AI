@@ -253,6 +253,7 @@ def run_ascent(
     induce_fault_duration_s: float = 3.0,
     induce_fault_throttle: float = 0.0,
     inject_bad_stage_request_at_t: float = None,
+    inject_bad_stage_request_at_ts: list = None,
 ) -> dict:
     """Fly straight up to target_altitude_m. Returns the last observed
     snapshot. Checkpoint C: when the replan gate fires, this now
@@ -272,6 +273,19 @@ def run_ascent(
     on its own, so this is how we get a real, repeatable, on-camera
     "illegal command rejected, safe fallback engaged" moment instead of
     just trusting the offline gateway_corpus_test.py coverage.
+
+    inject_bad_stage_request_at_ts: same mechanism, but a LIST of
+    injection times instead of one -- the other half of Checkpoint D's
+    live exit test: "a bad-but-not-illegal LLM streak does not
+    incorrectly trip the disablement latch once state has moved on."
+    Spaced widely apart in real flight time, each injection lands at a
+    meaningfully different altitude, so DisablementLatch's own
+    materially-similar-state check (same cause + phase + altitude within
+    similarity_band_m, default 500m) should treat them as unrelated
+    rejections rather than an accumulating streak -- proving the latch
+    discriminates a real bad streak from a few unlucky, unrelated
+    rejections scattered across a flight. Takes priority over the
+    single-time parameter if both are given.
 
     induce_fault_at_t: if set, forces throttle to induce_fault_throttle
     (default 0.0, a hard cutout) for induce_fault_duration_s seconds
@@ -326,7 +340,8 @@ def run_ascent(
     pending_effectiveness = None  # {"error_before", "fired_at_t"}
     total_corrections = 0
     harm_count = 0
-    bad_stage_injected = False  # Checkpoint D live test: fires at most once
+    bad_stage_injected = False  # Checkpoint D live test: single-time hook fires at most once
+    pending_injection_ts = sorted(inject_bad_stage_request_at_ts) if inject_bad_stage_request_at_ts else []
 
     last_snapshot = None
     try:
@@ -415,7 +430,20 @@ def run_ascent(
                         proposed_action_dict = None
                         rejection_cause_value = None
                         llm_latency_total_ms = 0.0
-                        if (inject_bad_stage_request_at_t is not None and not bad_stage_injected
+                        if (inject_bad_stage_request_at_ts is not None and pending_injection_ts
+                                and t_now >= pending_injection_ts[0]):
+                            pending_injection_ts.pop(0)
+                            bad_stage = _stage_state["expected_stage"] + 1
+                            correction = Correction(
+                                no_change=False, reason_code="TEST_INJECTED_bad_stage_request",
+                                target_throttle=(throttle_history[-1] if throttle_history else 0.5),
+                                stage_request=bad_stage, commit_ms=1000, latency_ms=0.0,
+                            )
+                            print(f"  [TEST] injecting deliberately illegal correction "
+                                  f"(streak test, alt={altitude_m:.0f}m): stage_request={bad_stage} "
+                                  f"(expected_stage={_stage_state['expected_stage']}) -- should be "
+                                  f"REJECTED by gateway, and NOT accumulate with unrelated rejections")
+                        elif (inject_bad_stage_request_at_t is not None and not bad_stage_injected
                                 and t_now >= inject_bad_stage_request_at_t):
                             bad_stage_injected = True
                             bad_stage = _stage_state["expected_stage"] + 1
@@ -442,6 +470,8 @@ def run_ascent(
                                       f"-- retrying once with cause fed back")
                                 rejection_cause_value = gdecision.cause.value
                                 latch.record_rejection(gdecision.cause, "ASCENT", altitude_m)
+                                print(f"  [latch] disabled={latch.disabled} (should stay False for "
+                                      f"unrelated/well-separated rejections)")
                                 retry_reason = (
                                     f"{decision.reason}; PREVIOUS PROPOSAL REJECTED by the guardrail gateway: "
                                     f"{gdecision.cause.value} ({gdecision.detail}). Propose something "
