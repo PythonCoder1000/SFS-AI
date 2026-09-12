@@ -11,6 +11,7 @@ sfsprobe/archive/
 # Python virtual environments and caches (regenerate via
 # `pip install -r requirements.txt` in each service's own venv)
 venv/
+.venv/
 __pycache__/
 *.pyc
 
