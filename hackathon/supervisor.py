@@ -36,7 +36,12 @@ DIRECT_MODEL = "claude-sonnet-4-6"
 # region has capacity; swap for a region-prefixed id (e.g. "us.anthropic...")
 # if data residency matters for the deployment.
 BEDROCK_MODEL = "global.anthropic.claude-sonnet-4-6"
-DEFAULT_TIMEOUT_S = 1.2  # spec sec 7: ~0.8-1.5s starting value
+DEFAULT_TIMEOUT_S = 3.0  # spec sec 7 said "~0.8-1.5s starting value, verify
+# against measured latency" -- measured (2026-09-12, direct API, 6 calls):
+# 1.74s-2.49s, consistently, median ~2.3s. 1.2s would fail almost every
+# real call. 3.0s gives ~500-700ms margin above the observed range while
+# still being a real cutoff, not a rubber-stamp "basically never times out"
+# value. Re-measure if the model/region/network changes.
 
 
 def _make_client(timeout_s: float):
@@ -50,7 +55,18 @@ def _make_client(timeout_s: float):
     """
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if anthropic_key:
-        return anthropic.Anthropic(api_key=anthropic_key, timeout=timeout_s), DIRECT_MODEL, "direct"
+        # 2026-09-12 finding: passing timeout=timeout_s alone did NOT
+        # enforce a hard 1.2s cutoff -- the SDK's default max_retries
+        # (2) meant a real timeout took ~5.1s wall-clock before finally
+        # raising (multiple retry attempts each eating into the budget).
+        # max_retries=0 makes this an actual hard timeout, matching spec
+        # sec 7's "~0.8-1.5s starting value" -- a supervisor call that
+        # can silently take 5s defeats the whole point of having a
+        # timeout/fallback design at all.
+        return (
+            anthropic.Anthropic(api_key=anthropic_key, timeout=timeout_s, max_retries=0),
+            DIRECT_MODEL, "direct",
+        )
 
     aws_key = os.environ.get("AWS_ACCESS_KEY_ID")
     if aws_key:
