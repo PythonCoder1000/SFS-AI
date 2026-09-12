@@ -77,6 +77,29 @@ def traced_predict(state, **kwargs):
     return predict(state, **kwargs)
 
 
+def _call_with_retry(fn, *args, max_attempts: int = 3, retry_delay_s: float = 0.5,
+                      label: str = "mod call", **kwargs):
+    """2026-09-12 live finding: sfsprobe itself can go unresponsive for a
+    few seconds -- not a supervisor/API issue, the mod's own file-
+    protocol I/O -- which previously crashed run_ascent() entirely via
+    an uncaught TimeoutError from observe()/act() (see
+    bookkeeping/active_state.md's incident note). That's a real infra
+    hiccup, not a reason to abandon the flight -- retry it a bounded
+    number of times before giving up. Bounded on purpose: a genuinely
+    dead mod should still surface as a real failure (and the caller's
+    own finally-block throttle-cut still runs), not hang forever."""
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except TimeoutError as e:
+            last_exc = e
+            print(f"  [WARN] {label} timed out (attempt {attempt}/{max_attempts}): {e}")
+            if attempt < max_attempts:
+                time.sleep(retry_delay_s)
+    raise last_exc
+
+
 @weave.op()
 def log_cycle_decision(
     cycle_id: int, replan_trigger_reason: str, llm_latency_ms: float,
@@ -165,7 +188,7 @@ def force_stage() -> str:
     (hackathon plan sec 9), even though the full gateway isn't built
     yet at this checkpoint."""
     idx = _stage_state["expected_stage"]
-    result = traced_act(f"stage {idx}")
+    result = _call_with_retry(traced_act, f"stage {idx}", label=f"act('stage {idx}')")
     _stage_state["expected_stage"] += 1
     return result
 
@@ -337,7 +360,7 @@ def run_ascent(
     engine state and of staging), so it's safe to send unconditionally
     at the start of every run, not just once ever.
     """
-    traced_act("master on")
+    _call_with_retry(traced_act, "master on", label="act('master on')")
 
     controller = AltitudePD(target_altitude_m)
     dt = 1.0 / poll_hz
@@ -373,7 +396,7 @@ def run_ascent(
     last_snapshot = None
     try:
         while time.monotonic() < deadline:
-            snapshot = traced_observe()
+            snapshot = _call_with_retry(traced_observe, label="observe()")
             last_snapshot = snapshot
             altitude_m, vspeed = _altitude_and_vspeed(snapshot)
             t_now = time.monotonic() - t_start
@@ -592,7 +615,7 @@ def run_ascent(
             # would resume from a stale value and jump the moment it regains
             # authority, instead of continuing smoothly from reality.
             controller._last_throttle = throttle
-            traced_act(f"throttle {throttle}")
+            _call_with_retry(traced_act, f"throttle {throttle}", label=f"act('throttle {throttle}')")
             throttle_history.append(throttle)
             print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
 
@@ -615,9 +638,17 @@ def run_ascent(
         # Always cut throttle on the way out -- tolerance reached, timeout
         # hit, or an exception/KeyboardInterrupt -- never leave the last
         # commanded throttle running unattended. Matches the plan's own
-        # "never an indefinite freeze" rule (sec 7.1), applied here even
-        # though the full expiry contract isn't built until Checkpoint D.
-        act("throttle 0")
+        # "never an indefinite freeze" rule (sec 7.1). Retried too (same
+        # 2026-09-12 mod-unresponsive finding) -- but this is the LAST
+        # line of defense, so failure here must never crash silently or
+        # mask whatever exception got us into finally in the first
+        # place: catch broadly, warn loudly, never re-raise.
+        try:
+            _call_with_retry(act, "throttle 0", label="final throttle-cut act('throttle 0')")
+        except Exception as e:  # noqa: BLE001 -- deliberately broad: this is the safety net,
+            # nothing here should ever propagate and hide the real error.
+            print(f"  [CRITICAL] failed to cut throttle after retries: {e} -- "
+                  f"MANUAL INTERVENTION MAY BE NEEDED, check the game directly")
 
     return last_snapshot
 
