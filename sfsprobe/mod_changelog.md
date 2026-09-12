@@ -9,6 +9,28 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.68.0 -- `ignite`'s description now warns about real destroyed-craft risk on multi-stage rockets
+
+**2026-09-11.** Docs-only change -- no functional code touched. `ignite` arms EVERY engine on the rocket across ALL stages at once (this was already documented, but not the danger). Confirmed live, twice, destroying a real 279.5t/27-part/3-stage craft both times: on a STACKED multi-stage rocket, an upper-stage engine (Titan/Valiant, sitting above still-attached lower-stage tanks) fires directly into the unstaged structure below it the instant `ignite`+throttle is applied, since `ignite` bypasses the normal stage-by-stage activation `stage <index>` provides. Real signature: `partCount` collapsing hard within 1-2s of full throttle (27 -> 7 -> 6 -> 4 in one live test, 27 -> 4-ish even faster on a repeat) with nothing looking wrong from the commands themselves -- the failure only shows up in telemetry (or visually) after the fact, not in any command response. Root-caused by Christian watching a repeat live. Safe usage: single-stage craft, or `stage <index>` to progress stage-by-stage on anything with engines stacked above/below other engines -- don't reach for blanket `ignite` on those.
+
+---
+
+## v0.67.0 -- fixed `computed:engines`' per-engine `thrustDirX/Y` (never reflected gimbal deflection), fixed `getplacedmagnets`' part-name field
+
+**2026-09-11.** Two items from `high_level_checklist.md`'s "Tooling bugs — confirmed broken, unfixed" list, both fixed as pure code changes (no new data needed).
+
+**`thrustDirX`/`thrustDirY` fix.** Found 2026-09-06: every engine reported exactly `(0, 1)` on 100% of samples across a whole flight, even while the single-engine `gimbalTime`/`gimbalTargetTime` proxy correctly showed active gimbal ramping on the same engines. Root-caused via IL this session: `EngineModule::thrustNormal` (`Composed_Vector2`) is a **constant local-space vector** — it never itself rotates with gimbal deflection. Confirmed directly from `EngineModule.FixedUpdate`'s own IL body: real per-tick force application reads `thrustNormal.Value` (local), then calls `Transform.TransformVector`/`Transform_Utility.TransformVectorUnscaled` **on the engine's own transform** to get the true world-relative direction — gimbal deflection lives in that transform's rotation, not in `thrustNormal`. `GetEngineArray` was reading `thrustNormal` raw with no transform step at all.
+
+Fixed by reusing the exact same `Transform_Utility.TransformVectorUnscaled` reflection call this file's own `rcsforce` case already uses for RCS thruster normals — `GetEngineArray` now unwraps `thrustNormal` to its real `Vector2`, transforms it through `Get(mv, "transform")` (the engine's own transform, matching `FixedUpdate`'s `this.transform`), and reports that as `thrustDirX/Y`. Falls back to the untransformed local value (logged, not silent) if the transform lookup fails for any reason.
+
+**Side finding, not yet acted on:** `getforwardstartinfo`'s pre-existing gimbal-related code (the `baseDirectionLocal` computation) assumes `thrustNormal` IS live-deflected and tries to *undo* a rotation that, per this finding, was never actually being applied to it in the first place. Because `getforwardstartinfo` is always called pre-ignition (gimbal deflection ~0 at that moment), this had no observable effect in practice — but the assumption itself is now known wrong. Not fixed this pass since it's dormant; flagging here so it isn't presumed correct if that code path's real effect is ever needed at a nonzero gimbal angle.
+
+**`getplacedmagnets` part-name fix.** Was reading `displayName.TranslatableName`, a shared localization KEY (e.g. `"Parachute_Name"`) — `Parachute` and `Parachute Side` were indistinguishable in its output. `getparts`/`dumpblueprint` already read the correct field (`orientation.name`); `getplacedmagnets` now does too.
+
+**Verification:** both are direct code fixes matching an already-working pattern elsewhere in this same file (`rcsforce` for the transform call, `dumpblueprint`/`getparts` for the name field) — not new mechanisms. **`thrustDirX/Y` fix LIVE-VERIFIED 2026-09-11**, after reload: baseline (engine off) read `thrustDirX≈-0.0001, thrustDirY≈1` (a tiny real residual from the craft's pad tilt, confirming the transform is genuinely being read now, not hardcoded); with `master on`, `throttle 0.3`, and a full `turn 1` command, `gimbalTime` hit `-1` (full deflection) and `thrustDirX` jumped to **0.1075** (`thrustDirY` 0.994, ~6° deflection) — correctly tracking the commanded turn, which the pre-fix code could never show (always exactly `(0,1)`). **`getplacedmagnets` fix NOT yet live-tested** — needs a build with both `Parachute` and `Parachute Side` placed to confirm.
+
+---
+
 ## v0.66.0 -- programmatic staging: `stage <index>` + `stages` (read-only listing)
 
 **2026-09-08.** No command existed to activate a stage in-flight -- every flight this project has scripted so far was a single unstaged craft. Blocked by not knowing the real activation mechanism; the existing `sfs_source_reference.md` B7 section on `Staging`/`Stage` documents field layout and edit-time mutator signatures only, explicitly marked `[PARTIAL]`, bodies not read.

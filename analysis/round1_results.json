@@ -1,0 +1,65 @@
+{
+  "BASELINE (dt=0.25,rk4,before,static-table)": {
+    "pos_err_m": 1057.7076758637015,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 24.82900519385428,
+    "rot_err_deg": 143.08057162227334,
+    "angv_err_degs": 193.69996135906666
+  },
+  "H1 use_real_aero=True (ceiling ref, not deployable)": {
+    "pos_err_m": 4023.682511610532,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 94.45335063643083,
+    "rot_err_deg": 42.24249625678499,
+    "angv_err_degs": 221.2157373656187
+  },
+  "H2 dt=1/60 fine step": {
+    "pos_err_m": 2363.748200675416,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 55.48746377737024,
+    "rot_err_deg": 165.13573403278212,
+    "angv_err_degs": 1703.2896038137635
+  },
+  "H3 integrator=symplectic_euler": {
+    "pos_err_m": 3803.2355602119146,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 89.27850069807135,
+    "rot_err_deg": 50.80548406639298,
+    "angv_err_degs": 359.9829156715423
+  },
+  "H4 sas_order=after": {
+    "pos_err_m": 1068.6925718351852,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 25.086868538664742,
+    "rot_err_deg": 101.23680651966407,
+    "angv_err_degs": 98.84232257096235
+  },
+  "H5 box2d_rotation_clamp=False": {
+    "pos_err_m": 2307.887441961885,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 54.17616851131449,
+    "rot_err_deg": 43.057825681135,
+    "angv_err_degs": 10885.557565331786
+  },
+  "H6 live_inertia=False": {
+    "pos_err_m": 933.5420445255371,
+    "real_disp_m": 4259.967999545577,
+    "pos_err_pct": 21.914297117375543,
+    "rot_err_deg": 30.297821951024844,
+    "angv_err_degs": 325.3547248840332
+  },
+  "H7 coast-only window (post-turns, t=24,h=8)": {
+    "pos_err_m": 1524.7293521701974,
+    "real_disp_m": 1080.9603887672279,
+    "pos_err_pct": 141.0532123114208,
+    "rot_err_deg": 158.03619271610995,
+    "angv_err_degs": 339.238001862532
+  },
+  "H7b pre-turn ascent window (t=0,h=5.5)": {
+    "pos_err_m": 312.11120164287706,
+    "real_disp_m": 408.8925346094995,
+    "pos_err_pct": 76.33086330151502,
+    "rot_err_deg": 159.9107750024002,
+    "angv_err_degs": 360.0000077560362
+  }
+}

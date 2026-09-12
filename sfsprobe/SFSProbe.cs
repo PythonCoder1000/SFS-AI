@@ -31,7 +31,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.66.0";
+        public const string VersionString = "0.68.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -830,7 +830,7 @@ namespace SFSProbe
                 Description = "Arms/disarms the probe's own autostop-on-condition behavior. 'on'/'turnover' = ascent-phase auto-stop, 'land' = descent-phase auto-stop, 'off' = disarm." },
             new ProbeCommandInfo { Name = "ignite", Category = "control",
                 Syntax = "ignite",
-                Description = "Sets EngineModule.engineOn = true on every engine on the active rocket (bypasses staging). Independent of throttle amount and master ignition." },
+                Description = "Sets EngineModule.engineOn = true on EVERY engine on the active rocket, across ALL stages at once (bypasses staging). Independent of throttle amount and master ignition. DANGEROUS on a real multi-stage STACKED rocket (2026-09-11, confirmed live -- destroyed a real 279.5t/27-part/3-stage craft twice): an upper-stage engine (e.g. a Titan/Valiant sitting above still-attached lower-stage tanks) fires directly into the unstaged structure below it before any separation happens, since ignite doesn't sequence engines with 'stage'. Real observed signature: partCount collapsing hard within ~1-2s of full throttle (27 -> 7 -> 6 -> 4 parts in one live test) while nothing looks wrong from the commands alone. Safe on a single-stage craft, or when only the CURRENTLY active stage's engines are the ones armed -- use 'stage <index>' to progress through stages properly on anything with engines above/below other engines, don't rely on ignite for that." },
             new ProbeCommandInfo { Name = "stage", Category = "control",
                 Syntax = "stage <0-based index into staging.stages>",
                 Description = "v0.66.0. Programmatic staging activation, confirmed via IL from StagingDrawer.UseStage(Stage): fires the given stage's parts through the real Rocket.UseParts(true, regions) entry point (PolygonData always null, confirmed). Requires WorldTime.realtimePhysics == true (fails explicitly otherwise, matching the game's own gate) -- won't fire on rails/during timewarp. Index is into the CURRENT staging.stages list, not Stage.stageId; use 'stages' first to see it. Does NOT replicate StagingDrawer's own useStageIdentifier UI bookkeeping (confirmed non-physics). Writes result only, no file." },
@@ -2179,7 +2179,13 @@ namespace SFSProbe
                         if (part == null) continue;
                         placedCount++;
                         string pname = "?";
-                        try { pname = (string)Get(Get(part, "displayName"), "TranslatableName"); } catch { }
+                        // FIXED (2026-09-11): was reading displayName.TranslatableName,
+                        // a SHARED localization KEY (e.g. "Parachute_Name") -- Parachute
+                        // and Parachute Side are indistinguishable in that field.
+                        // orientation.name is the real distinct catalog name;
+                        // getparts/dumpblueprint already use this field correctly, this
+                        // just brings getplacedmagnets in line with them.
+                        try { pname = (string)Get(Get(part, "orientation"), "name"); } catch { }
                         var psb = new StringBuilder();
                         psb.Append("{\"part\":").Append(Q(pname));
                         psb.Append(",\"magnetPoints\":").Append(DumpMagnetPoints(part));
@@ -4569,8 +4575,47 @@ namespace SFSProbe
                         {
                             bool engineOn = ToB(GetWrapped2(Get(mv, "engineOn")));
                             object normal = Get(mv, "thrustNormal");
-                            float dx = ToF(GetWrapped2(Get(normal, "x")));
-                            float dy = ToF(GetWrapped2(Get(normal, "y")));
+                            // FIXED (2026-09-11): thrustNormal is a CONSTANT LOCAL
+                            // vector -- confirmed via IL that it does NOT itself
+                            // rotate with gimbal deflection (matches this being
+                            // read raw and constant on 100% of samples in a real
+                            // gimbaling flight, per high_level_checklist.md's
+                            // "Tooling bugs -- confirmed broken, unfixed" entry).
+                            // The real mechanism, read directly from
+                            // EngineModule.FixedUpdate's own IL body: it takes
+                            // thrustNormal.Value (local) and calls
+                            // Transform.TransformVector / Transform_Utility.
+                            // TransformVectorUnscaled on THIS ENGINE'S OWN
+                            // transform to get the true world-relative direction
+                            // -- the exact same mechanism (and even the same
+                            // Transform_Utility.TransformVectorUnscaled reflection
+                            // call) this file's own 'rcsforce' case already uses
+                            // for RCS thruster normals. Gimbal deflection lives in
+                            // that transform's own rotation, not in thrustNormal
+                            // itself, so reading thrustNormal raw was always going
+                            // to miss it regardless of gimbal state.
+                            object localNormalVec = GetWrapped2(normal);
+                            object engineTransform = Get(mv, "transform");
+                            object transformUtilTypeEA = FindType("Transform_Utility");
+                            object worldNormalObjEA = (engineTransform != null && transformUtilTypeEA != null && localNormalVec != null)
+                                ? InvokeReturn(transformUtilTypeEA, "TransformVectorUnscaled", new object[] { engineTransform, localNormalVec })
+                                : null;
+                            float dx, dy;
+                            if (worldNormalObjEA != null)
+                            {
+                                dx = ToF(Get(worldNormalObjEA, "x"));
+                                dy = ToF(Get(worldNormalObjEA, "y"));
+                            }
+                            else
+                            {
+                                // Fallback: transform unavailable for some reason --
+                                // report the local (pre-transform) value rather than
+                                // silently failing, same spirit as this function's
+                                // existing per-part try/catch-and-log discipline.
+                                ProbeMod.Log("[engine-array] couldn't transform thrustNormal to world space on part \"" + pname + "\" -- reporting LOCAL (untransformed) direction");
+                                dx = ToF(GetWrapped2(Get(normal, "x")));
+                                dy = ToF(GetWrapped2(Get(normal, "y")));
+                            }
                             bool gimbal = ToB(GetWrapped2(Get(mv, "gimbalOn")));
                             float throttleOut = ToF(GetWrapped2(Get(mv, "throttle_Out")));
                             var esb = new StringBuilder();

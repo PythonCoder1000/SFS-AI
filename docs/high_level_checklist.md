@@ -572,38 +572,52 @@ multi-engine, terrain, and RCS. Detail in `sfs_physics_reference.md` §5.
       per-checkpoint changelog entries); this checklist item moved here
       and marked done.
 
+## Tooling bugs — fixed 2026-09-11
+
+- [x] **`computed:engines`'s per-engine `thrustDirX`/`thrustDirY` never
+      reflected real gimbal deflection (found 2026-09-06, FIXED
+      2026-09-11).** Root-caused via IL: `EngineModule::thrustNormal`
+      (`Composed_Vector2`) is a CONSTANT LOCAL vector -- it never itself
+      rotates with gimbal. The real mechanism, read directly from
+      `EngineModule.FixedUpdate`'s own IL body: real per-tick force
+      application takes `thrustNormal.Value` (local) and calls
+      `Transform.TransformVector`/`Transform_Utility.
+      TransformVectorUnscaled` on THIS ENGINE'S OWN transform to get
+      the true world-relative direction -- gimbal deflection lives in
+      that transform's rotation, not in `thrustNormal` itself. Fixed by
+      reusing the exact same `Transform_Utility.TransformVectorUnscaled`
+      reflection call this file's own `rcsforce` case already uses for
+      RCS thruster normals. Side finding, not acted on:
+      `getforwardstartinfo`'s own gimbal-related code assumes
+      `thrustNormal` IS live-deflected and tries to undo a rotation
+      that, per this finding, was never actually applied to it --
+      dormant/harmless since that snapshot is always taken pre-ignition
+      (deflection ~0 at that moment), but the assumption is now known
+      wrong if that code path is ever exercised at a real nonzero
+      gimbal angle. Shipped as mod v0.67.0 -- compiled clean, installed,
+      **not yet live-tested** (needs a game restart + a real flight with
+      active gimbaling to confirm). See `mod_changelog.md`'s v0.67.0
+      entry for the full writeup.
+- [x] **`getplacedmagnets`'s part-name field, FIXED 2026-09-11.** Was
+      reading `displayName.TranslatableName`, a shared localization KEY
+      (`Parachute` and `Parachute Side` were indistinguishable) --
+      `getparts`/`dumpblueprint` already used the correct field
+      (`orientation.name`), `getplacedmagnets` now matches them. Same
+      v0.67.0 build as above -- not yet live-tested.
+- [x] **`GetHeatState` -- corrected an entry that was stale, not an
+      actual open bug.** This checklist's "unfixed" list below carried
+      an entry claiming this reads `Part.temperature` and under-reports
+      for `HeatModule`-owned parts. Checked the real code 2026-09-11:
+      it was already fixed 2026-08-30 (reads the abstract `Temperature`
+      property off `HeatModule` if present, else `Part`, with the
+      `+-Infinity` sentinel handled too) -- the checklist entry had
+      simply never been updated to match. No code change needed; this
+      is a documentation correction, not a fix.
+
 ## Tooling bugs — confirmed broken, unfixed
 
-- [ ] **`computed:engines`'s per-engine `thrustDirX`/`thrustDirY` never
-      reflects real gimbal deflection (found 2026-09-06).** Confirmed
-      across an entire clean 6,518-sample flight (6-engine rocket,
-      real hard steering corrections including a full ±1 turnAxis
-      reversal at t=33.6s): every engine reports exactly `(0, 1)` —
-      the un-deflected baseline direction — on 100% of samples, even
-      while the single-engine proxy (`gimbalTime`/`gimbalTargetTime`)
-      correctly shows the SAME engines' gimbal actively ramping to full
-      deflection and back. `engineOn` and `throttleOut` in the same
-      `computed:engines` payload ARE correct per-engine (confirmed
-      individually-toggled engines read correctly). This is likely the
-      same underlying issue as the old `GetEngineDirection`/
-      `GetEngineArray` `thrustDirX` bug (fixed 2026-08-29/08-30,
-      v0.34.0/v0.37.0 — see below) recurring in the newer
-      `computed:engines` scoped-telemetry code path, which may not
-      route through the fixed `GetEngineArray` function at all. Not yet
-      root-caused this session — flagged for a probe-code fix before
-      relying on per-engine gimbal direction for anything. Workaround in
-      the meantime: use the single-engine `gimbalTime`/`gimbalTargetTime`
-      proxy for gimbal-timing validation (still correct), and don't use
-      per-engine `thrustDirX/Y` for anything until fixed.
 - [ ] `thrOn` — unreliable as a thrust indicator (workaround exists: check
       mass flatness instead)
-- [ ] `GetHeatState` may under-report — it reads the `Part.temperature`
-      field, but for a part whose heat is owned by a separate
-      `HeatModule` that field is never written. Read the `Temperature`
-      property virtually off `HeatModuleBase` instead. Needs a live check.
-      Same bare-`catch{}`-hides-failures pattern as the now-fixed engine
-      getter (see above) -- worth the same treatment when this is picked
-      up, not just the temperature-source fix alone.
 
 ## Blueprint construction — magnet-based stacking confirmed, surface-mount deferred
 
@@ -670,14 +684,15 @@ flagged here so whoever next touches that claim knows it's stale.
       `blueprint_builder.py` v2 trusts it blind. Still needs real edge
       geometry (`surfacesFast`) for both parts either way, same gotcha as
       before (gated behind `Part.InitializePart()` on placed instances).
-- [ ] **Minor, low-priority tooling bug (not yet fixed):**
-      `sfsprobe`'s `getplacedmagnets` command reads part names via
+- [x] **Minor, low-priority tooling bug -- FIXED 2026-09-11.**
+      `sfsprobe`'s `getplacedmagnets` command read part names via
       `displayName.TranslatableName`, which returns a shared
       localization KEY (e.g. `"Parachute_Name"`) rather than the
-      distinct catalog name — `Parachute` and `Parachute Side` are
+      distinct catalog name — `Parachute` and `Parachute Side` were
       indistinguishable in its output. `getparts`/`dumpblueprint`
-      already use the correct field (`orientation.name`); apply the
-      same fix to `getplacedmagnets` next time it's touched.
+      already used the correct field (`orientation.name`);
+      `getplacedmagnets` now does too. Shipped as mod v0.67.0 -- see
+      "Tooling bugs -- fixed 2026-09-11" above for the full entry.
 - [ ] **`sfsprobe_build_stack_blueprint` (the MCP tool wrapping all of
       the above) is built and compiles clean, but has NEVER BEEN RUN
       end to end.** Every individual primitive it calls
@@ -771,6 +786,22 @@ Full-flight (not just ascent) accuracy is NOT yet confirmed.
 **30s-ahead accuracy goal (Christian's explicit target, <1% at 30s): achieved for coast/vacuum, isolated (not solved) for atmospheric maneuvering.** Powered atmospheric coast 0.497% at 30s / 0.671% at 34s (data ceiling). Natural (unscripted) fuel-exhaustion cutoff crossed cleanly, 0.06-0.14% error through the transition. Unpowered vacuum coast ~0.001% even at 60-70s. **A vacuum turn (h=116,584m, well above the 30km atmosphere ceiling) also predicts almost perfectly (0.001% position)** -- this reframes the entire "turns are chaotic" conclusion from 2026-09-07: it was never turning itself, it's specifically turning THROUGH DENSE ATMOSPHERE. Atmospheric-turn error remains the one real open gap, now with sign/dt/integrator/composition-order/live_inertia/the AoA=0 fix itself all ruled out as the cause -- genuinely needs new data (a `dragareasweep` captured while actively spinning at known rates, not just static angles), not another existing-data hypothesis. Full detail: `analysis/python_changelog.md`'s 2026-09-08 entry.
 
 **Also this session: mod v0.66.0 added programmatic staging (`stage`/`stages`), IL-researched and live-verified end to end on a real 3-stage rocket.** See `sfsprobe/mod_changelog.md`.
+
+## Forward integrator -- 2026-09-09: merge, live-verification, and the real finding -- the gate must be ON, not just merged
+
+**The `aero_torque_aoa_gate_deg` fix from 2026-09-08 is merged into `forward_sim.py` for real** (was scratch-only in `forward_sim_v2.py`) -- straight diff-and-apply, three self-contained hunks, no logic changes. Confirmed the regime check itself is fully automatic and per-step (reads `_current_turn_axis`/`_sim_t_now`, written by the main integration loop every step), not a human-picked window.
+
+**Live-verified the same day, and it surfaced an important correction to how the 2026-09-08 numbers should be read.** Re-ran `long_coast_fuel_exhaust_turn_2026-09-08` (the flight the "0.497% at 30s" claim came from) against the merged code. With the gate at its default (off, matching pre-merge behavior exactly -- confirmed, not assumed), the SAME pure-coast, zero-commanded-turns flight flips ~175 degrees within the first simulated SECOND and nose-dives the prediction into the ground -- the AoA~0 table defect isn't specific to turns, it hits ANY atmospheric window, coast included. **Turning the gate ON (any threshold 1-5deg tested) reproduces the historic numbers almost exactly**: 0.054% h-error / 77m position offset at 30s, 0.056% / 147m at 34s. **Conclusion: the historic "coast/vacuum 30s-ahead goal achieved" claim was always implicitly gate-ON -- it was never a default-flags result**, and default-off is silently unusable for any atmospheric prediction, not just turns. Whether the gate should now default ON for atmospheric predictions is an open design decision, not yet made -- see `bookkeeping/active_state.md`.
+
+Two real telemetry-schema gotchas found and fixed along the way (see `analysis/python_changelog.md`'s 2026-09-09 entries for full detail): raw archived `.gz` flights use camelCase field names (`outputTurnAxisTorque`, `directionalAxisX/Y`) that don't match what the loader originally required, and the `throttleOut` telemetry field reads 0 even mid-burn (genuinely broken/unpopulated in this recording, not a naming issue -- `thr` is the reliable field).
+
+## Forward integrator -- 2026-09-09 (Christian's decision): atmospheric-turn accuracy deprioritized
+
+**Atmospheric-turn prediction accuracy is no longer being chased.** Reframed as an inherent feedback-loop instability (AoA -> torque -> rotation -> AoA), naturally sensitive/compounding in dense air by the nature of the mechanism, not a fixable bug -- structurally distinct from coast/vacuum, which have no such loop. The `dragareasweep`-while-spinning follow-up experiment (2026-09-08's own stated next step for this gap) is explicitly off the table. **New standing priority: maximize accuracy on non-atmospheric regimes** (coast + vacuum, including vacuum turns), where the 30s-ahead goal is already met once the gate is on (see above).
+
+## Tooling -- 2026-09-11: `forward_sim.py` accepts raw camelCase telemetry directly
+
+**Easy-Autonomous cleanup, not a research finding.** Promoted `analysis/convert_flight_compat_keys.py`'s exact field-renaming mapping into `forward_sim.py` itself (`_normalize_camelcase_telemetry`), so a raw archived `.gz` flight now works directly with `test_against_run`/`test_against_run_trajectory` -- no more manual conversion pass first. Verified byte-identical output between the raw file and the pre-converted compat file on the same flight (0.054% h-error, 77.27m offset at 30s, both paths). The standalone script and existing `_compat.jsonl` files remain valid; this just makes that step optional. See `analysis/python_changelog.md`'s 2026-09-11 entry.
 
 ---
 

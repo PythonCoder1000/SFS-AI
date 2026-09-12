@@ -232,6 +232,21 @@ DEFAULT_FLAGS = {
     # entry for the full story):
     "live_inertia": True,          # scale inertia with live-integrated mass
     "box2d_rotation_clamp": True,  # cap per-step rotation to 90deg (b2_maxRotation)
+    # NEW 2026-09-08 (H8/H9/H10, merged from forward_sim_v2.py
+    # 2026-09-09): None = disabled, matches prior behavior exactly.
+    # A float (degrees) zeroes the aero TORQUE contribution (not drag
+    # force) whenever |AoA| is below this threshold AND no turn command
+    # is active AND the cooldown since the last turn has elapsed -- see
+    # _derivative's own comment for the regime-gate logic and
+    # python_changelog.md's 2026-09-08 entry for why: the static AoA
+    # table predicts spurious large torque (~-85 to -92 deg/s^2) right
+    # at AoA~0 where real torque is genuinely ~0, but gating this
+    # unconditionally (no turn-awareness) was confirmed to actively
+    # HURT any turn-inclusive window even though it fixed pure-coast
+    # windows cleanly -- so the gate is off by default and only helps
+    # once these two guard conditions are also satisfied.
+    "aero_torque_aoa_gate_deg": None,
+    "aero_torque_aoa_gate_cooldown_s": 0.0,
 }
 
 
@@ -956,6 +971,37 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
         theta, vx, vy, omega, h, aoa_table, com_now, parachutes, body,
         flags["drag"], flags["parachute_drag"], real_aero_override=real_aero_override)
 
+    # H8 (2026-09-08 goal-loop experiment, merged 2026-09-09): gate the
+    # AERO TORQUE contribution off when |AoA| is below a threshold --
+    # confirmed this session that the static AoA table produces
+    # spurious large torque right at AoA~0 (a lookup/interpolation
+    # defect at the zero-crossing, not a real physics effect: real
+    # recorded aeroAlphaDeg was ~0 there). Zeroing only the TORQUE
+    # contribution (not the translational drag force, which is fine
+    # near AoA=0) in that narrow band. Does NOT touch cop_x/cop_y for
+    # translational force use elsewhere.
+    aoa_gate_ok = True
+    aoa_gate_threshold = flags.get("aero_torque_aoa_gate_deg")
+    if aoa_gate_threshold is not None:
+        v_now = math.hypot(vx, vy)
+        if v_now > 1e-9:
+            heading_now = math.atan2(vy, vx)
+            aoa_now = _wrap180((theta + 90.0) - math.degrees(heading_now))
+            # H9 refinement (2026-09-08): only gate during a genuinely
+            # calm/ballistic moment -- also require no active turn
+            # command (|turn_axis_now| small), so a momentary AoA~0
+            # crossing DURING a real commanded turn is NOT gated off
+            # (that's a different regime with real dynamics, confirmed
+            # this session: gating unconditionally hurt turn-inclusive
+            # windows even though it fixed pure-coast windows cleanly).
+            turn_axis_now = flags.get("_current_turn_axis", 0.0)
+            cooldown_s = flags.get("aero_torque_aoa_gate_cooldown_s", 0.0)
+            if abs(turn_axis_now) >= 0.1:
+                flags["_last_turn_t"] = flags.get("_sim_t_now", 0.0)
+            t_since_turn = flags.get("_sim_t_now", 0.0) - flags.get("_last_turn_t", -1e9)
+            if abs(aoa_now) < aoa_gate_threshold and abs(turn_axis_now) < 0.1 and t_since_turn >= cooldown_s:
+                aoa_gate_ok = False
+
     fx_thr, fy_thr, mass_flow_engines, engine_levers = _engine_thrust(
         theta, engines, gimbal_times, isp_multiplier, flags["thrust"], flags["fuel_burn"],
         throttle_override)
@@ -967,7 +1013,7 @@ def _derivative(state: tuple, body: dict, aoa_table: Optional[dict],
     if inertia_now is not None and com_now is not None and inertia_now > 1e-9:
         comx, comy = com_now
         torque_z = 0.0
-        if flags["aero_torque"] and cop_x is not None:
+        if flags["aero_torque"] and cop_x is not None and aoa_gate_ok:
             torque_z += (cop_x - comx) * fy_aero - (cop_y - comy) * fx_aero
         if flags["thrust"]:
             for lx, ly, fx, fy in engine_levers:
@@ -1296,6 +1342,8 @@ def forward_simulate(start: dict, duration_s: float, dt: float = 0.25,
         else:
             turn_axis = compute_turn_axis(omega0, m0, torque_effective_now, dt)
             directional_axis_now = (0.0, 0.0)
+        flags["_current_turn_axis"] = turn_axis  # H9: gate needs this each step
+        flags["_sim_t_now"] = t_after  # H10: cooldown timer needs current sim time
 
         # 2026-09-07 H_final1 test (see python_changelog.md) -- Unity's
         # OWN documentation confirms script execution order between
@@ -1487,6 +1535,69 @@ def _infer_sample_dt(rows: list, start_idx: int) -> float:
     return 1.0 / 60.0  # last-resort fallback, matches this project's known standard physics rate
 
 
+def _normalize_camelcase_telemetry(rows: list) -> None:
+    """Mutates every row in place, adding the underscore/dotted keys this
+    module's loaders require (output_TurnAxisTorque, output_
+    DirectionalAxis.x/y, location.position.x/y, location.velocity.x/y,
+    rb2d.mass/rotation/angularVelocity) from the camelCase/short names
+    full-mode telemetry actually records (outputTurnAxisTorque,
+    directionalAxisX/Y, px/py, vx/vy, m, rot, angv) -- ONLY when the
+    underscore key isn't already present, so an already-converted
+    (_compat.jsonl) file is left untouched (every underscore key it
+    already has is skipped, this is a no-op on those files).
+
+    2026-09-11: promotes analysis/convert_flight_compat_keys.py's exact
+    mapping (see that script's own docstring for the discovery story --
+    2026-09-09's live-verification session found the raw archived .gz
+    format uses camelCase, confirmed by decompressing it directly rather
+    than trusting a display tool) into forward_sim.py itself, so a raw
+    archived flight works directly with test_against_run/
+    test_against_run_trajectory without a manual separate conversion
+    pass first -- that script and its pre-generated _compat.jsonl files
+    remain valid, this just makes the conversion step optional rather
+    than mandatory.
+
+    turnAxis fallback: prefers the REAL resolved outputTurnAxisTorque
+    (v0.64.0+ mod) over the raw turnAxis field when both are present --
+    matches convert_flight_compat_keys.py's own preference and the
+    2026-09-07 H1/SAS finding (raw turnAxis reads 0 the instant a player
+    releases the stick even while SAS is actually fully saturated).
+
+    Does NOT flatten engines[0].throttleOut into a top-level key the way
+    the standalone script does -- that field is confirmed unreliable
+    (reads 0 even mid-burn, see python_changelog.md's 2026-09-09 entry);
+    callers should pass throttle_field="thr" instead, which is already
+    top-level and needs no normalization."""
+    if not rows:
+        return
+    if "output_TurnAxisTorque" in rows[0]:
+        return  # already has the keys this module needs -- nothing to do
+    for r in rows:
+        if "output_TurnAxisTorque" not in r:
+            if "outputTurnAxisTorque" in r:
+                r["output_TurnAxisTorque"] = r["outputTurnAxisTorque"]
+            elif "turnAxis" in r:
+                r["output_TurnAxisTorque"] = r["turnAxis"]
+        if "output_DirectionalAxis.x" not in r and "directionalAxisX" in r:
+            r["output_DirectionalAxis.x"] = r["directionalAxisX"]
+        if "output_DirectionalAxis.y" not in r and "directionalAxisY" in r:
+            r["output_DirectionalAxis.y"] = r["directionalAxisY"]
+        if "location.position.x" not in r and "px" in r:
+            r["location.position.x"] = r["px"]
+        if "location.position.y" not in r and "py" in r:
+            r["location.position.y"] = r["py"]
+        if "location.velocity.x" not in r and "vx" in r:
+            r["location.velocity.x"] = r["vx"]
+        if "location.velocity.y" not in r and "vy" in r:
+            r["location.velocity.y"] = r["vy"]
+        if "rb2d.mass" not in r and "m" in r:
+            r["rb2d.mass"] = r["m"]
+        if "rb2d.rotation" not in r and "rot" in r:
+            r["rb2d.rotation"] = r["rot"]
+        if "rb2d.angularVelocity" not in r and "angv" in r:
+            r["rb2d.angularVelocity"] = r["angv"]
+
+
 class ControlSchedule:
     """Wraps REAL recorded control INPUTS/OUTPUTS from a flight's
     telemetry, exposed as sim-relative-time -> value lookups.
@@ -1638,6 +1749,72 @@ class ControlSchedule:
         return (da, capx - comx, capy - comy)
 
 
+class HypotheticalControlSchedule:
+    """Feeds forward_simulate() a MADE-UP control sequence instead of
+    replaying a real flight's recorded inputs -- the missing piece
+    identified 2026-09-11 that lets a caller ask "if I did X, what
+    would happen?" instead of only being able to check "did the
+    physics predict correctly for what already happened?"
+    (test_against_run's job, unchanged by this class). Implements the
+    exact same duck-typed interface forward_simulate() already calls
+    on a real ControlSchedule -- .throttle(t), .turn_axis(t),
+    .directional_axis(t), .real_aero(t) -- so it's a drop-in swap, no
+    changes needed to forward_simulate/_derivative/_rk4_step at all.
+
+    Step-function semantics (matches ControlSchedule's own documented
+    reasoning): a real control input is discontinuous between game
+    ticks, so waypoints are HELD, not interpolated between -- picking a
+    waypoint density finer than you actually intend to change inputs is
+    the caller's job, not something this class should paper over by
+    fabricating in-between values.
+
+    waypoints: list of dicts, each with a required "t" (seconds,
+    sim-relative, same clock as forward_simulate's own t) and any
+    subset of "throttle" (0-1, or None for "no signal, use
+    craft_config's constant"), "turn_axis" (-1 to 1), "directional_axis"
+    ((x, y) tuple, WORLD frame). Any field a waypoint doesn't specify
+    carries forward unchanged from the previous waypoint (or this
+    schedule's own default_* value before the first waypoint that sets
+    it) -- lets a caller write e.g. {"t": 5.0, "turn_axis": 0.5} without
+    repeating throttle. Waypoints are sorted by t at construction;
+    out-of-order input is accepted, not an error.
+
+    real_aero() always returns None -- there's no REAL per-tick
+    dragArea/CoP to report for a state that hasn't happened yet, so
+    this correctly forces forward_simulate to fall back to its own
+    AoA-table aero model even if a caller mistakenly passes
+    use_real_aero=True alongside a hypothetical schedule."""
+
+    def __init__(self, waypoints: list, default_throttle: Optional[float] = None,
+                 default_turn_axis: float = 0.0,
+                 default_directional_axis: tuple[float, float] = (0.0, 0.0)):
+        self._waypoints = sorted(waypoints, key=lambda w: w["t"])
+        self._default_throttle = default_throttle
+        self._default_turn_axis = default_turn_axis
+        self._default_directional_axis = default_directional_axis
+
+    def _resolve(self, t: float, key: str, default):
+        value = default
+        for wp in self._waypoints:
+            if wp["t"] > t:
+                break
+            if key in wp:
+                value = wp[key]
+        return value
+
+    def throttle(self, t: float) -> Optional[float]:
+        return self._resolve(t, "throttle", self._default_throttle)
+
+    def turn_axis(self, t: float) -> float:
+        return self._resolve(t, "turn_axis", self._default_turn_axis)
+
+    def directional_axis(self, t: float) -> tuple[float, float]:
+        return self._resolve(t, "directional_axis", self._default_directional_axis)
+
+    def real_aero(self, t: float):
+        return None
+
+
 def load_control_schedule(flight_jsonl_path: str, start_t: float = 0.0,
                           sample_dt: Optional[float] = None,
                           throttle_field: Optional[str] = None) -> ControlSchedule:
@@ -1671,6 +1848,7 @@ def load_control_schedule(flight_jsonl_path: str, start_t: float = 0.0,
     rows = st.load_samples(Path(flight_jsonl_path))
     if not rows:
         raise ValueError(f"no samples found in {flight_jsonl_path}")
+    _normalize_camelcase_telemetry(rows)
     if "output_TurnAxisTorque" not in rows[0] or "output_DirectionalAxis.x" not in rows[0]:
         raise ValueError(
             f"{flight_jsonl_path} is missing output_TurnAxisTorque and/or "
@@ -1873,6 +2051,7 @@ def _prepare_replay(flight_jsonl_path: str, craft_config_path: str,
     rows = st.load_samples(Path(flight_jsonl_path))
     if not rows:
         raise ValueError(f"no samples found in {flight_jsonl_path}")
+    _normalize_camelcase_telemetry(rows)
     if "output_TurnAxisTorque" not in rows[0] or "output_DirectionalAxis.x" not in rows[0]:
         raise ValueError(
             "flight file is missing output_TurnAxisTorque / output_DirectionalAxis.x -- "
