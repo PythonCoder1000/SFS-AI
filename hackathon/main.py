@@ -2,12 +2,11 @@ import weave
 
 weave.init("sfs-ai-hackathon")
 
-# Entry point for the hackathon build.
-# Controller lives in controller.py.
+from controller import run_ascent
 
 
 def main():
-    pass
+    run_ascent(target_altitude_m=20000.0)
 
 
 if __name__ == "__main__":
