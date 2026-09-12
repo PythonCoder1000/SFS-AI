@@ -167,11 +167,30 @@ def run_ascent(
     tolerance_m: float = 250.0,
     poll_hz: float = 5.0,
     max_duration_s: float = 300.0,
+    induce_fault_at_t: float = None,
+    induce_fault_duration_s: float = 3.0,
+    induce_fault_throttle: float = 0.0,
 ) -> dict:
     """Fly straight up to target_altitude_m. Returns the last observed
     snapshot. Checkpoint C: when the replan gate fires, this now
     actually calls the LLM supervisor and applies its correction --
     previously it only logged what the gate would have done.
+
+    induce_fault_at_t: if set, forces throttle to induce_fault_throttle
+    (default 0.0, a hard cutout) for induce_fault_duration_s seconds
+    starting at that many seconds into the flight -- simulates an
+    actuator fault so the residual/gate/supervisor loop has something
+    real to react to, for Checkpoint C's own exit test (spec sec 11:
+    "On an induced perturbation, residual crosses tolerance, LLM fires,
+    correction visibly shrinks the residual"). The fault overrides
+    EVERYTHING during its window (PD and any LLM correction alike) --
+    it's meant to model a real actuator that briefly can't respond, not
+    something the loop is expected to fight in real time. Nothing
+    special is needed for the recovery: by the time the prediction
+    issued before/during the fault actually resolves (PREDICT_HORIZON_S
+    later), the fault window has already closed on its own, so the
+    supervisor's correction naturally applies to the AFTERMATH, not a
+    fight against the fault itself.
 
     IMPORTANT, still true: there is NO guardrail gateway yet
     (Checkpoint D -- schema/staging-FSM/clamp/mandatory-predict-sanity-
@@ -288,7 +307,10 @@ def run_ascent(
             if abs(target_altitude_m - altitude_m) <= tolerance_m:
                 break
 
-            if override_throttle is not None and t_now < override_until_t:
+            if induce_fault_at_t is not None and induce_fault_at_t <= t_now < induce_fault_at_t + induce_fault_duration_s:
+                throttle = induce_fault_throttle
+                print(f"  [FAULT INJECTED] forcing throttle={throttle:.2f}  (t={t_now:.1f}s)")
+            elif override_throttle is not None and t_now < override_until_t:
                 throttle = override_throttle  # LLM correction still in its commit window
             else:
                 override_throttle = None
