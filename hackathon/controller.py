@@ -27,6 +27,7 @@ from agent_interface import observe, observe_to_state, act, predict  # noqa: E40
 from residual import (  # noqa: E402
     ReplanTrigger, ResidualTrend, compute_residual, classify_cause,
 )
+from supervisor import build_state_summary, call_supervisor  # noqa: E402
 
 EARTH_RADIUS_M = fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
 
@@ -167,9 +168,19 @@ def run_ascent(
     poll_hz: float = 5.0,
     max_duration_s: float = 300.0,
 ) -> dict:
-    """Fly straight up to target_altitude_m, zero LLM. Returns the last
-    observed snapshot. This is the Checkpoint B / Stage 0 fallback
-    demo -- must work standalone, no supervisor, no guardrail gateway.
+    """Fly straight up to target_altitude_m. Returns the last observed
+    snapshot. Checkpoint C: when the replan gate fires, this now
+    actually calls the LLM supervisor and applies its correction --
+    previously it only logged what the gate would have done.
+
+    IMPORTANT, still true: there is NO guardrail gateway yet
+    (Checkpoint D -- schema/staging-FSM/clamp/mandatory-predict-sanity-
+    check). A Correction's target_throttle goes straight to act(),
+    protected only by agent_interface.act()'s existing rate clamp
+    (MAX_THROTTLE_STEP=0.3/call) -- nothing here vets whether the LLM's
+    suggestion is actually a good idea. That's a deliberate, known gap
+    at this checkpoint, not an oversight -- don't leave this running
+    unsupervised.
 
     2026-09-12 live-test finding: `throttle <amount>` only sets
     throttlePercent -- it does NOT arm the rocket-wide master ignition
@@ -187,14 +198,17 @@ def run_ascent(
     t_start = time.monotonic()
     deadline = t_start + max_duration_s
 
-    # Checkpoint C wiring: rolling predict() -> compare -> classify -> gate.
-    # No LLM call happens on a fire yet -- this just proves the gate
-    # reacts correctly against a real flight before anything acts on it.
+    # Checkpoint C: rolling predict() -> compare -> classify -> gate -> LLM.
     trigger = ReplanTrigger()
     trigger.reset_phase("ASCENT")
     trend = ResidualTrend()
     pending_prediction = None  # {"due_t", "predicted_final", "confidence"}
     throttle_history = deque(maxlen=5)  # for actuator-saturation detection
+    cycle_id = 0
+    last_gate_fire_t = 0.0
+    recent_decisions = []  # cut to last 1 entry per state-summary schema's own cut order
+    override_throttle = None  # LLM correction currently being held, if any
+    override_until_t = 0.0
 
     last_snapshot = None
     try:
@@ -204,6 +218,7 @@ def run_ascent(
             altitude_m, vspeed = _altitude_and_vspeed(snapshot)
             t_now = time.monotonic() - t_start
             state_now = observe_to_state(snapshot)
+            cycle_id += 1
 
             maybe_stage(snapshot)  # no-op placeholder, see TODO above
 
@@ -214,7 +229,7 @@ def run_ascent(
             )
 
             # Consume a due prediction: compare it against reality, classify,
-            # and check the gate -- before issuing the next rolling prediction.
+            # check the gate, and call the LLM supervisor if it fires.
             if pending_prediction is not None and t_now >= pending_prediction["due_t"]:
                 res = compute_residual(pending_prediction["predicted_final"], state_now)
                 confidence = pending_prediction["confidence"]
@@ -229,12 +244,55 @@ def run_ascent(
                       f"spd_err={res['speed_error_mps']:5.1f}m/s "
                       f"trend={trend_info['trend']:<8} conf={confidence:<5} "
                       f"cause={cause:<20} gate={decision.reason}{marker}")
+
+                if decision.should_replan:
+                    time_since_last_replan_s = t_now - last_gate_fire_t  # BEFORE updating it below
+                    last_gate_fire_t = t_now
+                    pred_alt = math.hypot(pending_prediction["predicted_final"]["px"],
+                                           pending_prediction["predicted_final"]["py"]) - EARTH_RADIUS_M
+                    summary = build_state_summary(
+                        cycle_id=cycle_id, phase="ASCENT",
+                        altitude_m=altitude_m, vertical_speed_mps=vspeed,
+                        throttle=(override_throttle if override_throttle is not None
+                                  else throttle_history[-1] if throttle_history else 0.0),
+                        active_stage=_stage_state["expected_stage"],
+                        target_altitude_m=target_altitude_m, plan_issued_at_cycle=0,
+                        prediction_confidence=confidence, prediction_horizon_s=PREDICT_HORIZON_S,
+                        predicted_terminal_altitude_error_m=target_altitude_m - pred_alt,
+                        predicted_terminal_speed_error_mps=res["speed_error_mps"],
+                        position_error_m=res["position_error_m"], speed_error_mps=res["speed_error_mps"],
+                        residual_trend=trend_info["trend"], residual_slope=trend_info["residual_slope"],
+                        triggered_replan=True, causal_category=cause,
+                        time_in_phase_s=t_now, time_since_last_replan_s=time_since_last_replan_s,
+                        actuator_saturated=actuator_saturated, recent_decisions=recent_decisions,
+                    )
+                    correction = call_supervisor(summary, decision.reason)
+                    if correction is None:
+                        print("  [supervisor] no correction (no credentials, timeout, or "
+                              "malformed response) -- deterministic layer continues unchanged")
+                    elif correction.no_change:
+                        print(f"  [supervisor] keep current plan ({correction.reason_code}, "
+                              f"{correction.latency_ms:.0f}ms)")
+                    else:
+                        commit_s = (correction.commit_ms / 1000.0) if correction.commit_ms else 1.0
+                        override_throttle = correction.target_throttle
+                        override_until_t = t_now + commit_s
+                        print(f"  [supervisor] CORRECTION: throttle -> {correction.target_throttle:.2f} "
+                              f"({correction.reason_code}, hold {commit_s:.1f}s, "
+                              f"{correction.latency_ms:.0f}ms)")
+                    if correction is not None:
+                        recent_decisions = [correction.to_dict()]
+
                 pending_prediction = None
 
             if abs(target_altitude_m - altitude_m) <= tolerance_m:
                 break
 
-            throttle = controller.throttle_for(altitude_m, vspeed)
+            if override_throttle is not None and t_now < override_until_t:
+                throttle = override_throttle  # LLM correction still in its commit window
+            else:
+                override_throttle = None
+                throttle = controller.throttle_for(altitude_m, vspeed)
             act(f"throttle {throttle}")
             throttle_history.append(throttle)
             print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
@@ -259,7 +317,7 @@ def run_ascent(
         # hit, or an exception/KeyboardInterrupt -- never leave the last
         # commanded throttle running unattended. Matches the plan's own
         # "never an indefinite freeze" rule (sec 7.1), applied here even
-        # though the full expiry contract isn't built until Checkpoint C.
+        # though the full expiry contract isn't built until Checkpoint D.
         act("throttle 0")
 
     return last_snapshot
