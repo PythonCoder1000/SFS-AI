@@ -56,7 +56,7 @@ class AltitudePD:
     Straight-up ascent only: no turn axis input, rot/turn left at 0.
     """
 
-    def __init__(self, target_altitude_m: float, kp: float = 0.0006, kd: float = 0.05):
+    def __init__(self, target_altitude_m: float, kp: float = 0.0012, kd: float = 0.3):
         self.target_altitude_m = target_altitude_m
         self.kp = kp
         self.kd = kd
@@ -121,6 +121,7 @@ def run_ascent(
 
         throttle = controller.throttle_for(altitude_m, vspeed)
         act(f"throttle {throttle}")
+        print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
 
         time.sleep(dt)
 
