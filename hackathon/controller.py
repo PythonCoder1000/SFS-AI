@@ -24,14 +24,27 @@ EARTH_RADIUS_M = fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
 # Known safety-critical finding (see hackathon spec sec 1): firing all
 # engines at once destroys the rocket. Stages must be armed one at a
 # time, in order, via `stage <index>` -- never a blanket `ignite`.
+#
+# 2026-09-12 CONFIRMED, live-tested: `stage <index>` is NOT idempotent.
+# Repeated calls with the same index TOGGLE engineOn every single call
+# (True/False/True/False..., 100% reproducible over 7 calls). No parts
+# lost/separated (part count and mass stayed constant) -- unlike
+# `ignite`, this doesn't destroy anything -- but a duplicate or retried
+# `stage` call reaching the game mid-flight can silently kill already-
+# firing engines while the caller's own state still believes they're
+# armed. force_stage() below is safe BECAUSE it only ever increments
+# expected_stage and never re-sends the same index twice -- do not call
+# it more than once per stage, and do not build any retry/resend logic
+# around `stage` without accounting for this. See sfsprobe/mod_changelog.md
+# for the full writeup.
 _stage_state = {"expected_stage": 0}
 
-# TODO(Checkpoint B, open item): the real trigger condition for "this
-# stage is spent, advance" needs to be confirmed against live telemetry
-# (fuel/thrOn semantics per sfsprobe's actual field set) before this is
-# more than a manual/placeholder hook. Don't wire this to auto-fire
-# until that's verified -- see hackathon plan sec 9 on stage command
-# idempotency being an open, unverified gap.
+# TODO(Checkpoint B, open item): the trigger condition for "this stage
+# is spent, advance" still needs to be confirmed against live telemetry
+# (fuel/thrOn semantics) before this is more than a manual/placeholder
+# hook. The idempotency question above is now answered (it's NOT
+# idempotent) -- what's still open is knowing WHEN to call force_stage()
+# automatically, not whether repeat calls are safe (they aren't).
 def maybe_stage(snapshot: dict) -> None:
     """Placeholder hook -- currently a no-op. Call manually via
     force_stage() during testing until the real trigger is confirmed."""
