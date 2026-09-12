@@ -22,8 +22,45 @@ from typing import Optional
 
 import anthropic
 
-MODEL = "claude-sonnet-4-6"
+# Two swappable endpoints, per spec sec 7: "build/debug against Claude API
+# first... Keep both behind one swappable interface." This project adds a
+# third (AWS Bedrock) under the same switch, selected by which
+# credentials/env vars are actually present -- never hardcoded, so the
+# same code runs unmodified whichever credential shows up first.
+DIRECT_MODEL = "claude-sonnet-4-6"
+# Bedrock uses inference-profile IDs, not the plain API model string --
+# no -v1 suffix on 4.6-generation IDs. "global." routes to whichever AWS
+# region has capacity; swap for a region-prefixed id (e.g. "us.anthropic...")
+# if data residency matters for the deployment.
+BEDROCK_MODEL = "global.anthropic.claude-sonnet-4-6"
 DEFAULT_TIMEOUT_S = 1.2  # spec sec 7: ~0.8-1.5s starting value
+
+
+def _make_client(timeout_s: float):
+    """Picks a backend by which credentials are actually present --
+    ANTHROPIC_API_KEY first (spec's own stated preference: "better docs,
+    structured outputs confirmed stable, reliability while the rest of
+    the system is unstable"), then AWS credentials via boto3's normal
+    credential chain (env vars, ~/.aws/credentials, or an assumed role).
+    Returns (client, model_id, backend_name) or (None, None, None) if
+    neither is configured.
+    """
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        return anthropic.Anthropic(api_key=anthropic_key, timeout=timeout_s), DIRECT_MODEL, "direct"
+
+    aws_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    if aws_key:
+        # boto3's own credential chain still applies underneath (profile,
+        # instance role, etc.) -- checking the env var here is just the
+        # fast/common-case signal to decide WHICH backend to try, not the
+        # only way Bedrock creds could be supplied.
+        client = anthropic.AnthropicBedrock(
+            aws_region=os.environ.get("AWS_REGION", "us-east-1"), timeout=timeout_s,
+        )
+        return client, BEDROCK_MODEL, "bedrock"
+
+    return None, None, None
 
 # ---------------------------------------------------------------------------
 # State summary (spec sec 5) -- trimmed to what this project's controller
@@ -182,19 +219,22 @@ def _build_prompt(state_summary: dict, warm_start_reason: str) -> str:
 def call_supervisor(
     state_summary: dict,
     warm_start_reason: str,
-    api_key: Optional[str] = None,
-    model: str = MODEL,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> Optional[Correction]:
     """Returns a Correction, or None on timeout/error/malformed output --
     None means "fall back to the deterministic layer", never raises out
     to the caller. This function's whole job is to make sure a bad LLM
-    response can never break the flight loop."""
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return None  # no key configured -- fail safe to deterministic layer
+    response can never break the flight loop.
 
-    client = anthropic.Anthropic(api_key=key, timeout=timeout_s)
+    Backend is picked automatically by _make_client() based on whatever
+    credentials are actually present (ANTHROPIC_API_KEY or AWS creds) --
+    no key configured at all is itself just another safe-fallback case,
+    same as a timeout or malformed response.
+    """
+    client, model, backend = _make_client(timeout_s)
+    if client is None:
+        return None  # no credentials configured -- fail safe to deterministic layer
+
     t0 = time.monotonic()
     try:
         response = client.messages.create(
@@ -209,20 +249,20 @@ def call_supervisor(
         # rate limit, API error, whatever -- ALL of them mean "fall back",
         # none of them should propagate and break the flight loop.
         latency_ms = (time.monotonic() - t0) * 1000
-        print(f"  [supervisor] call failed ({type(e).__name__}: {e}) after {latency_ms:.0f}ms -- falling back")
+        print(f"  [supervisor:{backend}] call failed ({type(e).__name__}: {e}) after {latency_ms:.0f}ms -- falling back")
         return None
 
     latency_ms = (time.monotonic() - t0) * 1000
 
     tool_use = next((b for b in response.content if b.type == "tool_use"), None)
     if tool_use is None:
-        print(f"  [supervisor] no tool_use block in response after {latency_ms:.0f}ms -- falling back")
+        print(f"  [supervisor:{backend}] no tool_use block in response after {latency_ms:.0f}ms -- falling back")
         return None
 
     try:
         return _validate_and_build(tool_use.input, latency_ms)
     except (KeyError, TypeError, ValueError) as e:
-        print(f"  [supervisor] malformed tool input ({e}) after {latency_ms:.0f}ms -- falling back")
+        print(f"  [supervisor:{backend}] malformed tool input ({e}) after {latency_ms:.0f}ms -- falling back")
         return None
 
 
@@ -297,7 +337,8 @@ if __name__ == "__main__":
         c = _validate_and_build(good, latency_ms=123.4)
         print(f"  OK -- {c}")
 
-    print("\n=== call_supervisor with no API key (should fail safe to None) ===")
+    print("\n=== call_supervisor with no credentials configured (should fail safe to None) ===")
+    saved_env = {k: os.environ.pop(k, None) for k in ("ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID")}
     dummy_summary = build_state_summary(
         cycle_id=1, phase="ASCENT", altitude_m=5000.0, vertical_speed_mps=200.0,
         throttle=0.5, active_stage=0, target_altitude_m=20000.0, plan_issued_at_cycle=0,
@@ -307,7 +348,10 @@ if __name__ == "__main__":
         residual_slope=10.0, triggered_replan=True, causal_category="underperformance",
         time_in_phase_s=20.0, time_since_last_replan_s=999.0, actuator_saturated=False,
     )
-    result = call_supervisor(dummy_summary, "residual_threshold", api_key="")
-    print(f"  result: {result}  (expected None -- no key)")
-    assert result is None, "expected None with no API key"
+    result = call_supervisor(dummy_summary, "residual_threshold")
+    print(f"  result: {result}  (expected None -- no credentials)")
+    assert result is None, "expected None with no credentials configured"
     print("  OK")
+    for k, v in saved_env.items():
+        if v is not None:
+            os.environ[k] = v
