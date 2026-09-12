@@ -227,9 +227,20 @@ def predict(state: dict, waypoints: Optional[list] = None, duration_s: float = 1
         default_directional_axis=default_directional_axis,
     )
 
+    # 2026-09-12 fix: forward_simulate() takes inertia/com_local as
+    # SEPARATE top-level kwargs -- it does not read them out of
+    # craft_config itself. Omitting them silently zeroed all rotational
+    # and aerodynamic-torque dynamics on every predict() call (the
+    # aero_torque_aoa_gate_deg flag set above had nothing to gate).
+    # load_craft_config_from_getforwardstartinfo() already puts both
+    # keys in craft_config, so this is just wiring them through.
+    inertia = (craft_config or {}).get("inertia")
+    com_local = (craft_config or {}).get("com_local")
+
     trajectory = fsim.forward_simulate(
         state, duration_s, dt=dt, body_name=body_name,
         aoa_table=aoa_table, craft_config=craft_config,
+        inertia=inertia, com_local=com_local,
         control_schedule=schedule, flags=resolved_flags,
     )
 
