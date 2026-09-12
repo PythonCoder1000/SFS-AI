@@ -54,17 +54,49 @@ def force_stage() -> str:
 class AltitudePD:
     """PD controller on altitude error, damped by vertical speed.
     Straight-up ascent only: no turn axis input, rot/turn left at 0.
+
+    2026-09-12 live-test finding: raw tick-to-tick vspeed noise (a
+    few m/s) was getting amplified by kd into near-full-range throttle
+    swings (0.84 -> 1.00 -> 0.01 across 3 ticks, from only a 3.4 m/s
+    vspeed change) -- classic chattering, called out as the most likely
+    visible demo failure in the hackathon plan itself. Fixed with an
+    exponential moving average on vspeed (smooths the noise kd reacts
+    to) plus a deadband on the final throttle (holds the last commanded
+    value if the new computed value hasn't moved far enough to matter).
     """
 
-    def __init__(self, target_altitude_m: float, kp: float = 0.0012, kd: float = 0.3):
+    def __init__(
+        self,
+        target_altitude_m: float,
+        kp: float = 0.0012,
+        kd: float = 0.3,
+        deadband: float = 0.05,
+        vspeed_smoothing: float = 0.3,
+    ):
         self.target_altitude_m = target_altitude_m
         self.kp = kp
         self.kd = kd
+        self.deadband = deadband
+        self.vspeed_smoothing = vspeed_smoothing  # EMA alpha, 0-1: lower = smoother/laggier
+        self._smoothed_vspeed = None
+        self._last_throttle = 0.0
 
     def throttle_for(self, altitude_m: float, vertical_speed_mps: float) -> float:
+        if self._smoothed_vspeed is None:
+            self._smoothed_vspeed = vertical_speed_mps
+        else:
+            a = self.vspeed_smoothing
+            self._smoothed_vspeed = a * vertical_speed_mps + (1 - a) * self._smoothed_vspeed
+
         alt_error = self.target_altitude_m - altitude_m
-        raw = self.kp * alt_error - self.kd * vertical_speed_mps
-        return max(0.0, min(1.0, raw))
+        raw = self.kp * alt_error - self.kd * self._smoothed_vspeed
+        clamped = max(0.0, min(1.0, raw))
+
+        if abs(clamped - self._last_throttle) < self.deadband:
+            return self._last_throttle  # hold -- change too small to bother
+
+        self._last_throttle = clamped
+        return clamped
 
 
 def _altitude_and_vspeed(snapshot: dict) -> tuple[float, float]:
@@ -108,22 +140,29 @@ def run_ascent(
     deadline = time.monotonic() + max_duration_s
 
     last_snapshot = None
-    while time.monotonic() < deadline:
-        snapshot = observe()
-        last_snapshot = snapshot
-        altitude_m, vspeed = _altitude_and_vspeed(snapshot)
+    try:
+        while time.monotonic() < deadline:
+            snapshot = observe()
+            last_snapshot = snapshot
+            altitude_m, vspeed = _altitude_and_vspeed(snapshot)
 
-        maybe_stage(snapshot)  # no-op placeholder, see TODO above
+            maybe_stage(snapshot)  # no-op placeholder, see TODO above
 
-        if abs(target_altitude_m - altitude_m) <= tolerance_m:
-            act("throttle 0")
-            break
+            if abs(target_altitude_m - altitude_m) <= tolerance_m:
+                break
 
-        throttle = controller.throttle_for(altitude_m, vspeed)
-        act(f"throttle {throttle}")
-        print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
+            throttle = controller.throttle_for(altitude_m, vspeed)
+            act(f"throttle {throttle}")
+            print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
 
-        time.sleep(dt)
+            time.sleep(dt)
+    finally:
+        # Always cut throttle on the way out -- tolerance reached, timeout
+        # hit, or an exception/KeyboardInterrupt -- never leave the last
+        # commanded throttle running unattended. Matches the plan's own
+        # "never an indefinite freeze" rule (sec 7.1), applied here even
+        # though the full expiry contract isn't built until Checkpoint C.
+        act("throttle 0")
 
     return last_snapshot
 
