@@ -90,7 +90,19 @@ def run_ascent(
 ) -> dict:
     """Fly straight up to target_altitude_m, zero LLM. Returns the last
     observed snapshot. This is the Checkpoint B / Stage 0 fallback
-    demo -- must work standalone, no supervisor, no guardrail gateway."""
+    demo -- must work standalone, no supervisor, no guardrail gateway.
+
+    2026-09-12 live-test finding: `throttle <amount>` only sets
+    throttlePercent -- it does NOT arm the rocket-wide master ignition
+    switch (throttleOn). Without `master on`, engines report engineOn
+    and accept throttle commands but produce zero real thrust
+    (throttleOut stayed 0 through several throttle calls in testing).
+    `master on` is idempotent and rocket-wide (independent of per-
+    engine state and of staging), so it's safe to send unconditionally
+    at the start of every run, not just once ever.
+    """
+    act("master on")
+
     controller = AltitudePD(target_altitude_m)
     dt = 1.0 / poll_hz
     deadline = time.monotonic() + max_duration_s
