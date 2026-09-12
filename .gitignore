@@ -18,6 +18,9 @@ __pycache__/
 # macOS
 .DS_Store
 
+# Secrets -- API keys, never commit
+.env
+
 # Local working-procedure notes -- not for the repo
 analysis/prediction_demo_data.json
 bookkeeping/active_state.md

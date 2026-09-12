@@ -21,6 +21,9 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()  # picks up .env in the repo root (or CWD) if present -- see .env.example
 
 # Two swappable endpoints, per spec sec 7: "build/debug against Claude API
 # first... Keep both behind one swappable interface." This project adds a
