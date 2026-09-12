@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+import weave
+
 
 class RejectionCause(str, Enum):
     SCHEMA_INVALID = "schema_invalid"
@@ -150,6 +152,7 @@ class GuardrailGateway:
     def __init__(self, staging_gate: Optional[StagingGate] = None):
         self.staging_gate = staging_gate or StagingGate()
 
+    @weave.op()
     def evaluate(
         self, correction, expected_stage: int, now_s: float,
         current_state: dict, craft_config: dict, aoa_table: dict, predict_fn,

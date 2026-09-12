@@ -18,11 +18,14 @@ import math
 from collections import deque
 from typing import Optional
 
+import weave
+
 
 # ---------------------------------------------------------------------------
 # Residual detector
 # ---------------------------------------------------------------------------
 
+@weave.op()
 def compute_residual(predicted_final: dict, actual_state: dict) -> dict:
     """Compare a predict() call's predicted final state against what
     observe() actually shows at that same point in time.
@@ -87,6 +90,7 @@ CAUSAL_CATEGORIES = (
 )
 
 
+@weave.op()
 def classify_cause(
     position_error_m: float,
     speed_error_mps: float,
@@ -184,6 +188,7 @@ class ReplanTrigger:
         self._in_violation = False
         self._consecutive_above = 0
 
+    @weave.op()
     def update(self, residual_m: float, now_s: float, confidence: str) -> TriggerDecision:
         if not self._seen_first_tick:
             # Seed the cooldown/heartbeat clocks from the first real

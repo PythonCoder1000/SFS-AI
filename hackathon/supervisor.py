@@ -21,6 +21,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 import anthropic
+import weave
 from dotenv import load_dotenv
 
 load_dotenv()  # picks up .env in the repo root (or CWD) if present -- see .env.example
@@ -245,6 +246,7 @@ def _build_prompt(state_summary: dict, warm_start_reason: str) -> str:
     )
 
 
+@weave.op()
 def call_supervisor(
     state_summary: dict,
     warm_start_reason: str,

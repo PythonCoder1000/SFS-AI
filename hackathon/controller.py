@@ -14,10 +14,16 @@ plumbing (see its own docstring), not something we rebuild here.
 
 import json
 import math
+import os
 import sys
 import time
 from collections import deque
 from pathlib import Path
+
+import weave
+from dotenv import load_dotenv
+
+load_dotenv()  # picks up .env in the repo root (or CWD) if present -- see .env.example
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "analysis"))
@@ -30,7 +36,82 @@ from residual import (  # noqa: E402
 from supervisor import build_state_summary, call_supervisor  # noqa: E402
 from gateway import GuardrailGateway, DisablementLatch  # noqa: E402
 
+# Eligibility requirement (spec sec 0) -- get this in on day one so a time
+# crunch can never make the project ineligible. 2026-09-12 finding: calling
+# weave.init() with no WANDB_API_KEY configured does NOT fail cleanly -- it
+# blocks waiting on an interactive `wandb login` prompt for a key paste,
+# which hangs forever in any non-interactive context (this exact script,
+# any script that imports it, a live flight run). Guarded the same way as
+# the Anthropic/AWS credentials in supervisor.py: skip cleanly with a clear
+# message if the key isn't there yet, rather than silently hanging.
+if os.environ.get("WANDB_API_KEY"):
+    weave.init("sfs-ai-hackathon")
+else:
+    print("[weave] WANDB_API_KEY not set -- skipping weave.init(), "
+          "@weave.op() calls will no-op (no tracing, but nothing hangs or breaks). "
+          "Add WANDB_API_KEY to .env to enable real Weave logging.")
+
 EARTH_RADIUS_M = fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
+
+
+# --- Weave-traced wrappers around agent_interface.py's observe/act/predict -
+# Spec sec 10: "@weave.op() on: observe, predict, ... act()." agent_interface.py
+# is pre-existing plumbing (see its own docstring) that this project
+# deliberately doesn't modify -- these thin wrappers add tracing at the call
+# site instead of touching that file. NOT applied to anything inside the
+# fast-loop's own internal ticks (the while loop body itself, print
+# statements, etc.) -- only these three named boundary calls, matching the
+# spec's "not on the fast-loop's internal ticks" instruction.
+@weave.op()
+def traced_observe():
+    return observe()
+
+
+@weave.op()
+def traced_act(command: str):
+    return act(command)
+
+
+@weave.op()
+def traced_predict(state, **kwargs):
+    return predict(state, **kwargs)
+
+
+@weave.op()
+def log_cycle_decision(
+    cycle_id: int, replan_trigger_reason: str, llm_latency_ms: float,
+    proposed_action: dict, accepted_action: dict, rejection_cause,
+    fallback_used: bool,
+) -> dict:
+    """One traced call per replan cycle bundling exactly the fields spec
+    sec 10 asks for beyond the raw op traces -- proposed vs accepted
+    action side by side is what makes a Weave decision-markers panel
+    possible without cross-referencing multiple separate traces."""
+    return {
+        "cycle_id": cycle_id, "replan_trigger_reason": replan_trigger_reason,
+        "llm_latency_ms": llm_latency_ms, "proposed_action": proposed_action,
+        "accepted_action": accepted_action, "rejection_cause": rejection_cause,
+        "fallback_used": fallback_used,
+    }
+
+
+@weave.op()
+def log_correction_effectiveness(
+    cycle_id: int, error_before_replan: float, error_after_replan: float,
+    correction_effectiveness: float, correction_harm_rate: float,
+) -> dict:
+    """Headline metric (spec sec 10): correction_effectiveness =
+    error_before_replan - error_after_replan, reported ALONGSIDE
+    correction_harm_rate (how often a replan makes it worse), never
+    just the effectiveness number alone -- a system that helps 90% of
+    the time but catastrophically hurts the other 10% looks great on
+    effectiveness alone and isn't."""
+    return {
+        "cycle_id": cycle_id, "error_before_replan": error_before_replan,
+        "error_after_replan": error_after_replan,
+        "correction_effectiveness": correction_effectiveness,
+        "correction_harm_rate": correction_harm_rate,
+    }
 
 # Real craft config + AoA table -- captured live from THIS craft
 # (2026-09-12, getforwardstartinfo hackathon_idle / hackathon_firing)
@@ -84,7 +165,7 @@ def force_stage() -> str:
     (hackathon plan sec 9), even though the full gateway isn't built
     yet at this checkpoint."""
     idx = _stage_state["expected_stage"]
-    result = act(f"stage {idx}")
+    result = traced_act(f"stage {idx}")
     _stage_state["expected_stage"] += 1
     return result
 
@@ -211,7 +292,7 @@ def run_ascent(
     engine state and of staging), so it's safe to send unconditionally
     at the start of every run, not just once ever.
     """
-    act("master on")
+    traced_act("master on")
 
     controller = AltitudePD(target_altitude_m)
     dt = 1.0 / poll_hz
@@ -234,11 +315,16 @@ def run_ascent(
     recent_decisions = []  # cut to last 1 entry per state-summary schema's own cut order
     override_throttle = None  # LLM correction currently being held, if any
     override_until_t = 0.0
+    # Weave sec 10 headline metric tracking: measured one cycle after a
+    # correction is actually applied, against THAT cycle's fresh residual.
+    pending_effectiveness = None  # {"error_before", "fired_at_t"}
+    total_corrections = 0
+    harm_count = 0
 
     last_snapshot = None
     try:
         while time.monotonic() < deadline:
-            snapshot = observe()
+            snapshot = traced_observe()
             last_snapshot = snapshot
             altitude_m, vspeed = _altitude_and_vspeed(snapshot)
             t_now = time.monotonic() - t_start
@@ -257,6 +343,25 @@ def run_ascent(
             # check the gate, and call the LLM supervisor if it fires.
             if pending_prediction is not None and t_now >= pending_prediction["due_t"]:
                 res = compute_residual(pending_prediction["predicted_final"], state_now)
+
+                # Weave sec 10 headline metric: did the LAST correction we
+                # applied actually help? Measured against THIS cycle's fresh
+                # residual, one cycle after it fired.
+                if pending_effectiveness is not None:
+                    error_before = pending_effectiveness["error_before"]
+                    error_after = res["position_error_m"]
+                    effectiveness = error_before - error_after
+                    total_corrections += 1
+                    if effectiveness < 0:
+                        harm_count += 1
+                    harm_rate = harm_count / total_corrections
+                    print(f"  [effectiveness] error_before={error_before:.1f}m "
+                          f"error_after={error_after:.1f}m effectiveness={effectiveness:+.1f}m "
+                          f"harm_rate={harm_rate:.2f} ({harm_count}/{total_corrections})")
+                    log_correction_effectiveness(cycle_id, error_before, error_after,
+                                                  effectiveness, harm_rate)
+                    pending_effectiveness = None
+
                 confidence = pending_prediction["confidence"]
                 trend_info = trend.update(t_now, res["position_error_m"])
                 cause = classify_cause(
@@ -296,8 +401,17 @@ def run_ascent(
                         print("  [gateway] LLM authority DISABLED for this phase "
                               "(sustained rejections) -- skipping supervisor call")
                         correction = None
+                        proposed_action_dict = None
+                        rejection_cause_value = None
+                        llm_latency_total_ms = 0.0
                     else:
+                        proposed_action_dict = None
+                        rejection_cause_value = None
+                        llm_latency_total_ms = 0.0
                         correction = call_supervisor(summary, decision.reason)
+                        if correction is not None:
+                            proposed_action_dict = correction.to_dict()
+                            llm_latency_total_ms += correction.latency_ms
                         if correction is not None and not correction.no_change:
                             gdecision = gateway.evaluate(
                                 correction, expected_stage=_stage_state["expected_stage"], now_s=t_now,
@@ -306,6 +420,7 @@ def run_ascent(
                             if not gdecision.accepted:
                                 print(f"  [gateway] REJECTED ({gdecision.cause.value}): {gdecision.detail} "
                                       f"-- retrying once with cause fed back")
+                                rejection_cause_value = gdecision.cause.value
                                 latch.record_rejection(gdecision.cause, "ASCENT", altitude_m)
                                 retry_reason = (
                                     f"{decision.reason}; PREVIOUS PROPOSAL REJECTED by the guardrail gateway: "
@@ -313,6 +428,8 @@ def run_ascent(
                                     f"different, or keep the current plan."
                                 )
                                 correction2 = call_supervisor(summary, retry_reason)
+                                if correction2 is not None:
+                                    llm_latency_total_ms += correction2.latency_ms
                                 if correction2 is not None and not correction2.no_change:
                                     gdecision2 = gateway.evaluate(
                                         correction2, expected_stage=_stage_state["expected_stage"], now_s=t_now,
@@ -323,6 +440,7 @@ def run_ascent(
                                     else:
                                         print(f"  [gateway] retry REJECTED again ({gdecision2.cause.value}) "
                                               f"-- deterministic safe-hold this cycle")
+                                        rejection_cause_value = gdecision2.cause.value
                                         latch.record_rejection(gdecision2.cause, "ASCENT", altitude_m)
                                         correction = None  # safe-hold: PD keeps flying, no LLM throttle applied
                                 else:
@@ -340,11 +458,20 @@ def run_ascent(
                         commit_s = (correction.commit_ms / 1000.0) if correction.commit_ms else 1.0
                         override_throttle = correction.target_throttle
                         override_until_t = t_now + commit_s
+                        pending_effectiveness = {"error_before": res["position_error_m"], "fired_at_t": t_now}
                         print(f"  [supervisor] CORRECTION: throttle -> {correction.target_throttle:.2f} "
                               f"({correction.reason_code}, hold {commit_s:.1f}s, "
                               f"{correction.latency_ms:.0f}ms)")
                     if correction is not None:
                         recent_decisions = [correction.to_dict()]
+
+                    log_cycle_decision(
+                        cycle_id=cycle_id, replan_trigger_reason=decision.reason,
+                        llm_latency_ms=llm_latency_total_ms, proposed_action=proposed_action_dict,
+                        accepted_action=(correction.to_dict() if correction is not None else None),
+                        rejection_cause=rejection_cause_value,
+                        fallback_used=(correction is None),
+                    )
 
                     # Arbitration: this tick's residual is the freshest stability signal --
                     # feed it to the latch regardless of what the supervisor/gateway did.
@@ -371,7 +498,7 @@ def run_ascent(
             # would resume from a stale value and jump the moment it regains
             # authority, instead of continuing smoothly from reality.
             controller._last_throttle = throttle
-            act(f"throttle {throttle}")
+            traced_act(f"throttle {throttle}")
             throttle_history.append(throttle)
             print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
 
@@ -379,7 +506,7 @@ def run_ascent(
             # PREDICT_HORIZON_S seconds with no further input, where do I end
             # up?" -- a hypothetical, not a real replay of the actual plan.
             if pending_prediction is None:
-                result = predict(
+                result = traced_predict(
                     state_now, waypoints=[], duration_s=PREDICT_HORIZON_S,
                     craft_config=CFG, aoa_table=AOA, default_throttle=throttle,
                 )
