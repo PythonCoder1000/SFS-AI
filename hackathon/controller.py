@@ -30,15 +30,18 @@ from residual import (  # noqa: E402
 
 EARTH_RADIUS_M = fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
 
-# Real craft config + AoA table, same source as offline_pd_test.py's
-# validated harness -- gives predict() the actual thrust/mass/drag
-# model instead of its crude no-config fallback, so residuals reflect
-# real prediction error, not "we didn't tell it what the rocket is".
+# Real craft config + AoA table -- captured live from THIS craft
+# (2026-09-12, getforwardstartinfo hackathon_idle / hackathon_firing)
+# after discovering the earlier borrowed config was a different, much
+# lighter craft (28.8t vs this rocket's real 116t) and gave inflated,
+# not-very-meaningful residuals. idle snapshot supplies mass/engine/
+# geometry; firing snapshot supplies the load-bearing torque values
+# (torqueEffectiveRaw jumps 5 -> 12.2 idle->firing on this craft).
 CFG = fsim.load_craft_config_from_getforwardstartinfo(
-    str(ROOT / "analysis/sfs_probe_forwardstartinfo_prediction_test.json"),
-    firing_snapshot_path=str(ROOT / "analysis/sfs_probe_forwardstartinfo_firing.json"))
+    str(ROOT / "analysis/sfs_probe_forwardstartinfo_hackathon_idle.json"),
+    firing_snapshot_path=str(ROOT / "analysis/sfs_probe_forwardstartinfo_hackathon_firing.json"))
 CFG["dry_mass_t"] = 8.0  # not in the dump; keeps fuel finite, matches offline harness
-AOA = json.load(open(ROOT / "analysis/aoa_dragarea_table_prediction_test_flight.json"))
+AOA = json.load(open(ROOT / "analysis/aoa_dragarea_table_hackathon.json"))
 
 PREDICT_HORIZON_S = 5.0  # how far ahead each rolling prediction looks
 
