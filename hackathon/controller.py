@@ -28,6 +28,7 @@ from residual import (  # noqa: E402
     ReplanTrigger, ResidualTrend, compute_residual, classify_cause,
 )
 from supervisor import build_state_summary, call_supervisor  # noqa: E402
+from gateway import GuardrailGateway, DisablementLatch  # noqa: E402
 
 EARTH_RADIUS_M = fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
 
@@ -218,9 +219,14 @@ def run_ascent(
     deadline = t_start + max_duration_s
 
     # Checkpoint C: rolling predict() -> compare -> classify -> gate -> LLM.
+    # Checkpoint D: every non-no_change Correction is vetted by the
+    # guardrail gateway before it can touch act() -- retry once with
+    # the rejection cause fed back, then deterministic safe-hold.
     trigger = ReplanTrigger()
     trigger.reset_phase("ASCENT")
     trend = ResidualTrend()
+    gateway = GuardrailGateway()
+    latch = DisablementLatch()
     pending_prediction = None  # {"due_t", "predicted_final", "confidence"}
     throttle_history = deque(maxlen=5)  # for actuator-saturation detection
     cycle_id = 0
@@ -285,10 +291,48 @@ def run_ascent(
                         time_in_phase_s=t_now, time_since_last_replan_s=time_since_last_replan_s,
                         actuator_saturated=actuator_saturated, recent_decisions=recent_decisions,
                     )
-                    correction = call_supervisor(summary, decision.reason)
+
+                    if latch.disabled:
+                        print("  [gateway] LLM authority DISABLED for this phase "
+                              "(sustained rejections) -- skipping supervisor call")
+                        correction = None
+                    else:
+                        correction = call_supervisor(summary, decision.reason)
+                        if correction is not None and not correction.no_change:
+                            gdecision = gateway.evaluate(
+                                correction, expected_stage=_stage_state["expected_stage"], now_s=t_now,
+                                current_state=state_now, craft_config=CFG, aoa_table=AOA, predict_fn=predict,
+                            )
+                            if not gdecision.accepted:
+                                print(f"  [gateway] REJECTED ({gdecision.cause.value}): {gdecision.detail} "
+                                      f"-- retrying once with cause fed back")
+                                latch.record_rejection(gdecision.cause, "ASCENT", altitude_m)
+                                retry_reason = (
+                                    f"{decision.reason}; PREVIOUS PROPOSAL REJECTED by the guardrail gateway: "
+                                    f"{gdecision.cause.value} ({gdecision.detail}). Propose something "
+                                    f"different, or keep the current plan."
+                                )
+                                correction2 = call_supervisor(summary, retry_reason)
+                                if correction2 is not None and not correction2.no_change:
+                                    gdecision2 = gateway.evaluate(
+                                        correction2, expected_stage=_stage_state["expected_stage"], now_s=t_now,
+                                        current_state=state_now, craft_config=CFG, aoa_table=AOA, predict_fn=predict,
+                                    )
+                                    if gdecision2.accepted:
+                                        correction = correction2
+                                    else:
+                                        print(f"  [gateway] retry REJECTED again ({gdecision2.cause.value}) "
+                                              f"-- deterministic safe-hold this cycle")
+                                        latch.record_rejection(gdecision2.cause, "ASCENT", altitude_m)
+                                        correction = None  # safe-hold: PD keeps flying, no LLM throttle applied
+                                else:
+                                    correction = correction2  # None or no_change both skip the gateway cleanly
+                            elif correction.stage_request is not None:
+                                force_stage()  # gateway-accepted staging action -- only ever expected_stage
+
                     if correction is None:
-                        print("  [supervisor] no correction (no credentials, timeout, or "
-                              "malformed response) -- deterministic layer continues unchanged")
+                        print("  [supervisor] no correction (no credentials, timeout, rejected twice, "
+                              "or malformed response) -- deterministic layer continues unchanged")
                     elif correction.no_change:
                         print(f"  [supervisor] keep current plan ({correction.reason_code}, "
                               f"{correction.latency_ms:.0f}ms)")
@@ -301,6 +345,11 @@ def run_ascent(
                               f"{correction.latency_ms:.0f}ms)")
                     if correction is not None:
                         recent_decisions = [correction.to_dict()]
+
+                    # Arbitration: this tick's residual is the freshest stability signal --
+                    # feed it to the latch regardless of what the supervisor/gateway did.
+                    residual_within_tolerance = res["position_error_m"] < trigger.clear_threshold_m
+                    latch.record_stable_tick("ASCENT", residual_within_tolerance)
 
                 pending_prediction = None
 
@@ -315,6 +364,13 @@ def run_ascent(
             else:
                 override_throttle = None
                 throttle = controller.throttle_for(altitude_m, vspeed)
+            # Bumpless handoff (spec sec 9): keep the deterministic controller's
+            # own internal state honest about what's ACTUALLY being commanded,
+            # even on ticks where the fault injector or an LLM correction is the
+            # one deciding. Without this, the PD's _last_throttle/deadband logic
+            # would resume from a stale value and jump the moment it regains
+            # authority, instead of continuing smoothly from reality.
+            controller._last_throttle = throttle
             act(f"throttle {throttle}")
             throttle_history.append(throttle)
             print(f"alt={altitude_m:8.1f}m  vspeed={vspeed:7.1f}m/s  throttle={throttle:.2f}")
