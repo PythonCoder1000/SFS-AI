@@ -197,6 +197,15 @@ SUPERVISOR_TOOL = {
                 "type": "integer",
                 "description": "How long (ms) this correction should be held before the next replan check is allowed to reconsider it.",
             },
+            "stage_request": {
+                "type": ["integer", "null"],
+                "description": (
+                    "Request to arm the next stage, or null for no staging action. "
+                    "Must be the CURRENT expected stage index -- the gateway will reject "
+                    "anything else. There is no 'ignite' option -- staging is the only way "
+                    "to arm engines, always one stage at a time."
+                ),
+            },
         },
         "required": ["no_change", "reason_code"],
     },
@@ -217,6 +226,7 @@ class Correction:
     reason_code: str
     target_throttle: Optional[float] = None
     commit_ms: Optional[int] = None
+    stage_request: Optional[int] = None
     latency_ms: float = 0.0
 
     def to_dict(self) -> dict:
@@ -317,9 +327,16 @@ def _validate_and_build(raw: dict, latency_ms: float) -> Correction:
         if commit_ms < 0:
             raise ValueError(f"commit_ms negative: {commit_ms}")
 
+    stage_request = raw.get("stage_request")
+    if stage_request is not None:
+        stage_request = int(stage_request)
+        if stage_request < 0:
+            raise ValueError(f"stage_request negative: {stage_request}")
+
     return Correction(
         no_change=False, reason_code=reason_code,
-        target_throttle=throttle, commit_ms=commit_ms, latency_ms=latency_ms,
+        target_throttle=throttle, commit_ms=commit_ms, stage_request=stage_request,
+        latency_ms=latency_ms,
     )
 
 
