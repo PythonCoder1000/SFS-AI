@@ -68,11 +68,20 @@ class AltitudePD:
     def __init__(
         self,
         target_altitude_m: float,
-        kp: float = 0.0012,
-        kd: float = 0.3,
+        kp: float = 0.002,
+        kd: float = 0.1,
         deadband: float = 0.05,
         vspeed_smoothing: float = 0.3,
     ):
+        """kp/kd retuned 2026-09-12 via hackathon/offline_pd_test.py's grid
+        sweep against forward_sim.py -- the earlier kd/kp=250 (chosen to
+        fix overshoot) turned out to overcorrect: it plateaued around
+        14-18km and never reached 20km target in 300-600s. Sweeping
+        kp x kd/kp ratio found kd/kp=50 reliably reaches the tolerance
+        band (~235-255s, landing within ~150m of target, low smooth
+        final throttle). This kp/kd pair was the sweep's best balance of
+        speed and precision -- see offline_pd_test.py for the full grid.
+        """
         self.target_altitude_m = target_altitude_m
         self.kp = kp
         self.kd = kd
