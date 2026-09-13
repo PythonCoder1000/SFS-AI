@@ -493,13 +493,28 @@ STAGE_CHECK_MENU = {
 # thrust can't undo an overshoot after the fact. After that fix,
 # OVERSHOOT re-tested at conf 0.99 (was 0.42).
 #
-# Floor set at 0.9 (Christian's explicit choice, stricter than every
-# other question class's bands -- see guardrail.BANDS) specifically to
-# avoid an accidental early stop: ending the pilot loop is not easily
-# reversible (see pilot_loop.py's PilotRun.task_complete_confirmed) the
-# way a single throttle/turn cycle is, so this question gets the
-# strictest bar in the whole system, deliberately tighter than even the
-# 'irreversible' class's 0.7 reject_below used for staging.
+# 2026-09-13 STILL LATER SAME DAY -- REMOVED the "still climbing with a
+# small coast_apoapsis_error_m" completion path entirely (criterion (2)
+# in the original version of this instructions text). Real live-flight
+# finding: this path fired at cycle 46 (conf 0.91) while the craft was
+# STILL CLIMBING at +220 m/s -- coast_apoapsis_m read close enough to
+# the 5000m target to look "done". The actual apex landed at ~4500m, a
+# real 10% undershoot. Root cause: compute_coast_apoapsis_m() is a
+# CLOSED-FORM BALLISTIC estimate that explicitly ignores drag (same
+# documented simplification used everywhere in this project) -- it
+# systematically overestimates real apex altitude once atmospheric drag
+# is decelerating the craft on the way up, and that overestimate is
+# exactly what made an undershoot-in-progress look like "close enough,
+# stop now". Trusting a still-climbing PREDICTION as grounds to stop
+# throttle control is the wrong call when more thrust genuinely could
+# have closed the gap -- Christian's explicit instruction: never end the
+# run on a still-climbing estimate, only on the craft ACTUALLY having
+# passed apex. Completion is now ONLY criterion (1) below -- confirmed,
+# not predicted, past-apex. This makes the task_status question strictly
+# more conservative than before (fewer cycles will read task_complete,
+# not more), which is the correct direction of error for a floor whose
+# whole design goal (0.9, stricter than every other class -- see
+# guardrail.BANDS) was avoiding an accidental early stop.
 TASK_STATUS_MENU = {
     "type": "choice",
     "instructions": (
@@ -513,33 +528,42 @@ TASK_STATUS_MENU = {
         "overshot or undershot the target by a wide margin is still "
         "DONE, and correctly task_complete, once nothing further can be "
         "done about it -- do not answer task_in_progress just because "
-        "the outcome wasn't close to ideal. Specifically: (1) if the "
-        "craft has already passed apoapsis and is now descending "
-        "(`state.vehicle.vertical_speed_mps` clearly negative), the task "
-        "is DONE regardless of how far off the peak altitude was from "
-        "the target -- thrust cannot undo an overshoot or add altitude "
-        "after the fact, so there is nothing left to control. (2) if the "
-        "craft is still climbing and `coast_apoapsis_error_m` is small "
-        "(roughly within a few percent of the target apoapsis), the task "
-        "is DONE -- coasting alone will land it close enough, no further "
-        "correction needed. (3) if the craft is still climbing with a "
-        "large negative coast_apoapsis_error_m, or is early in a hard "
-        "vertical climb, the task is clearly NOT done -- continued "
-        "throttle control still matters."
+        "the outcome wasn't close to ideal. THE ONLY VALID BASIS FOR "
+        "task_complete: the craft has ALREADY passed apoapsis and is "
+        "CONFIRMED now descending -- `state.vehicle.vertical_speed_mps` "
+        "clearly negative, an OBSERVED fact, not a prediction. At that "
+        "point the task is done regardless of how far off the peak "
+        "altitude was from the target -- thrust cannot undo an overshoot "
+        "or add altitude after the fact, so there is nothing left to "
+        "control. CRITICAL: a still-climbing craft is ALWAYS "
+        "task_in_progress, no matter how small `coast_apoapsis_error_m` "
+        "looks. Do NOT answer task_complete from a prediction that the "
+        "craft will coast close enough -- `coast_apoapsis_m` is a "
+        "closed-form estimate that ignores drag and can look deceptively "
+        "close to target while the craft is still climbing, well before "
+        "the real apex is known. A real live flight undershot by ~10% "
+        "(500m short of a 5000m target) specifically because task_status "
+        "stopped throttle control early on a still-climbing prediction "
+        "that looked done but wasn't -- do not repeat that mistake. If "
+        "`vertical_speed_mps` is positive (still climbing), even barely, "
+        "the answer is task_in_progress, full stop, regardless of how "
+        "small the predicted error looks."
     ),
     "criteria": {
-        "task_complete": "The ascent control task is DONE -- either the "
-            "craft has already passed apoapsis and is now descending (at "
-            "ANY altitude, whether that matched the target closely, "
-            "overshot, or undershot -- outcome quality is irrelevant "
-            "here), or it is still climbing with a small "
-            "coast_apoapsis_error_m such that coasting alone will finish "
-            "the job. No further throttle correction can usefully change "
-            "what happens.",
-        "task_in_progress": "The craft is still climbing and continued "
-            "throttle control can still meaningfully change the outcome "
-            "-- coast_apoapsis_error_m is not yet small, or the craft is "
-            "early in a hard vertical climb.",
+        "task_complete": "The craft has ALREADY passed apoapsis and is "
+            "CONFIRMED descending -- `vertical_speed_mps` is clearly "
+            "negative, an observed fact. This holds at ANY altitude, "
+            "whether the peak matched the target closely, overshot, or "
+            "undershot -- outcome quality is irrelevant here. Never "
+            "choose this while vertical_speed_mps is still positive, "
+            "even if coast_apoapsis_error_m looks small.",
+        "task_in_progress": "The craft is still climbing "
+            "(vertical_speed_mps positive or zero) -- continued throttle "
+            "control can still meaningfully change the outcome. This is "
+            "the correct answer for EVERY still-climbing state, "
+            "regardless of how small coast_apoapsis_error_m predicts the "
+            "eventual error to be -- that prediction ignores drag and is "
+            "not a substitute for the craft actually having passed apex.",
         "insufficient_data": INSUFFICIENT_DATA_PHRASING,
     },
 }
