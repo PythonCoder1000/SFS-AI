@@ -35,7 +35,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.69.0";
+        public const string VersionString = "0.70.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";

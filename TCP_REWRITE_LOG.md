@@ -162,3 +162,39 @@ proven live above.
 Exit condition met (TCP_REWRITE_SPEC.md §3, Checkpoint 4). Next:
 Checkpoint 5 (wrap-up: changelog, documentation, still-defaults-to-file
 note).
+
+## Checkpoint 5 — status: COMPLETE
+
+`sfsprobe/mod_changelog.md` updated: new `v0.70.0` entry (version bump
+in `SFSProbe.cs`'s `VersionString`, `0.69.0` → `0.70.0`) covering the
+TCP listener addition and this session's real Checkpoint 2-4
+latency/Hz numbers. Note: bumping `VersionString` is a source-only
+change here — it does not take effect on the currently-running live
+mod until `sfsprobe/build.sh` is rerun and the game restarted (per the
+spec's own build-process note); no rebuild/install was done as part of
+this wrap-up step, to avoid touching the live game session unnecessarily.
+
+**How to flip `pilot_loop.py`/`agent_interface.py` to the TCP path**
+(for whenever Christian decides to make that call — NOT done as part of
+this rewrite):
+- `agent_interface.observe()` and `agent_interface.act()` both take an
+  explicit `use_tcp: bool = False` keyword param. Passing `use_tcp=True`
+  at each call site routes that one call through the TCP client instead
+  of the file-protocol path; omitting it (or passing `False`) keeps
+  today's default behavior exactly as-is.
+- In `hackathon/optionA/pilot_loop.py`, that means changing its
+  `act_fn`'s two `ai.act(...)` calls and its `ai.observe()` call to pass
+  `use_tcp=True` — nothing else in that file needs to change, since
+  `agent_interface.py`'s public function signatures/return shapes are
+  identical either way.
+- The mod itself does NOT need reconfiguring either way — both
+  `command.txt`/`result.txt` polling and the TCP listener run
+  simultaneously and unconditionally once the `v0.70.0`+ DLL is built
+  and installed; which one a given Python call uses is decided entirely
+  client-side, per call, by the `use_tcp` flag above.
+- **This rewrite does not flip that default itself** — file-protocol
+  stays the default in `pilot_loop.py`/`agent_interface.py` until
+  Christian explicitly says to switch, per the spec's own instruction
+  not to make that call unilaterally.
+
+Final commit and push for this checkpoint follows this log entry.

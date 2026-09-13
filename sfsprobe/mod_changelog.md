@@ -9,6 +9,54 @@ fact from session notes rather than logged at the time.
 
 ---
 
+## v0.70.0 -- TCP command path added alongside file-polling (`tcp-rewrite` branch)
+
+**2026-09-13.** New capability, additive only -- the existing
+`command.txt`/`result.txt` file-polling path is untouched and remains
+the default everywhere. A `TcpListener` was added to `ProbeRunner`,
+bound to `127.0.0.1:47821`, started alongside the existing file-polling
+setup in `Start()`. Incoming lines are queued off a background
+accept/reader thread and drained on the main thread inside `Update()`
+(`DrainTcpCommands()`), calling the SAME `Probe.Command(line)` dispatch
+every one of the ~47 registered commands already goes through -- no
+handler code changed. Results route back over the same socket the
+command arrived on (`ProbeMod.ActiveTcpConn`), not broadcast, not
+file-only. Multi-line writes are dispatched per-line same-tick, matching
+the file path's existing batching behavior (confirmed live, see below).
+A dead/reconnecting client can't crash the mod -- a broken socket only
+flips that one connection's alive flag; the listener keeps accepting.
+
+**Real, live-measured numbers (this session, same live game, both
+protocols active side by side throughout):**
+- Python client (`analysis/sfsprobe_tcp_client.py`, new file): 10x
+  `ping` round trip, min=7.7ms mean=12.6ms max=13.6ms, zero reconnects.
+- Batching (`"throttle 0.5\nturn 0.0\n"` in one write): confirmed two
+  correct result lines, same tick.
+- Single-command real latency (`turn 0.0` x15): min=6.68ms
+  mean=13.45ms max=19.74ms.
+- Batched observe+act (`["ping","turn 0.0"]` x15): min=13.81ms
+  mean=18.78ms max=21.82ms.
+- Live pilot-loop-shaped dry run (`observe()`→`act(throttle)`→
+  `act(turn)`, 25 cycles, safe no-op values): **22.09 Hz achieved**,
+  vs. the 2.48 Hz file-protocol baseline measured earlier the same
+  night -- roughly a 9x improvement, and far below the ~55ms
+  file-protocol mean this replaces.
+
+`analysis/agent_interface.py`'s `observe()`/`act()` both gained an
+explicit `use_tcp: bool = False` parameter routing through a new shared
+`SfsProbeTcpClient` instance -- **default stays file-protocol
+(`use_tcp=False`) everywhere**; nothing in `pilot_loop.py` or any other
+existing caller changes behavior until that flag is explicitly passed.
+Full detail, methodology, and the live-safety notes around this
+session's real command traffic: `TCP_REWRITE_LOG.md` on the
+`tcp-rewrite` branch.
+
+**Not yet done, deliberately deferred:** `pilot_loop.py` itself has not
+been switched to pass `use_tcp=True` -- that's a real live-flight
+decision (which transport an actual mission runs on), left for
+Christian to make explicitly rather than defaulted by this rewrite. See
+this repo's own note on how to opt in once that decision is made.
+
 ## Finding -- `stage <index>` toggles engine ignition on repeat calls (not idempotent)
 
 **2026-09-12.** Behavioral finding, no code change (yet). Repeated `stage <index>` calls with the SAME index do not no-op on the 2nd+ call -- they TOGGLE `engineOn` on every single call. Confirmed live, 100% reproducible over 7 consecutive calls on a 3-engine single-stage craft: True, False, True, False, True, False, True. Part count and total mass stayed constant across all calls (14 parts, 116.0t) -- so unlike `ignite`, this does NOT destroy or separate anything. But it's still a real hazard: a duplicate or retried `stage` command reaching the game mid-flight (network retry, a race between two callers, anything sending the same index twice) can silently kill already-firing engines while a caller's own state still believes they're armed and keeps sending nonzero throttle -- thrust silently drops to zero with no error, no rejected command, nothing visibly wrong in the command's own response. Root cause not yet investigated (unclear if this is `UseParts` toggling by design, or an artifact of how staging state is tracked). Safe usage until this is understood: never send `stage <index>` for a stage that's already active -- track armed state on the caller side and treat every `stage` call as fire-once, not idempotent-ensure-armed. This is exactly the kind of gap the project's own guardrail-gateway design (staging FSM: reject `stage n` unless `n == expected_stage`, debounce pending stage requests) already anticipated -- this finding confirms why that debounce is load-bearing, not just defensive-in-general.
