@@ -1,40 +1,6 @@
 # SFS AI — Option A Build Spec: tsAI as Pilot
 ### Self-contained. Machine-readable. Written for an executing Claude agent.
 
-## CURRENT STATUS (read this first — added after Checkpoint 6)
-
-**Checkpoints 0–6 are all complete, committed, and pushed** on branch
-`optionA-autonomous-build` (worktree at `.claude/worktrees/optionA-build`).
-Full narrative of what each checkpoint actually did is in
-`hackathon/BUILD_LOG.md`; day-to-day status pointer is
-`bookkeeping/active_state.md`. The rest of this document below is the
-**original build spec**, still accurate as architecture/design reference —
-it is not stale, but it describes the plan, not the finished state. Read
-`BUILD_LOG.md` for what actually happened at each step, including one
-real menu-design gap found and fixed (Checkpoint 6, PAD_IDLE framing) that
-this original spec doesn't mention because it hadn't been discovered yet.
-
-**The one thing genuinely still open, requiring a human present — not
-another unattended session:** nobody has yet watched `launch` actually
-get selected by tsAI, clear the confidence gate, and reach `act()` as a
-real command. Checkpoint 6 fixed the menu wording that was suppressing
-it (measured: PAD_IDLE `throttle_action` confidence went from
-0.13–0.22/rejected to 0.6–0.79/accepted on real telemetry) and
-re-validated the Cartesian-product safety check for the new option — but
-deliberately never ran `--mode live` to observe an actual launch, per an
-explicit no-launch constraint given to that session. **Next step:** run
-`pilot_loop.py --mode live` on a genuinely PAD_IDLE, launch-ready craft
-with a human watching and able to abort.
-
-Secondary, lower-priority open items: `stage_check` is computed/gated
-correctly every cycle but has never been sent live (the craft's
-stage-index mapping was never independently re-verified — separate task,
-same "needs a human watching" category); `DEGRADE_AFTER_MISSES = 2` and
-the 0.5/0.7/0.9 confidence bands (§4.1/§6 below) are still placeholders,
-not rigorously calibrated.
-
----
-
 Read this entire document before writing any code. Every checkpoint has an
 explicit exit condition — do not proceed past a failed checkpoint. If a
 checkpoint fails, stop and report which one and why; do not improvise past it.
@@ -269,12 +235,6 @@ needed, but it's free).
 
 ## 7. Build checkpoints — commit and push after each one
 
-**All checkpoints below (1–5) are complete — see CURRENT STATUS at the
-top of this document and `hackathon/BUILD_LOG.md`. Left in place as
-design reference for what each checkpoint was meant to achieve, and as
-the template for any future checkpoint (e.g. the attended live-launch
-test, which is not yet a numbered checkpoint in this file).**
-
 ### Checkpoint 1 — tsAI client + menu library, no live game
 - [ ] Thin client wrapping `/v1/systemone` (auth from `.env`, timeout,
       response-freshness timestamp check).
@@ -326,24 +286,6 @@ test, which is not yet a numbered checkpoint in this file).**
 - [ ] Final commit and push.
 - **Commit message:** `checkpoint 5: Option A build complete, see BUILD_LOG.md`
 
-### Checkpoint 6 — done, see BUILD_LOG.md, not detailed here since this
-section predates that fix. Summary: fixed a PAD_IDLE menu-framing gap
-found during Checkpoint 4 (ascent-only menu wording was tanking
-confidence for a stationary vehicle); added phase-aware `launch`/
-`hold_on_pad` criteria; re-validated the Cartesian-product safety check;
-measured a real confidence improvement on real telemetry; made zero live
-game calls this checkpoint, per an explicit no-launch constraint.
-
-### Checkpoint 7 (not yet started) — Attended live launch test
-- [ ] Human present and watching, able to abort.
-- [ ] Run `pilot_loop.py --mode live` on a genuinely PAD_IDLE, launch-ready
-      craft with a real mission target.
-- **Exit:** observe, for the first time, whether `launch` is actually
-  selected by tsAI, clears the confidence gate, and reaches `act()` as a
-  real nonzero-throttle command — and whether the resulting flight is
-  controlled, not whether it reaches orbit.
-- Not yet attempted by any session as of this document's last update.
-
 ## 8. Known open gaps — do not re-research, just be aware
 
 - The "2 consecutive misses" watchdog threshold is a placeholder, not a
@@ -360,6 +302,3 @@ game calls this checkpoint, per an explicit no-launch constraint.
   perfectly discounting a bad forecast; the feasibility check (§4.2) is
   the actual backstop for that, not tsAI's own judgment about the
   predictor.
-- `stage_check` has never been sent to a live game (see CURRENT STATUS) —
-  the craft's stage-index mapping needs independent re-verification
-  before that changes.
