@@ -104,3 +104,37 @@ combination of them can compose into a single unsafe command the way a
 raw `ignite` would.
 
 **Commit:** `checkpoint 1: tsAI client + menus`
+
+## Checkpoint 2 — Feasibility + confidence gate
+
+**Built:**
+- `hackathon/optionA/guardrail.py` — `confidence_gate()` (sec 4.1,
+  class-specific bands: routine reject<0.5/caution<0.7, irreversible
+  reject<0.7/caution<0.9; `noul` confidence analog `abs(noul-0.5)*2`
+  used automatically, `.confidence` never read on a `noul` answer) and
+  `evaluate()` which chains it into the feasibility check (sec 4.2) for
+  the actual chosen option. `insufficient_data`/`hold_stage` skip
+  feasibility entirely — they're always the safe no-op regardless of
+  confidence band. Caution-band answers get a `CAUTION_MARGIN` (1.5x)
+  applied to every feasibility threshold, per sec 4.1's "pass with
+  margin, not just pass" requirement.
+- Feasibility checks per question: `throttle_action` (increasing
+  throttle requires delta-v margin above what the target still needs);
+  `pitch_action` (projects the chosen turn's angular-rate effect one
+  assumed second forward and rejects if it would exceed 2x the
+  vehicle's max angular acceleration — a documented simplification, see
+  the function's own docstring for the dps-vs-dps2 unit note);
+  `stage_check` (`stage_now` only accepted when the current stage's
+  fuel is near-exhausted or its remaining delta-v can't meet the
+  target — staging a healthy stage away is itself an irreversible
+  mistake this project has no way to undo).
+
+**Exit check result:** `uv run python3 hackathon/optionA/test_checkpoint2.py`
+— three cases: (1) low-confidence `throttle_action` answer (0.31, below
+the 0.5 routine floor) rejected on confidence alone with a typed reason;
+(2) high-confidence (0.95) but physically infeasible `stage_now` (plenty
+of delta-v/fuel margin remaining) rejected by feasibility despite
+clearing the irreversible-class confidence floor; (3) sanity control
+(feasible + confident `hold`) accepted cleanly. **PASS**, all three.
+
+**Commit:** `checkpoint 2: feasibility + confidence gate`
