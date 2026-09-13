@@ -633,3 +633,153 @@ for the concrete next step.
 **Commit:** not yet made -- `guardrail.py`/`menus.py`/`pilot_loop.py`/
 `state_builder.py` all modified, uncommitted at session end (see
 `bookkeeping/active_state.md`).
+
+## Checkpoint 8 — Full instrumentation session: closure-rate/action-conditioned prediction, commitment rule, tsAI-driven task completion (with a real bug and fix), TCP integration, first genuinely successful flight
+
+**Long attended session, many real `--mode live` runs, human watching
+throughout.** Continuation of Checkpoint 7's stated focus ("how to
+communicate with tsAI more efficiently") -- this session is where it
+actually paid off. Real numbers/findings below; full per-cycle detail
+in the Weave project `sfs-ai-hackathon` as usual.
+
+**1. Directional confidence fix (`guardrail.py`).** Root cause of the
+confidence-collapse Checkpoint 7 ended on: vendor's native `confidence`
+on `throttle_score` measures flatness across all 6 levels, but 0/1/2
+are all "decrease" and 4/5 are both "increase" -- a totally unambiguous
+DIRECTION still reads as flat/uncertain if it splits across 2-3
+adjacent levels. `throttle_score_directional_confidence()` pools into
+{decrease, hold, increase} and uses the max pooled mass instead.
+Confirmed against 3 real prior flights: 67-84% combined decrease-side
+probability had been rejected every time at native confidence 0.1-0.5.
+
+**2. `state.history` (replacing the physics scratchpad).** Last 5
+cycles' throttle/score/confidence/coast_apoapsis_error_m, motivated by
+tsAI's own self-report (asked directly why confidence collapsed over a
+sustained flight: 66% "repeated_near_identical_state", 27%
+"no_memory_of_trend"). `build_physics_block()` (thrust/gravity/net
+accel scratchpad) was tried first, tested live, found not to help --
+left in `state_builder.py`, unwired, not deleted.
+
+**3. `coast_apoapsis` closing rate + validity flag.** New
+`compute_coast_apoapsis_trend()`: closure_rate_mps (this cycle vs last)
+and a linear extrapolation to zero-crossing, so tsAI can react BEFORE
+the error goes positive, not after -- on a T/W~3+ craft the error can
+move 700+m in one cycle. External review (non-Claude) flagged two real
+risks in the first version, both fixed same day: (a) renamed
+`seconds_to_crossover` -> `linear_seconds_to_crossover`, since a
+one-step linear extrapolation isn't a forecast in the same sense as the
+real 15s integrator: (b) added `coast_apoapsis_trend_valid` (false on
+no prior point, >2s gaps, or a phase transition since last cycle) so a
+bad trend never gets used numerically.
+
+**4. Faster loop -- 1.0 -> 1.64 -> 2.48 -> ~2.9-3.0 Hz across three
+real changes**, each live-measured: (a) `--cycle-period-s` default
+0.5->0.0 (removed the artificial sleep -- the real floor is IPC +
+tsAI latency, not this constant); (b) `agent_interface.py`'s file-
+protocol `poll_s` 0.1->0.01, found via direct A/B that the OLD 0.1s
+round-trip was suspiciously exactly poll_s itself, not real game/IPC
+jitter (mod's own poll cadence is 0.05s); (c) the TCP integration
+(below).
+
+**5. `action_conditioned_apoapsis`.** The single `coast_apoapsis_m`
+only ever answered "what if cut RIGHT NOW" -- `state_builder.
+compute_action_conditioned_apoapsis()` computes the SAME closed-form
+answer for 4 candidate throttle actions (if_cut/if_decrease_large/
+if_hold/if_increase_large), each ~1s projected ahead, so tsAI chooses
+between precomputed consequences instead of interpolating blind. Menu
+instructions also rewritten with an explicit 5-level signal priority
+ordering (feasibility > coast apoapsis > physical history > terminal
+prediction > raw telemetry) after external review flagged the risk of
+25 correlated numbers being treated as a flat committee.
+
+**6. Commitment rule -- real bug found and fixed with live data.**
+Even with action_conditioned_apoapsis added, tsAI was found (via real
+trace analysis) to under-commit: an unambiguous `if_cut` winner
+(error_m=+393 vs +1019/+1234/+1438 for the alternatives) still scored
+1.47 instead of near 0, dragged there by a run of recent scores in the
+3.0-3.2 range -- `state.history`'s own anti-inertia instruction wasn't
+enough in practice. Added an explicit COMMITMENT RULE: when one
+candidate's |error_m| is roughly half or less of the next-best, score
+MUST land within 0.5 of that candidate's anchor, overriding history
+continuity. Live-retested: the same class of case (if_cut winning by a
+wide margin) now scores 0.79, and full throttle cutoff is reached in
+~5 cycles from first decrease instead of ~14. Not perfectly reliable at
+borderline margins (one case at ~45% margin still scored 2.12 instead
+of near 0) -- real, working, not exact.
+
+**7. tsAI-driven task completion -- real bug found live, fixed, then
+re-validated live.** New `task_status` question (own guardrail class,
+`reject_below=0.9`, stricter than every other class -- ending the loop
+isn't reversible the way one cycle's command is) replaces a fixed
+`--max-cycles` cutoff; `--max-cycles` now defaults to -1 (unlimited).
+Calibrated pre-wiring via 4 synthetic states sent directly through
+`tsai_client` (not a live flight): EARLY (conf 1.00 in_progress),
+NEAR_DONE (0.86), AT_5000 (0.95), OVERSHOOT (0.42 -> 0.99 once the
+instructions explicitly separated "done" from "succeeded" -- an
+overshot-and-descending craft is done regardless of outcome quality).
+**Real bug, found on the FIRST live run of this feature:** task_status
+fired `task_complete` at conf 0.91 while the craft was still climbing
+at +220 m/s -- `coast_apoapsis_m` (closed-form, ignores drag) read
+close enough to target to look done. Real apex landed ~4500m, a ~10%
+undershoot. Root cause: a still-climbing PREDICTION was being trusted
+as grounds to stop. Fix: removed that completion path entirely --
+`task_complete` now requires `vertical_speed_mps` CONFIRMED negative
+(observed fact, never a prediction), full stop, at ANY altitude.
+Re-verified against the exact real state that caused the undershoot:
+now reads `task_in_progress` (1.00) instead of the `task_complete`
+(0.91) that ended the run early. **Live-retested end to end: 125
+cycles, `task_status` correctly held `task_in_progress` at confidence
+1.000 through the entire climb (temptingly-close predictions included),
+only firing at cycle 124 once genuinely descending -- final state
+altitude~4996m, vertical_speed~-2m/s, a 0.08% miss against the 5000m
+target.** Best result of the whole project to date.
+
+**8. TCP transport, merged in from the separate `tcp-rewrite` branch
+(built by a parallel Claude Code session, all 5 checkpoints complete).**
+SFSProbe.cs got a TCP listener (127.0.0.1:47821) alongside the existing
+file-polling, main-thread-safe via a background accept/reader thread +
+ConcurrentQueue drain; `analysis/sfsprobe_tcp_client.py` is the Python
+side; `agent_interface.py`'s `observe()`/`act()` got a `use_tcp=True`
+opt-in (file-protocol stays the library default). `pilot_loop.py` now
+passes `use_tcp=True` on every real call in `run_live()`, INCLUDING the
+shutdown path -- motivated directly by a real crash this session where
+the file-protocol shutdown call timed out mid-flight (craft left
+airborne, caught and handled safely by the existing `[ATTENTION]`
+convention, but still a real failure mode this closes). Real measured
+numbers: TCP ~12ms/8.6ms per observe()/act() call vs file-protocol's
+~55-100ms; a full live flight over TCP achieved 2.83-2.96 Hz, the
+fastest of the project, with zero timeouts.
+
+**9. Orbital-ascent test -- started, not completed, deferred to a
+future session (Christian's explicit call: "leave that for extra").**
+Added real `--apoapsis-m`/`--periapsis-m`/`--delta-v-required-mps` CLI
+flags (previously hardcoded to a fixed vertical-hop mission every run)
+specifically so `pitch_action`'s ORBITAL_ASCENT gravity-turn framing
+(never exercised live all project) could actually be tested. Also
+fixed `TASK_STATUS_MENU`'s instructions, which hardcoded "vertical-hop
+mission... no orbit" and would have been actively wrong under
+periapsis_m>0 -- made profile-neutral (the actual completion criterion
+never depended on profile, only the framing sentence did). A real test
+run (`--periapsis-m 1000`) was started but the craft was reset
+mid-flight (by Christian, outside the script) before reaching a
+conclusion -- stopped cleanly, craft confirmed safe (grounded, engines
+off, ~63m, ~0 velocity, full fuel). Genuinely untested: does
+`pitch_action` correctly execute real prograde/retrograde gravity-turn
+shaping when it matters. Also worth keeping in mind for next time: this
+craft's real delta-v budget (~200-250m/s) is nowhere near a real
+circular orbit's requirement at low altitude on this body (~1743 m/s at
+~5000m, computed from `mu=9.72e11`/`radius=314970m`) -- a periapsis_m>0
+test here exercises the PITCH LOGIC, not an actually-achievable
+insertion, and that's worth saying explicitly to avoid confusion later.
+
+**Session-end git state:** everything committed and pushed to
+`worktree-optionA-build` (latest: `9b868fe`, CLI flags + profile-neutral
+task_status text). `tcp-rewrite` branch (checkpoints 1-5, all merged in
+above) is separately committed and pushed on its own branch. Working
+tree clean, nothing uncommitted at session end.
+
+**Next session's explicit focus (Christian's own words): "nail down
+visuals"** -- not yet scoped further at session end; see
+`bookkeeping/active_state.md`'s "Immediate next experiment" for what
+that needs to start with.
+
