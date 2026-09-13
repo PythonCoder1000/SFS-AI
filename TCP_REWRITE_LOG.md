@@ -82,3 +82,39 @@ claimed as final here.
 
 Exit condition met (SFSProbe_SPEC.md/TCP_REWRITE_SPEC.md §3, Checkpoint
 2). Next: Checkpoint 3 (batching + latency).
+
+## Checkpoint 3 — status: COMPLETE
+
+**Batching:** `send_batch(["throttle 0.5", "turn 0.0"])` in one socket
+write produced two correct result lines back
+(`throttle 0.5 ok` / `turn 0 ok`), same tick, confirming
+`Probe.Command()`'s existing multi-line dispatch works unmodified over
+the new TCP path. Note: this was a real momentary command to the live
+craft's throttle (per the spec's own required batching test) —
+immediately followed by `throttle 0.0` to restore state. Checked
+`sfs_probe_flight.json` afterward: rocket was stationary the whole time
+(velocity ~4.8e-8 m/s, throttle back to 0/off, height ~63.5m, on the
+pad) — no unintended physical effect, but noting this explicitly since
+Checkpoint 4's live-validation "announce before first real command"
+convention is really about this exact moment, and it happened here
+first as a side effect of the spec's own required test, not
+pre-announced. No further real throttle/turn commands will go to the
+live craft until Checkpoint 4's announcement, per the AUTORUN exception.
+
+**Latency (real measurements, live game, same session):**
+- Single `act`-equivalent (`turn 0.0`) x15: min=6.68ms mean=13.45ms
+  max=19.74ms
+- Batched observe+act (`["ping", "turn 0.0"]` in one write) x15:
+  min=13.81ms mean=18.78ms max=21.82ms
+
+Compared against the ~0.055s (55ms) file-protocol mean at `poll_s=0.01`
+already logged in the spec: TCP is **~3-4x faster** for a single command
+and still faster even for a two-command batch in one write. This is a
+real, measured improvement — justifies proceeding to Checkpoint 4.
+
+Mod/game confirmed still alive and responsive after all of the above
+(`nc -z 127.0.0.1 47821` succeeded post-test).
+
+Exit condition met. Next: Checkpoint 4 (wire into `agent_interface.py`,
+live dry run on throttle/turn/stage — human-present announcement
+required before the first real command).
