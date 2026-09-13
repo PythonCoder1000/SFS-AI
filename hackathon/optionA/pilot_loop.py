@@ -544,7 +544,7 @@ def _safe_shutdown_act(ai_module, command: str, max_attempts: int = 3,
     broadly, warn loudly, never re-raise."""
     for attempt in range(1, max_attempts + 1):
         try:
-            ai_module.act(command, allow_full_authority=True)
+            ai_module.act(command, allow_full_authority=True, use_tcp=True)
             return
         except TimeoutError as e:
             log(f"  [WARN] shutdown command {command!r} timed out "
@@ -596,7 +596,22 @@ def _preflight_feasibility_gate(mass_t: float, dry_mass_t: float, isp: float,
 def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> PilotRun:
     import agent_interface as ai
 
-    resp = ai._send_command("getforwardstartinfo")
+    # 2026-09-13 EVEN LATER SAME DAY (Christian's explicit request,
+    # following the mod-timeout crash mid-flight that ended tonight's
+    # task_status live test): switched every real live call in this
+    # function over to the TCP path (tcp-rewrite, now merged in) --
+    # file-protocol (command.txt/result.txt polling) is what actually
+    # timed out. TCP checkpoint 4 measured ~22 Hz vs. the file-protocol's
+    # 2.48 Hz baseline (~9x) with no observed timeouts across its own
+    # live-validated dry run -- see TCP_REWRITE_LOG.md. use_tcp=True is
+    # now threaded through every observe()/act() call below, including
+    # the safety-critical shutdown path in the `finally` block
+    # (_safe_shutdown_act, above) -- that shutdown call was the EXACT
+    # one that timed out tonight, so it's not left on the slower/less
+    # reliable path just because it's "only cleanup". File-protocol
+    # remains agent_interface.py's default (use_tcp defaults False) --
+    # this is pilot_loop.py opting in explicitly, not a global flip.
+    resp = ai._send_command_tcp("getforwardstartinfo")
     log(f"getforwardstartinfo -> {resp}")
     with open(str(ai.MOD_DIR / "sfs_probe_forwardstartinfo.json")) as f:
         craft_raw = json.load(f)
@@ -623,9 +638,9 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
     def act_fn(throttle, turn_axis, extra_commands=None, full_authority_throttle=False):
         for cmd in extra_commands or []:
             log(f"  -> sending live: {cmd!r}")
-            ai.act(cmd)
-        ai.act(f"throttle {throttle:.3f}", allow_full_authority=full_authority_throttle)
-        ai.act(f"turn {turn_axis:.3f}")
+            ai.act(cmd, use_tcp=True)
+        ai.act(f"throttle {throttle:.3f}", allow_full_authority=full_authority_throttle, use_tcp=True)
+        ai.act(f"turn {turn_axis:.3f}", use_tcp=True)
 
     cycle_id = 0
     loop_start_t = time.time()  # 2026-09-13 LATER SAME DAY: real achieved
@@ -634,7 +649,7 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
     # doesn't tell you what rate was actually achieved.
     try:
         while True:
-            snapshot = ai.observe()
+            snapshot = ai.observe(use_tcp=True)
             angv_dps = abs(math.degrees(snapshot.get("rb2d.angularVelocity", 0.0)))
             if angv_dps > 500.0 or any(
                 math.isnan(snapshot.get(k, 0.0)) for k in
@@ -668,7 +683,7 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
         # loud signal that manual attention was now needed). Best-effort,
         # read-only, never allowed to raise past this point.
         try:
-            final_snapshot = ai.observe()
+            final_snapshot = ai.observe(use_tcp=True)
             final_alt = math.hypot(
                 final_snapshot.get("location.position.x", 0.0),
                 final_snapshot.get("location.position.y", 0.0),
