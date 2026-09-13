@@ -29,6 +29,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import forward_sim as fsim
+from sfsprobe_tcp_client import SfsProbeTcpClient
 
 MOD_DIR = Path(os.path.expanduser(
     "~/Library/Application Support/Steam/steamapps/common/"
@@ -86,6 +87,29 @@ def _send_command(command: str, timeout_s: float = 5.0, poll_s: float = 0.01) ->
     )
 
 
+# 2026-09-13 tcp-rewrite checkpoint 4: TCP-backed transport, opt-in only.
+# File-protocol (_send_command above) remains the default for every
+# caller -- this exists so observe()/act() can be told to use the
+# persistent-socket path instead, behind an explicit use_tcp=True, until
+# Christian decides to flip the default (see TCP_REWRITE_LOG.md). One
+# shared client instance, lazily connected on first use.
+_tcp_client: Optional[SfsProbeTcpClient] = None
+
+
+def _get_tcp_client() -> SfsProbeTcpClient:
+    global _tcp_client
+    if _tcp_client is None:
+        _tcp_client = SfsProbeTcpClient()
+    return _tcp_client
+
+
+def _send_command_tcp(command: str) -> str:
+    """TCP-path equivalent of _send_command() -- same return contract
+    (a stripped result string), transport only. Checkpoint 2/3 already
+    validated the client itself; this just routes through it."""
+    return _get_tcp_client().send(command)
+
+
 # ---------------------------------------------------------------------------
 # observe()
 # ---------------------------------------------------------------------------
@@ -102,14 +126,23 @@ OBSERVE_FIELDS = (
 )
 
 
-def observe(extra_fields: Optional[str] = None) -> dict:
+def observe(extra_fields: Optional[str] = None, *, use_tcp: bool = False) -> dict:
     """Current real craft state, as a clean dict -- wraps
     telemetrysnapshot with a fixed field list instead of every caller
     re-deriving one. Pass extra_fields (comma-separated, same syntax
     telemetrysnapshot itself takes) to add fields beyond
-    OBSERVE_FIELDS' default set without losing them."""
+    OBSERVE_FIELDS' default set without losing them.
+
+    use_tcp=True sends the telemetrysnapshot command over the
+    tcp-rewrite persistent socket (see sfsprobe_tcp_client.py) instead
+    of the file-protocol command.txt/result.txt round trip -- default
+    stays False (file protocol) until Checkpoint 4's live validation
+    passes and Christian decides to flip it. Either way, the snapshot
+    itself is still written by the mod to SNAPSHOT_FILE and read from
+    there -- only the command/result transport changes."""
     fields = OBSERVE_FIELDS if extra_fields is None else OBSERVE_FIELDS + "," + extra_fields
-    _send_command(f"telemetrysnapshot {fields}")
+    sender = _send_command_tcp if use_tcp else _send_command
+    sender(f"telemetrysnapshot {fields}")
     with open(SNAPSHOT_FILE, "r") as f:
         return json.load(f)
 
@@ -146,14 +179,17 @@ MAX_THROTTLE_STEP = 0.3  # max |change| in one act() call vs the last commanded 
 _last_throttle = {"value": 0.0}
 
 
-def act(command: str, *, allow_full_authority: bool = False) -> str:
-    """Sends ONE command to the live game through the same file
-    protocol sfsprobe/probe_cmd.py uses, with safety clamps applied to
-    the two command types that actually crashed a real rocket today:
-    'turn <axis>' and 'throttle <amount>'. Every other command passes
-    through unmodified -- this is not a general-purpose command
-    validator, just a guard on the two specific failure modes already
-    observed live.
+def act(command: str, *, allow_full_authority: bool = False, use_tcp: bool = False) -> str:
+    """Sends ONE command to the live game -- by default through the same
+    file protocol sfsprobe/probe_cmd.py uses, or over the tcp-rewrite
+    persistent socket when use_tcp=True (default False; file protocol
+    stays the default transport until Christian flips it, per
+    TCP_REWRITE_LOG.md Checkpoint 4). Either transport applies the same
+    safety clamps below to the two command types that actually crashed a
+    real rocket today: 'turn <axis>' and 'throttle <amount>'. Every
+    other command passes through unmodified -- this is not a
+    general-purpose command validator, just a guard on the two specific
+    failure modes already observed live.
 
     allow_full_authority=True bypasses both clamps for a single call --
     escape hatch for deliberate full-authority testing, not the
@@ -183,7 +219,7 @@ def act(command: str, *, allow_full_authority: bool = False) -> str:
                 if clamped != v:
                     command = f"throttle {clamped}"
                 _last_throttle["value"] = clamped
-    return _send_command(command)
+    return _send_command_tcp(command) if use_tcp else _send_command(command)
 
 
 # ---------------------------------------------------------------------------

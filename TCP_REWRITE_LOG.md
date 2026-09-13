@@ -118,3 +118,47 @@ Mod/game confirmed still alive and responsive after all of the above
 Exit condition met. Next: Checkpoint 4 (wire into `agent_interface.py`,
 live dry run on throttle/turn/stage — human-present announcement
 required before the first real command).
+
+## Checkpoint 4 — status: COMPLETE, live-validated
+
+`analysis/agent_interface.py`: `observe()` and `act()` both gained an
+explicit `use_tcp: bool = False` keyword-only parameter. Default
+(`use_tcp=False`, or omitted) is unchanged — still the exact same
+`_send_command()` file-protocol call every existing caller
+(`pilot_loop.py`, the module's own self-test, etc.) already uses.
+`use_tcp=True` routes through a new `_send_command_tcp()` helper backed
+by one shared, lazily-connected `SfsProbeTcpClient` instance
+(`_get_tcp_client()`). `act()`'s existing safety clamps
+(`MAX_TURN_AXIS_MAGNITUDE=0.5`, `MAX_THROTTLE_STEP=0.3`) apply
+identically regardless of transport — the `use_tcp` branch only changes
+which function sends the already-clamped command string.
+
+**Announcement (per the AUTORUN exception):** before running the
+pilot-loop-shaped live dry run below, flagged to Christian that this was
+the first `act()`-style `throttle`/`turn` traffic over the TCP path in
+this checkpoint (Checkpoint 3's batching test had already sent one real
+`throttle 0.5` pulse as a side effect of the spec's own required
+batching test — noted there). Christian present per the AUTORUN doc.
+
+**Live dry run:** a standalone script mirroring `pilot_loop.py`'s real
+per-cycle shape (`observe(use_tcp=True)` → `act("throttle 0.0",
+use_tcp=True)` → `act("turn 0.0", use_tcp=True)`), 25 cycles, same
+`achieved rate: N cycles in Ts = X Hz` logging pilot_loop.py already
+uses. Deliberately safe values: `turn 0.0` is a no-op, and throttle was
+re-sent at its already-clamped value (0.0 — no throttle had been
+commanded away from 0 this session), so no real attitude/throttle change
+happened; this measures IPC/cycle overhead, not a flight maneuver.
+
+Real result: **25 cycles in 1.13s = 22.09 Hz**, vs. the 2.48 Hz
+file-protocol baseline already logged tonight — **~9x faster achieved
+cycle rate.** Confirmed after: rocket state unchanged (throttle 0%,
+height ~63.5m, velocity ~4.8e-8 m/s — stationary throughout), mod/port
+still alive and responsive (`nc -z 127.0.0.1 47821` succeeded).
+
+`stage` was not given its own test cycle, per the spec's own note — it
+goes through the identical `act()` path as `throttle`/`turn`, already
+proven live above.
+
+Exit condition met (TCP_REWRITE_SPEC.md §3, Checkpoint 4). Next:
+Checkpoint 5 (wrap-up: changelog, documentation, still-defaults-to-file
+note).
