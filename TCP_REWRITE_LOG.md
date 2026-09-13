@@ -1,6 +1,6 @@
 # TCP rewrite — session log
 
-## Checkpoint 1 — status: implemented + compiles clean, live smoke test BLOCKED
+## Checkpoint 1 — status: COMPLETE, live-validated
 
 What's done:
 - `sfsprobe/SFSProbe.cs`: `TcpListener` added to `ProbeRunner`, bound to
@@ -34,25 +34,25 @@ What's done:
   compiles clean, only 3 pre-existing unrelated warnings (`CS1718` at
   lines ~3177-3180, present before this change, not touched here).
 
-What's BLOCKED and why:
-- Checkpoint 1's actual exit condition needs `sfsprobe/build.sh` run for
-  real (which installs `SFSProbe.dll` into the live game's `Mods/`
-  folder) and the game restarted/mod re-enabled, then a manual `nc
-  127.0.0.1 47821` / `ping` smoke test, run side-by-side with the
-  existing file-protocol path to confirm both still work.
-- Per this spec's own safety section (§4) and the standing project
-  convention, I asked Christian before installing a build or touching
-  the live game, since it's shared state and `worktree-optionA-build` may
-  have a live flight in progress in the other session. He said **not
-  right now**.
-- Stopping here rather than proceeding past this — not treating "not
-  right now" as a green light to install anyway, and not simulating or
-  assuming the live test would pass.
+**2026-09-13 LATER SAME DAY — live smoke test done, Christian's
+go-ahead.** `sfsprobe/build.sh` run for real, DLL installed into the
+live game's `Mods/SFSProbe/` folder (same 3 pre-existing `CS1718`
+warnings, no new ones), game restarted, mod re-enabled. Both real
+results, back to back, in the same live game session:
+- File-protocol `ping` (`command.txt`/`result.txt`, via the existing
+  MCP `sfsprobe_ping` tool): real `pong` with live scene/version info.
+- Raw TCP `ping` (`nc 127.0.0.1 47821`, command `"ping\n"`): identical
+  real `pong` response, same content/format as the file path.
+- File-protocol `ping` again immediately after: still clean, no
+  interference or state corruption between the two paths.
 
-Next step (when Christian gives the go-ahead): run `sfsprobe/build.sh`,
-restart the game, enable the mod, run the `nc`/`ping` smoke test and the
-side-by-side file-protocol check, then continue to checkpoints 2-5 as
-written in `TCP_REWRITE_SPEC.md`.
+Checkpoint 1's exit condition (SFSProbe_SPEC.md §3, Checkpoint 1) is
+fully met: both paths alive simultaneously, mod loaded cleanly, no
+regressions to the existing file-protocol path.
+
+Next: checkpoints 2-5 as written in `TCP_REWRITE_SPEC.md` -- Python
+client round-trip validation (2), batching + latency measurement (3),
+agent_interface.py wiring + live pilot_loop dry run (4), wrap-up (5).
 
 Local-only note: `sfsprobe/lib/harmonyx_2.16.0/` was copied into this
 worktree from the main checkout to make local `mcs` compilation possible
