@@ -66,6 +66,10 @@ SFS AI/
 
   blueprints/             rocket designs (research/, live/)
 
+  hackathon/              CoreWeave Hacks submission (Sept 2026) -- see
+                          hackathon/README.md for full disclosure of what's
+                          pre-existing (this repo) vs. built during the event
+
   scratch/                gitignored -- raw IL dumps, not our code
 
   unused_assets/          gitignored -- parked, not deleted: old session handoffs,
@@ -110,6 +114,12 @@ multi-session Claude Code effort: one file per class, a strict template
 `INDEX.md`/`manifest.json` that can't drift from the real assembly since
 they're built from `inventory.json`. In progress -- see
 `docs/sfs_reference_plan.md` for the standing plan and current phase.
+
+## Hackathon submission (CoreWeave Hacks, Sept 2026)
+
+Everything in this repo outside `hackathon/` predates the event and is
+infrastructure, not the submission -- see `hackathon/README.md` for the
+full disclosure, architecture, demo script, and submission checklist.
 
 ## Status
 

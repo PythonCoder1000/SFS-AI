@@ -653,6 +653,276 @@ def run_ascent(
     return last_snapshot
 
 
+def _wrap180(deg: float) -> float:
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def _vertical_theta_deg(px: float, py: float) -> float:
+    """Craft rotation (rb2d.rotation convention) that points 'straight
+    up' (radially away from the planet) at this position. Confirmed
+    empirically 2026-09-12: a stationary craft on the pad read
+    theta=-0.04 deg against this formula's own -0.07 deg prediction at
+    that same position -- 0.03 deg off, i.e. no real calibration offset
+    needed. Derived from forward_sim.py's own confirmed AoA convention
+    (aoa = wrap180((theta+90) - heading_deg)): a craft with zero AoA
+    flying straight up has heading == atan2(py,px) (straight out from
+    the planet), so theta == heading - 90."""
+    return math.degrees(math.atan2(py, px)) - 90.0
+
+
+class AttitudePD:
+    """PD controller on rotation error -> turn_axis command. Separate
+    from AltitudePD (throttle) -- this is the piece run_ascent() never
+    needed, since it always held rot/turn_axis at 0 (straight-up only).
+    A gravity turn needs BOTH loops running simultaneously: throttle
+    still drives when we get there, attitude now drives WHERE we point.
+
+    Deliberately conservative gains: agent_interface.py's act() clamps
+    any 'turn <v>' command to +-0.5 no matter what this computes (see
+    MAX_TURN_AXIS_MAGNITUDE, added after two real crashes from turn=1
+    full authority at low altitude/speed) -- this controller is tuned
+    to rarely need that clamp, not to lean on it. kd damps on the
+    craft's own angular velocity (omega, deg/s) to avoid overshoot/
+    oscillation chasing a moving pitch-program target, the same
+    chattering risk AltitudePD's own kd/vspeed-smoothing was built to
+    avoid on the throttle side.
+    """
+
+    def __init__(self, kp: float = 0.012, kd: float = 0.06):
+        self.kp = kp
+        self.kd = kd
+
+    def turn_axis_for(self, current_theta_deg: float, desired_theta_deg: float,
+                       omega_degs: float) -> float:
+        """SIGN FIX (2026-09-12, post-incident): confirmed via
+        forward_sim.py's apply_rotation_update -- the actual physics is
+        `omega -= torque_effective * turn_axis * RAD2DEG/mass * dt`
+        with torque_effective POSITIVE, so a POSITIVE turn_axis
+        DECREASES omega and a NEGATIVE turn_axis INCREASES it (SAS's
+        own compute_turn_axis, turn_axis=omega/delta with delta>0,
+        commands turn_axis with the SAME sign as omega specifically
+        because that's what cancels it under this formula). The
+        original version here had raw = kp*error - kd*omega -- backwards
+        on BOTH terms: to increase theta (positive error) you need to
+        BUILD positive omega, which requires a NEGATIVE turn_axis, not
+        positive; and to damp an existing positive omega back to zero
+        you need a POSITIVE turn_axis (matching SAS's own law), not
+        negative. That inversion is exactly what pegged turn at the
+        -0.5 clamp for 40+ consecutive ticks on the first live attempt
+        while theta raced through 2000+ degrees and altitude started
+        dropping -- a real positive-feedback runaway, caught and killed
+        via SIGINT before any damage, not a close call worth repeating.
+        """
+        error = _wrap180(desired_theta_deg - current_theta_deg)
+        raw = -self.kp * error + self.kd * omega_degs
+        return max(-0.5, min(0.5, raw))
+
+
+# Hard safety ceiling for run_gravity_turn_to_orbit's attitude loop --
+# independent of AttitudePD's own gains being right. If |omega| ever
+# exceeds this, something is badly wrong (a real gravity-turn pitch
+# program never needs anywhere near this much angular rate) and the
+# run aborts immediately -- zero turn, zero throttle -- rather than
+# trusting the controller to self-correct. Direct response to the
+# 2026-09-12 sign-bug incident: a watchdog independent of the
+# controller's own correctness is the actual fix for "a bug like that
+# should never be able to run away again", not just fixing this one bug.
+SPIN_ABORT_THRESHOLD_DEGS = 45.0
+
+
+def _pitch_program_deg(altitude_m: float, pitch_start_alt_m: float,
+                        pitch_end_alt_m: float, max_pitch_deg: float) -> float:
+    """How far off local-vertical to pitch, as a function of altitude --
+    a classic gravity-turn profile: stay vertical until pitch_start_alt_m
+    (let speed build in the thickest air first, avoid turning at low
+    speed/high density where torque authority is weakest and risk is
+    highest -- directly the regime the two real turn-related crashes
+    this project already logged happened in), then ramp linearly to
+    max_pitch_deg by pitch_end_alt_m, then hold there. Linear, not eased
+    -- simplest profile that's still a real gravity turn; an S-curve or
+    similar refinement is a natural next iteration once this baseline
+    is confirmed to fly at all."""
+    if altitude_m <= pitch_start_alt_m:
+        return 0.0
+    if altitude_m >= pitch_end_alt_m:
+        return max_pitch_deg
+    frac = (altitude_m - pitch_start_alt_m) / (pitch_end_alt_m - pitch_start_alt_m)
+    return max_pitch_deg * frac
+
+
+def _orbital_apoapsis_periapsis_alt(px: float, py: float, vx: float, vy: float,
+                                     mu: float, body_radius_m: float) -> tuple:
+    """Apoapsis/periapsis ALTITUDE (above body_radius_m), computed from
+    the current state via standard two-body orbital mechanics (vis-viva
+    energy + specific angular momentum) -- NOT via the game's own
+    predApo/predPeri telemetry fields. Confirmed live 2026-09-12 via
+    sfsprobe's field registry (light_search): those fields are
+    namespace='truth', requestAs='telemetry on (full mode, no field
+    list) -- truth.jsonl' -- i.e. ONLY populated by the continuous
+    full-mode RECORDING pipeline, not retrievable via the per-tick
+    telemetrysnapshot query this fast control loop uses for everything
+    else. Confirmed the hard way first: predApo/predPeri came back None
+    on every single telemetrysnapshot call across an entire real flight
+    (63m to 81,209m altitude) before this was traced to the field
+    registry entry above. Hand-computing here avoids depending on a
+    second, asynchronous recording pipeline inside a tight real-time
+    loop -- one self-contained state->orbital-elements calc instead.
+
+    epsilon = v^2/2 - mu/r (specific orbital energy), a = -mu/(2*epsilon)
+    (semi-major axis, valid for epsilon<0 -- a closed ellipse), h_ang =
+    px*vy - py*vx (z-component of the specific angular momentum in this
+    module's 2D world frame), e = sqrt(1 - h_ang^2/(mu*a)) (eccentricity).
+    r_apo/r_peri = a*(1+-e). Returns (None, None) for a degenerate
+    state (r<1m) or a hyperbolic/parabolic trajectory (epsilon>=0 --
+    no apoapsis/periapsis pair exists, matching a real fast/steep
+    powered-ascent trajectory before it settles into a bound orbit)."""
+    r = math.hypot(px, py)
+    if r < 1.0:
+        return None, None
+    v2 = vx * vx + vy * vy
+    epsilon = v2 / 2.0 - mu / r
+    if epsilon >= 0:
+        return None, None
+    a = -mu / (2.0 * epsilon)
+    h_ang = px * vy - py * vx
+    e_sq = 1.0 - (h_ang * h_ang) / (mu * a)
+    e = math.sqrt(max(0.0, e_sq))
+    r_apo = a * (1.0 + e)
+    r_peri = a * (1.0 - e)
+    return r_apo - body_radius_m, r_peri - body_radius_m
+
+
+def run_gravity_turn_to_orbit(
+    target_orbit_altitude_m: float,
+    pitch_start_alt_m: float = 1500.0,
+    pitch_end_alt_m: float = 25000.0,
+    max_pitch_deg: float = 80.0,
+    poll_hz: float = 5.0,
+    max_duration_s: float = 900.0,
+    circularize_tolerance_m: float = 1500.0,
+) -> dict:
+    """First orbit attempt: vertical liftoff -> gravity-turn ascent
+    (pitch program + AttitudePD, throttle held near-full during the
+    burn since the goal here is 'reach target apoapsis', not 'hover at
+    an altitude' the way run_ascent()'s AltitudePD is built for) ->
+    cut throttle once predicted apoapsis (the game's OWN live 'predApo'
+    telemetry field, not a hand-rolled orbital-mechanics calc) reaches
+    target -> coast to apoapsis -> circularization burn (point
+    prograde, burn until the game's own 'predPeri' also reaches target,
+    i.e. periapsis raised to match apoapsis).
+
+    predApo/predPeri: the game's own telemetry fields exist but are
+    ONLY populated by the continuous full-mode recording pipeline
+    ('telemetry on'), not the per-tick 'telemetrysnapshot' query this
+    loop uses (confirmed live, see _orbital_apoapsis_periapsis_alt's
+    own docstring for the full story) -- apoapsis/periapsis here are
+    computed directly from state instead (vis-viva + angular momentum),
+    not read from the game.
+
+    No LLM supervisor in this loop -- this is the deterministic flight-
+    mechanics piece (attitude + throttle + phase sequencing), the same
+    scope run_ascent() covers for straight-up flight. A first real
+    attempt, not a tuned/proven controller -- gains and the pitch
+    program are conservative starting points, expect to iterate after
+    watching how it actually flies.
+    """
+    _call_with_retry(traced_act, "master on", label="act('master on')")
+
+    attitude_ctrl = AttitudePD()
+    dt = 1.0 / poll_hz
+    t_start = time.monotonic()
+    deadline = t_start + max_duration_s
+    phase = "ascent"
+    last_snapshot = None
+    mu = fsim.PLANET_CONSTANTS["Earth"]["mu"]
+
+    try:
+        while time.monotonic() < deadline:
+            snapshot = _call_with_retry(traced_observe, label="observe()")
+            last_snapshot = snapshot
+            state_now = observe_to_state(snapshot)
+            px, py, vx, vy = state_now["px"], state_now["py"], state_now["vx"], state_now["vy"]
+            r = math.hypot(px, py)
+            altitude_m = r - EARTH_RADIUS_M
+            theta = state_now["rot"]
+            omega = state_now["angv"]
+            t_now = time.monotonic() - t_start
+
+            pred_apo_alt, pred_peri_alt = _orbital_apoapsis_periapsis_alt(
+                px, py, vx, vy, mu, EARTH_RADIUS_M)
+
+            # Spin watchdog (2026-09-12, post-incident) -- checked BEFORE
+            # any phase logic runs, independent of AttitudePD's own
+            # correctness, so a bug in the controller (like the sign
+            # inversion that caused the first live attempt's runaway)
+            # can never spin the craft past this point unnoticed. A real
+            # gravity-turn pitch program never needs anywhere near this
+            # much angular rate -- if omega gets here, something is
+            # already wrong and the safest move is to stop commanding
+            # turn/throttle entirely and hand control back, not to keep
+            # trusting the loop to self-correct.
+            if abs(omega) > SPIN_ABORT_THRESHOLD_DEGS:
+                print(f"  [ABORT] |omega|={abs(omega):.1f}deg/s exceeds "
+                      f"{SPIN_ABORT_THRESHOLD_DEGS:.0f}deg/s safety ceiling -- "
+                      f"cutting turn and throttle, stopping the run")
+                _call_with_retry(traced_act, "turn 0.0", label="act('turn 0.0')")
+                _call_with_retry(traced_act, "throttle 0", label="act('throttle 0')")
+                phase = "aborted_spin"
+                break
+
+            if phase == "ascent":
+                pitch = _pitch_program_deg(altitude_m, pitch_start_alt_m,
+                                            pitch_end_alt_m, max_pitch_deg)
+                desired_theta = _vertical_theta_deg(px, py) - pitch
+                turn_axis = attitude_ctrl.turn_axis_for(theta, desired_theta, omega)
+                _call_with_retry(traced_act, f"turn {turn_axis}", label=f"act('turn {turn_axis}')")
+                throttle = 1.0
+                _call_with_retry(traced_act, f"throttle {throttle}", label=f"act('throttle {throttle}')")
+                print(f"[ascent] alt={altitude_m:8.1f}m pitch={pitch:5.1f}deg theta={theta:7.2f} "
+                      f"turn={turn_axis:+.2f} apo={pred_apo_alt} peri={pred_peri_alt}")
+                if pred_apo_alt is not None and pred_apo_alt >= target_orbit_altitude_m:
+                    phase = "coast_to_apo"
+                    _call_with_retry(traced_act, "throttle 0", label="act('throttle 0')")
+                    print(f"  [phase] apoapsis target reached (predApo={pred_apo_alt:.0f}m) "
+                          f"-- cutting throttle, coasting to apoapsis")
+
+            elif phase == "coast_to_apo":
+                _call_with_retry(traced_act, "turn 0.0", label="act('turn 0.0')")
+                _call_with_retry(traced_act, "throttle 0", label="act('throttle 0')")
+                radial_v = (px * vx + py * vy) / r if r else 0.0
+                print(f"[coast]  alt={altitude_m:8.1f}m radial_v={radial_v:6.1f}m/s "
+                      f"apo={pred_apo_alt} peri={pred_peri_alt}")
+                if abs(radial_v) < 3.0 and altitude_m > pitch_end_alt_m * 0.5:
+                    phase = "circularize"
+                    print(f"  [phase] near apoapsis (radial_v={radial_v:.1f}m/s) -- circularizing")
+
+            elif phase == "circularize":
+                heading_deg = math.degrees(math.atan2(vy, vx)) if math.hypot(vx, vy) > 1e-6 else theta + 90
+                desired_theta = heading_deg - 90.0  # zero-AoA prograde pointing
+                turn_axis = attitude_ctrl.turn_axis_for(theta, desired_theta, omega)
+                _call_with_retry(traced_act, f"turn {turn_axis}", label=f"act('turn {turn_axis}')")
+                throttle = 1.0
+                _call_with_retry(traced_act, f"throttle {throttle}", label=f"act('throttle {throttle}')")
+                print(f"[circ]   alt={altitude_m:8.1f}m theta={theta:7.2f} turn={turn_axis:+.2f} "
+                      f"apo={pred_apo_alt} peri={pred_peri_alt}")
+                if pred_peri_alt is not None and pred_peri_alt >= target_orbit_altitude_m - circularize_tolerance_m:
+                    _call_with_retry(traced_act, "throttle 0", label="act('throttle 0')")
+                    phase = "done"
+                    print(f"  [phase] periapsis raised to {pred_peri_alt:.0f}m (target "
+                          f"{target_orbit_altitude_m:.0f}m) -- ORBIT ACHIEVED, cutting throttle")
+                    break
+
+            time.sleep(dt)
+    finally:
+        try:
+            _call_with_retry(act, "throttle 0", label="final throttle-cut act('throttle 0')")
+        except Exception as e:  # noqa: BLE001 -- safety net, never mask the real error
+            print(f"  [CRITICAL] failed to cut throttle after retries: {e} -- "
+                  f"MANUAL INTERVENTION MAY BE NEEDED, check the game directly")
+
+    return {"final_snapshot": last_snapshot, "phase_reached": phase}
+
+
 if __name__ == "__main__":
     # Manual smoke test -- requires the game running with a rocket
     # loaded in the scene. Adjust target as needed.
