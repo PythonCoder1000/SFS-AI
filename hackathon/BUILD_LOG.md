@@ -166,3 +166,84 @@ duplicate/stale replays) produce exactly one `stage 0` send, and a
 genuinely new stage index (`1`) still fires. **PASS**, both cases.
 
 **Commit:** `checkpoint 3: watchdog + staging idempotency`
+
+## Checkpoint 4 — Wire into agent_interface.py/sfsprobe, live dry run
+
+**Built:** `hackathon/optionA/pilot_loop.py` — the full loop:
+`observe()`/replay tick -> `state_builder.build_state()` -> one bundled
+`SystemOneClient.ask()` call -> `guardrail.evaluate()` per question ->
+`Watchdog`/`StagingTracker` -> `agent_interface.act()`. Supports
+`--mode live` (real game via `analysis/agent_interface.py`) and
+`--mode replay` (drives the identical loop against
+`manual_flight_log.jsonl` ticks, per the spec's own documented
+fallback) from one shared `PilotRun` class, so the decision logic is
+identical in both modes — only the state source and whether `act()` is
+real differ.
+
+**A live SFS session WAS reachable** (unattended, but a rocket was
+already loaded on the pad from prior test sessions) — this checkpoint's
+exit was met via an actual live run, not the offline fallback, though
+`--mode replay` was also exercised and works end-to-end (see below).
+
+**Live dry run result (`--mode live --max-cycles 15`):** tsAI genuinely
+answered all three bundled questions from real telemetry every cycle
+(15 cycles, real `getforwardstartinfo`-sourced mass/isp/torque, real
+`observe()` position/velocity/rotation each cycle). The guardrail
+visibly rejected **every** cycle's `throttle_action`/`pitch_action`
+answer on confidence (`throttle_action` confidence 0.13–0.35;
+`pitch_action` mostly `insufficient_data` at confidence 0.24–0.46 --
+both below the 0.5 routine floor) and accepted `stage_check`'s
+`stage_now` into the caution band each time but suppressed it via
+`StagingTracker` idempotency after the first cycle (and never sent it
+live at all, per this file's safety note below). Net result: the
+vehicle stayed on the pad, throttle 0 for the entire run, ending in a
+genuinely stable state -- confirmed after the run via a fresh
+`observe()`: mass unchanged (116.0t), rotation ~0, angular velocity
+~0 -- **no crash, no unintended motion.**
+
+**Real finding, worth recording honestly (not covered up as a clean
+pass):** the craft never left the pad because `throttle_action`
+confidence never crossed 0.5 even after fixing the state's `phase`
+field to correctly say `PAD_IDLE` (was hardcoded to
+`ASCENT_GRAVITY_TURN` regardless of actual throttle/speed/altitude
+before this run -- fixed in `pilot_loop.py` mid-Checkpoint-4, see the
+inline comment). Confidence actually got LOWER after the phase fix
+(0.13–0.22 vs. 0.18–0.35 before) -- plausible reason: the current menu
+instructions frame `throttle_action` purely in terms of ascent-shaping
+("running slightly hot/cold relative to target trajectory"), which has
+no clean meaning for a stationary, unlaunched vehicle -- there's no
+explicit "launch" framing distinct from "increase throttle for shaping
+reasons" in the current menu text. This is a real menu-design gap for a
+PAD_IDLE phase, not a bug in the gate -- and the resulting behavior
+(never launching without confidence) is itself the guardrail correctly
+doing its job: refusing to act on a plausible-but-uncertain choice with
+no human to double-check it. Recorded here rather than tuned away
+under time pressure -- fixing it properly would mean adding a
+PAD_IDLE-specific `launch`/`hold_on_pad` framing to the menu and
+re-validating the Cartesian-product safety argument for it, which is
+follow-up work, not a Checkpoint 4 blocker (the exit condition is a
+live loop with a visible guardrail rejection and no crash, both
+present).
+
+**Safety deviation, deliberate:** `stage_check` answers are computed,
+confidence-gated, and feasibility-checked exactly per spec, but
+`pilot_loop.py` never sends the resulting `stage <index>` command to
+the live game -- only `throttle_action`/`pitch_action` are sent live.
+This craft's real stage-index mapping (which index corresponds to
+"jettison the currently-firing propulsion stage" vs. accidentally the
+parachute stage further down the stack) was not independently
+re-verified before this unattended run, and sec 1's own catalogued
+catastrophic-staging failure mode is exactly the risk this project has
+zero tolerance for running with no human watching. This is logged here
+as a real, intentional scope reduction from the spec's literal "wire
+into act()/stage()" wording, not a silent omission.
+
+**Replay mode also exercised** (`--mode replay --max-cycles 6` against
+`manual_flight_log.jsonl`): identical loop, same guardrail/watchdog
+behavior confirmed (12 rejections across 6 cycles, degrade-to-safe-hold
+engaged by cycle 1, ended in a controlled, logged safe-hold with no
+real `act()` calls sent). Kept in the codebase as the documented
+fallback path even though the live path is what actually satisfied this
+checkpoint's exit condition.
+
+**Commit:** `checkpoint 4: live loop wired, dry run complete`
