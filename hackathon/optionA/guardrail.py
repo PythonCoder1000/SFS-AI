@@ -49,6 +49,60 @@ def confidence_of(answer: dict) -> float:
     return float(answer.get("confidence", 0.0))
 
 
+# 2026-09-13 LATER SAME DAY fix (Christian's explicit request, following
+# vendor doc confirmation -- console.typesafe.ai/docs/confidence and
+# .../primitives/score, read directly, not assumed): vendor's own docs
+# state plainly that `confidence` is "derived from the probabilities
+# distribution" as a general FLATNESS statistic ("a flatter distribution
+# means lower confidence"), and explicitly invite a domain-specific
+# derived measure instead when the native one doesn't fit ("you are never
+# locked into our definition ... which is exactly why we give you the
+# full probabilities in the response"). throttle_score's six levels are
+# NOT all decision-distinct for this project's purposes -- 0/1/2 all mean
+# "decrease by some amount", 4/5 both mean "increase by some amount" --
+# so probability legitimately spreads across 2-3 adjacent levels even
+# when the DIRECTION is completely unambiguous, which native confidence
+# (a flatness measure over all 6 levels) reads as "uncertain" regardless.
+# CONFIRMED EMPIRICALLY across three real live flights this same day:
+# combined decrease-side probability was consistently 67-84% on cycles
+# where native confidence sat at 0.1-0.5 and the guardrail rejected every
+# one -- see bookkeeping/active_state.md for the full cycle-by-cycle data
+# pulled from Weave. Pooling into three decision-relevant groups (below)
+# is the direct fix.
+THROTTLE_SCORE_DECREASE_KEYS = ("0", "1", "2")
+THROTTLE_SCORE_HOLD_KEY = "3"
+THROTTLE_SCORE_INCREASE_KEYS = ("4", "5")
+
+
+def throttle_score_directional_confidence(probabilities: dict) -> float:
+    """Pools throttle_score's per-level probabilities into
+    {decrease: 0+1+2, hold: 3, increase: 4+5} and returns the max pooled
+    mass -- the "is the DIRECTION clear" analog of vendor confidence
+    (which measures "is any SINGLE level clear" instead, per its own
+    docs). Returns 0.0 defensively if probabilities is missing/empty --
+    never fabricates confidence from nothing, same fail-safe convention
+    as the rest of this project's physics/state functions."""
+    if not probabilities:
+        return 0.0
+    decrease = sum(probabilities.get(k, 0.0) for k in THROTTLE_SCORE_DECREASE_KEYS)
+    hold = probabilities.get(THROTTLE_SCORE_HOLD_KEY, 0.0)
+    increase = sum(probabilities.get(k, 0.0) for k in THROTTLE_SCORE_INCREASE_KEYS)
+    return max(decrease, hold, increase)
+
+
+def effective_confidence(question_name: str, answer: dict) -> float:
+    """The confidence value actually used for the guardrail gate --
+    native vendor confidence (confidence_of()) for every question type
+    EXCEPT throttle_score, which uses throttle_score_directional_
+    confidence() instead. Centralized here (rather than duplicated in
+    confidence_gate() and pilot_loop.py's per-cycle logging) so the
+    gate and the log line displaying "why" can never silently drift onto
+    different numbers for the same answer."""
+    if question_name == "throttle_score" and answer.get("probabilities"):
+        return throttle_score_directional_confidence(answer["probabilities"])
+    return confidence_of(answer)
+
+
 @dataclass
 class GateResult:
     accepted: bool
@@ -57,10 +111,15 @@ class GateResult:
 
 
 def confidence_gate(question_name: str, answer: dict) -> GateResult:
-    """4.1 confidence-band check only -- does not touch feasibility."""
+    """4.1 confidence-band check only -- does not touch feasibility.
+
+    2026-09-13 LATER SAME DAY: uses effective_confidence() rather than
+    confidence_of() directly -- see that function's docstring. Every
+    question type except throttle_score is completely unaffected (they
+    resolve to the exact same value confidence_of() would have given)."""
     question_class = QUESTION_CLASS.get(question_name, "routine")
     band_cfg = BANDS[question_class]
-    conf = confidence_of(answer)
+    conf = effective_confidence(question_name, answer)
 
     if conf < band_cfg["reject_below"]:
         return GateResult(False, "reject",

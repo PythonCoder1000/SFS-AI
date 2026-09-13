@@ -56,14 +56,22 @@ import agent_interface as ai_predict  # noqa: E402  -- predict()/observe_to_stat
 # the live mod's file protocol and stay behind run_live()'s local import.
 from tsai_client import SystemOneClient  # noqa: E402
 from menus import build_menus, mission_profile, throttle_score_to_delta, TURN_AXIS_DELTA  # noqa: E402
-from guardrail import evaluate, confidence_of  # noqa: E402
+from guardrail import evaluate, confidence_of, effective_confidence  # noqa: E402
 from watchdog import Watchdog, StagingTracker  # noqa: E402
 from state_builder import (  # noqa: E402
-    build_state, build_feasibility, build_prediction_block, compute_delta_v_remaining_mps,
+    build_state, build_feasibility, build_prediction_block,
+    compute_delta_v_remaining_mps,
 )
 
 SAFE_HOLD_THROTTLE_CHOICE = "hold"
 SAFE_HOLD_PITCH_CHOICE = "hold"
+# 2026-09-13 LATER SAME DAY: how many recent cycles' summaries ride along
+# in state.history each call -- see PilotRun.cycle_history's docstring.
+# 5 is a starting guess (covers roughly the last few seconds at whatever
+# the current --cycle-period-s/achieved Hz is -- see main()'s
+# --cycle-period-s default for why that's no longer a fixed 0.5s), not
+# yet tuned against real flight data.
+HISTORY_MAX_ENTRIES = 5
 
 
 def log(msg: str) -> None:
@@ -170,6 +178,16 @@ class PilotRun:
         self.last_turn_axis = 0.0  # last commanded turn_axis, fed to predict() as the
         # hypothetical continuation default ("if I keep doing what I'm
         # currently doing, where do I end up") -- see build_cycle_state.
+        # 2026-09-13 LATER SAME DAY addition (Christian's explicit
+        # request, replacing the now-unwired physics scratchpad): rolling
+        # window of recent-cycle throttle/score/confidence summaries, fed
+        # into state.history each cycle (see state_builder.build_state's
+        # docstring). Targets tsAI's own self-reported explanation for
+        # why its confidence collapsed over a real sustained flight --
+        # every call was previously fully stateless, so a genuinely
+        # ongoing correction and a brand-new situation looked identical.
+        # Capped at HISTORY_MAX_ENTRIES, oldest dropped first.
+        self.cycle_history = []
 
     def _vehicle_from_snapshot(self, snapshot: dict, torque_effective_raw: float) -> dict:
         px = snapshot.get("location.position.x", 0.0)
@@ -253,7 +271,9 @@ class PilotRun:
             target_altitude_m=self.mission_target.get("apoapsis_m"),
             current_altitude_m=vehicle["altitude_m"],
             current_vertical_speed_mps=vehicle["vertical_speed_mps"],
-            g_local_mps2=g_local)
+            g_local_mps2=g_local,
+            current_t=t,
+            prev_history_entry=(self.cycle_history[-1] if self.cycle_history else None))
         # Phase must match the REAL state, not just always claim ascent --
         # a "PAD_IDLE" craft (throttle 0, negligible speed, low altitude)
         # mislabeled as mid-gravity-turn is exactly the kind of
@@ -266,7 +286,8 @@ class PilotRun:
         else:
             phase = "ASCENT_GRAVITY_TURN"
         return build_state(cycle_id, t, phase, self.mission_target,
-                            vehicle, feasibility, prediction)
+                            vehicle, feasibility, prediction,
+                            history=list(self.cycle_history[-HISTORY_MAX_ENTRIES:]))
 
     def run_cycle(self, cycle_id: int, snapshot: dict, torque_effective_raw: float,
                   act_fn) -> bool:
@@ -294,8 +315,17 @@ class PilotRun:
                 gate_results[qname] = evaluate(qname, ans, state)
                 gr = gate_results[qname]
                 shown = ans.get("choice", ans.get("score"))
+                native_conf = confidence_of(ans)
+                gate_conf = effective_confidence(qname, ans)
+                # 2026-09-13 LATER SAME DAY: throttle_score's gate now uses
+                # a different number than its native confidence (see
+                # guardrail.effective_confidence's docstring) -- show both
+                # whenever they diverge so a log reader isn't misled into
+                # thinking the printed number is what the gate decided on.
+                conf_display = (f"{native_conf:.3f}" if abs(native_conf - gate_conf) < 1e-9
+                                 else f"{native_conf:.3f} (gate used directional={gate_conf:.3f})")
                 log(f"cycle {cycle_id}: {qname} answer={shown!r} "
-                    f"conf={confidence_of(ans):.3f} -> "
+                    f"conf={conf_display} -> "
                     f"{'ACCEPT' if gr.accepted else 'REJECT'} band={gr.band} "
                     f"reason={gr.reason}")
                 if not gr.accepted:
@@ -402,6 +432,28 @@ class PilotRun:
             throttle_label = f"score={score:.2f}(delta={delta:+.3f})"
         # else: HOLD-LAST or DEGRADED-SAFE-HOLD -- self.current_throttle
         # unchanged, throttle_label stays "hold".
+
+        # 2026-09-13 LATER SAME DAY addition (Christian's explicit
+        # request, replacing the now-unwired physics scratchpad): record
+        # this cycle's throttle_score summary for state.history on the
+        # NEXT cycle (see PilotRun.cycle_history's docstring and
+        # state_builder.build_state's history param). Deliberately only
+        # covers throttle_score, not launch_decision/pitch_action/
+        # stage_check -- the confidence-collapse finding this targets was
+        # specific to throttle_score's sustained-correction cycles.
+        ts_answer = answers.get("throttle_score")
+        self.cycle_history.append({
+            "cycle_id": cycle_id,
+            "t": round(t, 2),
+            "phase": phase,
+            "throttle": round(self.current_throttle, 3),
+            "throttle_score": None if ts_answer is None else ts_answer.get("score"),
+            "throttle_score_confidence": None if ts_answer is None else ts_answer.get("confidence"),
+            "accepted_this_cycle": fresh_accept,
+            "coast_apoapsis_error_m": state["prediction"].get("coast_apoapsis_error_m"),
+        })
+        if len(self.cycle_history) > HISTORY_MAX_ENTRIES:
+            self.cycle_history.pop(0)
 
         tag = "DEGRADED-SAFE-HOLD" if outcome.degraded else (
             "HOLD-LAST" if outcome.held_from_last else "LIVE")
@@ -534,6 +586,10 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
         ai.act(f"turn {turn_axis:.3f}")
 
     cycle_id = 0
+    loop_start_t = time.time()  # 2026-09-13 LATER SAME DAY: real achieved
+    # Hz measurement, not just the --cycle-period-s setting -- the real
+    # floor is tsAI latency + game IPC round-trip, so the setting alone
+    # doesn't tell you what rate was actually achieved.
     try:
         while True:
             snapshot = ai.observe()
@@ -552,6 +608,10 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
                 break
             time.sleep(cycle_period_s)
     finally:
+        elapsed_s = time.time() - loop_start_t
+        if cycle_id > 0 and elapsed_s > 0:
+            log(f"achieved rate: {cycle_id} cycles in {elapsed_s:.1f}s "
+                f"= {cycle_id / elapsed_s:.2f} Hz (--cycle-period-s was {cycle_period_s})")
         log("run ending -- commanding safe throttle-down/attitude-hold")
         _safe_shutdown_act(ai, "throttle 0.0")
         _safe_shutdown_act(ai, "turn 0.0")
@@ -638,8 +698,17 @@ def run_replay(log_path: str, max_cycles: int, mission_target: dict) -> PilotRun
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["live", "replay"], default="live")
-    parser.add_argument("--max-cycles", type=int, default=20)
-    parser.add_argument("--cycle-period-s", type=float, default=0.5)
+    parser.add_argument("--max-cycles", type=int, default=50)
+    # 2026-09-13 LATER SAME DAY: lowered from 0.5 (Christian's explicit
+    # request -- 1Hz effective loop rate was too slow to catch a
+    # fast-closing coast_apoapsis_error_m in time, confirmed live: 14
+    # cycles of continuous, correctly-directed graduated braking still
+    # weren't enough on a T/W~3+ craft). 0.0 removes the artificial sleep
+    # entirely -- the real floor becomes tsAI's own round-trip latency
+    # (~0.2-0.3s per call, confirmed from real traces) plus the game's
+    # file-polling IPC, not this constant. Real achieved Hz is now logged
+    # at DONE so this can be tuned from measured data, not guessed.
+    parser.add_argument("--cycle-period-s", type=float, default=0.0)
     parser.add_argument("--replay-log", default=os.path.join(HERE, "..", "manual_flight_log.jsonl"))
     args = parser.parse_args()
 

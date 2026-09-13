@@ -61,6 +61,30 @@ Design rules applied here (OPTION_A_BUILD_SPEC.md sec 4.3), non-negotiable:
    `hold_on_pad` (pitch_action, +0.0), added in Checkpoint 6 for
    PAD_IDLE framing, is unaffected by either change -- still a
    zero-magnitude turn delta, still covered by the original argument.
+
+   *** 2026-09-13, third change, does NOT need cartesian_check.py
+   re-vetting: *** `THROTTLE_SCORE_MENU`'s instructions briefly pointed
+   tsAI at a new `state.physics` block (thrust_accel_mps2/
+   gravity_accel_mps2/net_accel_mps2 -- see state_builder.py's
+   build_physics_block()) before scoring. REMOVED again the same day: a
+   real live flight showed confidence on throttle_score collapsing over
+   sustained cycles (0.48 -> 0.09) with this block present every cycle
+   -- it didn't hurt, but didn't fix the actual failure either.
+   build_physics_block() is kept in state_builder.py, unwired, for a
+   future reshape -- not currently sent.
+
+   *** 2026-09-13, fourth change, ALSO does NOT need cartesian_check.py
+   re-vetting: *** `THROTTLE_SCORE_MENU`'s instructions now instead
+   point tsAI at a new `state.history` list (last few cycles'
+   throttle/score/confidence/coast_apoapsis_error_m -- see
+   state_builder.py's build_state() `history` param and pilot_loop.py's
+   PilotRun.cycle_history). Motivated by tsAI's own self-report (asked
+   directly why its confidence collapsed over a sustained flight: 66%
+   'repeated_near_identical_state', 27% 'no_memory_of_trend') --
+   every call was previously fully stateless, so a genuinely ongoing
+   correction and a brand-new situation looked identical. Same safety
+   category as the physics-block change above: input/instructions only,
+   no menu vocabulary, score->delta mapping, or clamp path touched.
 """
 
 INSUFFICIENT_DATA_PHRASING = (
@@ -173,6 +197,20 @@ THROTTLE_SCORE_MENU = {
         "right correction sits between two anchor points (e.g. more than "
         "a small decrease but less than a large one), score accordingly "
         "in between them rather than rounding to the nearest anchor. "
+        "`state.history` (when present) lists your last few cycles' "
+        "throttle/score/confidence/coast_apoapsis_error_m, oldest first -- "
+        "use it to tell whether this is a NEW situation or a CONTINUATION "
+        "of a correction already underway: if coast_apoapsis_error_m has "
+        "been shrinking toward zero cycle over cycle, that correction is "
+        "WORKING and a similar or smaller score is likely still right; if "
+        "it has been flat or growing despite recent corrections, the "
+        "prior magnitude was insufficient and a LARGER score is likely "
+        "needed, not a repeat of the same one. Do not let seeing several "
+        "similar-looking recent cycles in `state.history` lower your "
+        "confidence on its own -- similarity across cycles is expected "
+        "during a sustained correction, not evidence of ambiguity; judge "
+        "confidence from how clearly the CURRENT numbers support a "
+        "choice, the same as if `state.history` were empty. "
         "`state.prediction.coast_apoapsis_m` is the altitude this "
         "trajectory would coast up to if thrust were cut THIS INSTANT "
         "(closed-form, ignores drag/horizontal motion) -- "
@@ -184,6 +222,20 @@ THROTTLE_SCORE_MENU = {
         "for magnitude -- it directly answers 'how far off would doing "
         "nothing more leave me', which is a more concrete basis for the "
         "score than eyeballing raw altitude/speed/feasibility numbers. "
+        "CRITICAL, on a powerful vehicle: coast_apoapsis_error_m can move "
+        "by thousands of meters in a SINGLE cycle once vertical speed is "
+        "high (it scales with speed squared), so waiting until it's "
+        "already positive to start backing off is often already too "
+        "late. `coast_apoapsis_closure_rate_mps` (how fast the error is "
+        "moving toward/through zero, computed from this cycle vs the "
+        "last) and `coast_apoapsis_seconds_to_crossover` (a linear "
+        "extrapolation of how many seconds until it crosses zero AT THAT "
+        "RATE, or null if no crossover is currently projected) exist "
+        "specifically so you can start reducing throttle BEFORE "
+        "coast_apoapsis_error_m itself goes positive, proportional to how "
+        "soon and how fast it's closing -- a short seconds_to_crossover "
+        "with still-negative coast_apoapsis_error_m calls for an early, "
+        "partial decrease now, not waiting for confirmation. "
         "`terminal_error` (the 15s forward-simulated prediction assuming "
         "throttle/turn_axis HOLD UNCHANGED) is a secondary cross-check, "
         "not the primary signal, since it reflects a fixed future horizon "

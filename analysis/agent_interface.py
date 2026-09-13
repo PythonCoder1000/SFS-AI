@@ -39,13 +39,33 @@ RESULT_FILE = MOD_DIR / "result.txt"
 SNAPSHOT_FILE = MOD_DIR / "sfs_probe_telemetry_snapshot.json"
 
 
-def _send_command(command: str, timeout_s: float = 5.0, poll_s: float = 0.1) -> str:
+def _send_command(command: str, timeout_s: float = 5.0, poll_s: float = 0.01) -> str:
     """Low-level file-protocol send/receive -- same protocol
     sfsprobe/probe_cmd.py uses (command.txt/result.txt polling), just
     importable here instead of only callable as a subprocess, since a
     standalone AI loop needs this as a library call, not a CLI script.
     See that file's own docstring for why polling result.txt beats a
-    fixed sleep."""
+    fixed sleep.
+
+    2026-09-13 LATER SAME DAY: poll_s lowered from 0.1 (Christian's
+    explicit request, chasing the pilot loop's achieved-Hz bottleneck).
+    Measured live: at poll_s=0.1, observe()/act() round-trips were a
+    suspiciously uniform ~0.105s every time (10 calls, 0.103-0.106s) --
+    too tight a spread to be real game/IPC jitter, and almost exactly
+    poll_s itself. The mod's own PollCommands() checks command.txt every
+    0.05s (ProbeRunner.Update(), sfsprobe/SFSProbe.cs), so our old 0.1s
+    poll interval was the dominant term, not the mod or the game.
+    Confirmed by direct A/B: poll_s=0.01 measured ~0.055s mean round-trip
+    (8 calls, 0.046-0.063s) -- roughly half, and now in line with the
+    mod's own ~0.025s average detection latency (half its 0.05s poll
+    period) plus real overhead. Not pushed lower than 0.01 -- the mod's
+    own poll cadence is now the likely floor without a C#-side change,
+    and busy-waiting much tighter than that mostly burns CPU for no
+    further real gain. A genuine floor below this needs a real socket
+    protocol replacing this file-polling IPC entirely (see the separate
+    tcp-rewrite branch/effort for that -- deliberately NOT attempted
+    here, kept as a small, low-risk, easily-revertable change on its
+    own)."""
     if not RESULT_FILE.exists():
         RESULT_FILE.touch()
     start_size = RESULT_FILE.stat().st_size
