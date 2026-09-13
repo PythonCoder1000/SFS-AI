@@ -138,3 +138,31 @@ clearing the irreversible-class confidence floor; (3) sanity control
 (feasible + confident `hold`) accepted cleanly. **PASS**, all three.
 
 **Commit:** `checkpoint 2: feasibility + confidence gate`
+
+## Checkpoint 3 — Watchdog + staging idempotency
+
+**Built:**
+- `hackathon/optionA/watchdog.py` — `Watchdog` (miss-counting,
+  hold-last-accepted-command for exactly 1 miss, degrade to a
+  caller-supplied phase-default safe-hold at 2+ consecutive misses per
+  sec 6; `DEGRADE_AFTER_MISSES = 2` kept as the spec's own placeholder,
+  not tightened yet — no real dry-run miss data exists until Checkpoint
+  4) and `StagingTracker` (edge-triggered staging: a stage index fires
+  at most once, tracked by the index itself as the command ID — a
+  duplicate/replayed response targeting an already-fired index is a
+  no-op, never a second `stage <index>` send; a genuinely new index
+  still fires normally).
+- Kept staging idempotency deliberately STRICTER than the continuous-
+  command hold logic: replaying a bounded throttle/pitch hold is safe
+  (reversible), replaying a stage command is not (sec 1's known
+  catastrophic-staging failure mode class).
+
+**Exit check result:** `uv run python3 hackathon/optionA/test_checkpoint3.py`
+— dropped-response case: 1st miss holds the last accepted
+throttle/pitch command exactly once, 2nd consecutive miss degrades to
+the safe-hold default, and a subsequent hit resets the streak; duplicate
+-response case: three `stage 0` requests (one genuine + two
+duplicate/stale replays) produce exactly one `stage 0` send, and a
+genuinely new stage index (`1`) still fires. **PASS**, both cases.
+
+**Commit:** `checkpoint 3: watchdog + staging idempotency`
