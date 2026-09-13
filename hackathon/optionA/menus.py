@@ -518,10 +518,11 @@ STAGE_CHECK_MENU = {
 TASK_STATUS_MENU = {
     "type": "choice",
     "instructions": (
-        "You are piloting a rocket on a vertical-hop mission "
-        "(`state.mission_target.apoapsis_m` is the target altitude, "
-        "`periapsis_m` <= 0 -- no orbit, just reach the target altitude "
-        "and come back down). Decide whether this ASCENT CONTROL TASK is "
+        "You are piloting a rocket during ascent (this project currently "
+        "flies both vertical-hop missions, `periapsis_m` <= 0, and "
+        "orbital-ascent missions, `periapsis_m` > 0 -- "
+        "`state.mission_target.apoapsis_m` is the target altitude either "
+        "way). Decide whether this ASCENT CONTROL TASK is "
         "DONE -- meaning no further throttle action can meaningfully "
         "change the outcome, NOT whether the mission was a success. "
         "'Done' and 'succeeded' are different questions: a flight that "

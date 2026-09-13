@@ -780,18 +780,33 @@ def main():
     # at DONE so this can be tuned from measured data, not guessed.
     parser.add_argument("--cycle-period-s", type=float, default=0.0)
     parser.add_argument("--replay-log", default=os.path.join(HERE, "..", "manual_flight_log.jsonl"))
+    # 2026-09-13 STILL LATER SAME DAY addition (Christian's explicit
+    # request -- "test a real turn signal, see if it can do any orbital
+    # stuff"): mission_target was previously hardcoded to a fixed
+    # vertical-hop mission (periapsis_m=0) every run, so pitch_action's
+    # ORBITAL_ASCENT gravity-turn framing (see menus._pitch_action_menu's
+    # profile branch) had never actually been exercised live -- every
+    # flight tonight held vertical the whole way by design (profile ==
+    # 'vertical_hop'). Exposed as real CLI flags instead of editing the
+    # hardcoded dict, so this is a reusable knob, not a one-off hack.
+    # Defaults preserve tonight's exact vertical-hop mission unchanged.
+    parser.add_argument("--apoapsis-m", type=float, default=5000.0)
+    parser.add_argument("--periapsis-m", type=float, default=0.0,
+                         help="> 0 switches menus.mission_profile() to "
+                              "'orbital_ascent' (real gravity-turn pitch "
+                              "shaping) instead of 'vertical_hop' (hold "
+                              "vertical). NOTE: this craft's real delta-v "
+                              "budget (~200m/s) is nowhere near what a "
+                              "real circular orbit needs at low altitude "
+                              "on this body (~1743 m/s at ~5000m, mu/r^2 "
+                              "physics) -- a positive periapsis_m tests "
+                              "the gravity-turn PITCH LOGIC, not an "
+                              "actually-achievable orbital insertion.")
+    parser.add_argument("--delta-v-required-mps", type=float, default=150.0)
     args = parser.parse_args()
 
-    # 2026-09-13: lowered from 400 -- that value exceeded BOTH the live
-    # craft's (~252m/s) and replay craft's (~189m/s) delta-v estimates
-    # under state_builder's own 35%-wet-mass dry-mass ballpark, which
-    # meant the mission was infeasible before a single cycle ran (see
-    # _preflight_feasibility_gate and BUILD_LOG.md's 2026-09-13 entry).
-    # 150 clears both known estimates with margin. Still a placeholder,
-    # not a physically-derived number -- the real fix is a better
-    # dry-mass estimate, tracked separately.
-    mission_target = {"apoapsis_m": 5000, "periapsis_m": 0,
-                       "delta_v_required_for_target_mps": 150.0}
+    mission_target = {"apoapsis_m": args.apoapsis_m, "periapsis_m": args.periapsis_m,
+                       "delta_v_required_for_target_mps": args.delta_v_required_mps}
 
     if args.mode == "live":
         run = run_live(args.max_cycles, args.cycle_period_s, mission_target)
