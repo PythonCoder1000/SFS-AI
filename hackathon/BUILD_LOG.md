@@ -373,3 +373,152 @@ priority is exactly a guardrail that will accept "no flight" over
 guessing.
 
 **Final commit:** `checkpoint 5: Option A build complete, see BUILD_LOG.md`
+
+## Checkpoint 6 — PAD_IDLE menu framing fix (follow-up to Checkpoint 4/5)
+
+Follow-up task, unattended, per the Checkpoint 4/5 finding: the
+`throttle_action`/`pitch_action` menu instructions and criteria in
+`hackathon/optionA/menus.py` assumed an in-progress ascent for every
+choice, so a genuinely idle/unlaunched vehicle (`state.phase ==
+"PAD_IDLE"`) had no clean way to be answered about -- tsAI was forced
+to reinterpret "increase throttle for ascent-shaping reasons" as a
+liftoff decision, which measurably lowered its confidence and kept the
+craft grounded for the whole Checkpoint 4 live dry run (not wrongly --
+the guardrail correctly refused to act on an under-confident answer --
+but for the wrong underlying reason: a menu-design gap, not a real
+absence of evidence).
+
+**HARD CONSTRAINT observed this session:** no live launch was
+attempted, and no `pilot_loop.py --mode live` run was made at any point
+in this checkpoint. Everything below was validated via `--mode replay`,
+the unit/synthetic checkpoint tests, the offline Cartesian-product
+check, and direct (non-`act()`) calls to `SystemOneClient.ask()` for
+real-telemetry confidence inspection only -- consistent with this
+session's instructions.
+
+**Built / changed:**
+- `hackathon/optionA/menus.py`:
+  - Added a new PAD_IDLE-only `throttle_action` choice, `launch`
+    (throttle delta +0.30 -- sits exactly at, not past,
+    `agent_interface.act()`'s existing `MAX_THROTTLE_STEP` (0.3) hard
+    clamp, so it needs no clamp change and no new bound to justify).
+  - Added a new PAD_IDLE-only `pitch_action` choice, `hold_on_pad`
+    (turn_axis delta +0.0 -- a zero-magnitude command, distinct in
+    *label* from ascent's `hold` so tsAI is never asked to reuse an
+    ascent-shaping label for a grounded vehicle, but identical in
+    *effect*: no rotation command).
+  - Rewrote both menus' `instructions` to explicitly branch on
+    `state.phase`: PAD_IDLE vehicles are told to choose only between
+    `launch`/`hold` (throttle) or `hold_on_pad` (pitch) using
+    PAD_IDLE-specific criteria text; ASCENT_GRAVITY_TURN vehicles keep
+    the original ascent-shaping criteria, now explicitly labeled
+    "ASCENT_GRAVITY_TURN ONLY" so tsAI is told the existing options
+    don't apply to a stationary craft rather than left to infer it.
+  - `hold` (throttle) keeps working for both phases but now carries two
+    distinct criteria sentences (PAD_IDLE: "stay on the pad, don't
+    launch yet" vs. ASCENT_GRAVITY_TURN: "current setting is on
+    track") -- deliberately kept as one shared choice rather than
+    forked into `hold`/`hold_on_pad` like pitch_action, since "stay at
+    the current throttle setting" is one coherent idea in both phases
+    (0.0 throttle on the pad, whatever-it-is in ascent); pitch_action's
+    `hold` genuinely means something different in each phase (attitude
+    -tracking vs. no-rotation-applicable), which is why it got a
+    separate label instead.
+  - Updated the module docstring's Cartesian-product design-rule
+    paragraph to describe the new choices and point at the two-case
+    check below instead of the original single mid-flight case.
+- `hackathon/optionA/cartesian_check.py` (sec 4.3 point 4 re-run,
+  required before considering this done): restructured into two
+  worst-case cases instead of one:
+  - **Case 1** (unchanged): the original ASCENT_GRAVITY_TURN worst case
+    (`increase_large` + `prograde_large`/`retrograde_large`, whichever
+    the dict iteration picks first at tied magnitude) from a real
+    mid-flight tick.
+  - **Case 2** (new): a PAD_IDLE worst case -- `launch` (+0.30 throttle)
+    paired *pessimistically* with the largest available turn_axis
+    magnitude in the whole menu (not the menu's own recommended
+    `launch` + `hold_on_pad` pairing, which is turn_axis=0.0 and
+    therefore strictly less aggressive than what this check exercises),
+    from a real near-zero-speed, low-altitude tick (the first recorded
+    sample -- the closest real stand-in this log has for an actual pad
+    state).
+  - **Result:** `uv run python3 hackathon/optionA/cartesian_check.py`
+    -- both cases report `collided=False`. **PASS.** Case 2's final
+    altitude goes slightly negative (h=-58.9m) from this near-ground
+    starting sample, same as Case 1 and same as the original
+    Checkpoint 1 finding -- confirmed this is the same pre-existing
+    low-altitude terrain-resolution/gravity artifact already flagged in
+    Checkpoint 1 (it happens at zero throttle too), not something
+    introduced by `launch`. The structural safety argument is unchanged
+    and, if anything, strengthened: `launch` sits at the *same* hard
+    clamp boundary the existing menu already relied on (+0.30 vs. the
+    previous max of +0.20, both inside `MAX_THROTTLE_STEP=0.3`), and
+    `hold_on_pad` is a zero-magnitude command, so neither choice
+    required loosening any existing bound.
+- `hackathon/optionA/test_checkpoint6.py` (new): makes a REAL
+  `/v1/systemone` call (via `SystemOneClient.ask()`, no `act()` call
+  anywhere in the file) against a real recorded low-altitude tick from
+  `manual_flight_log.jsonl`, built as an explicit PAD_IDLE state
+  (`phase="PAD_IDLE"`, `throttle=0.0`) using the same real-telemetry
+  approach as `test_checkpoint1.py`. Confirms answers are sane, in the
+  (now-expanded) menu vocabulary, and confidence-bounded.
+
+**Real-telemetry confidence result (`test_checkpoint6.py`, a genuine
+tsAI classification call, not simulated):**
+```
+throttle_action: choice='hold' confidence=0.6
+pitch_action:    choice='hold_on_pad' confidence=1.0
+```
+Compare to Checkpoint 4/5's actual live PAD_IDLE run under the OLD menu
+wording: `throttle_action` confidence 0.13-0.22 (well below the 0.5
+routine floor) and `pitch_action` mostly `insufficient_data` at
+confidence 0.24-0.46 (also below floor). The new PAD_IDLE-specific
+framing took `throttle_action` from consistently-rejected to
+consistently-accepted-band and `pitch_action` from
+mostly-insufficient-data to fully confident -- a real, measured
+improvement from the menu-wording fix, not an assumption.
+
+**End-to-end confirmation (`--mode replay --max-cycles 6`, no live game
+involved):** across the log's early, genuinely PAD_IDLE-phase cycles
+(0-4: throttle 0, altitude 63.5m, negligible speed -- `build_cycle_state`'s
+own phase-detection logic classifies these as PAD_IDLE), the loop now
+gets `throttle_action='hold'` at confidence 0.63-0.79 (ACCEPT, caution
+or normal band) and `pitch_action='hold_on_pad'` at confidence 1.0
+(ACCEPT, normal band) every cycle -- both cleanly accepted rather than
+rejected, and both correctly resolving to a zero-command hold (the
+vehicle never received a `launch` answer from this particular log,
+which is itself expected and correct: this log is an altitude-hold
+test, not a real launch-readiness profile, so there is no real evidence
+in it that should make tsAI choose `launch`). Cycle 5 (where the log's
+phase shifts away from PAD_IDLE) reverts to the previously-documented
+low-confidence ascent-framing rejections, unchanged from Checkpoint 4/5
+behavior -- confirming the fix is scoped to PAD_IDLE and did not alter
+ascent-phase behavior.
+
+**Why a live re-run to see an actual `launch` accepted/sent was NOT
+attempted (documented per this session's instructions, not silently
+skipped):** confirming that the new `launch` choice would actually be
+chosen, accepted by the confidence gate, and result in a real nonzero
+throttle command reaching the game would require either (a) a live SFS
+session with a craft in a genuine, evidence-rich PAD_IDLE state with a
+real mission target that plausibly justifies immediate launch, run
+through `--mode live`, or (b) accepting a lucky confidence roll on the
+same ambiguous replay log used above. Both would risk -- or in case (a),
+require as the very definition of success -- a real nonzero throttle
+command reaching the live game, which this session's hard constraint
+explicitly prohibits regardless of how confident tsAI's answer might
+be. This is left as a documented follow-up: the NEXT attended
+Checkpoint 4-style live dry run (with a human able to watch and abort)
+is the right place to observe whether `launch` is actually selected and
+correctly gated on a real PAD_IDLE craft, not this unattended session.
+
+**Exit check result:** `uv run python3 hackathon/optionA/cartesian_check.py`
+-- PASS, both cases (sec 4.3 point 4 re-run, as required before
+considering this fix done). `uv run python3 hackathon/optionA/test_checkpoint6.py`
+-- PASS. Pre-existing `test_checkpoint{1,2,3}.py` re-run to confirm no
+regression from the menu changes -- all three still PASS unchanged.
+`--mode replay --max-cycles 6` re-run end-to-end -- confirms the fix's
+effect on real loop behavior (PAD_IDLE cycles now ACCEPT instead of
+REJECT) without any live game involvement.
+
+**Commit:** `checkpoint 6: PAD_IDLE menu framing fix + re-validated Cartesian check`
