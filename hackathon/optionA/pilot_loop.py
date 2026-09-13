@@ -62,6 +62,7 @@ from state_builder import (  # noqa: E402
     build_state, build_feasibility, build_prediction_block,
     compute_delta_v_remaining_mps,
 )
+from overlay_state import write_overlay_state, write_overlay_status_only  # noqa: E402
 
 SAFE_HOLD_THROTTLE_CHOICE = "hold"
 SAFE_HOLD_PITCH_CHOICE = "hold"
@@ -206,8 +207,20 @@ class PilotRun:
         body = fsim.PLANET_CONSTANTS["Earth"]
         r = math.hypot(px, py)
         altitude_m = r - body["radius_m"]
-        rot_deg = math.degrees(snapshot.get("rb2d.rotation", 0.0))
-        angv_dps = math.degrees(snapshot.get("rb2d.angularVelocity", 0.0))
+        # 2026-09-13 EVEN LATER SAME DAY fix (Christian's explicit
+        # request, confirmed via a real setrot test + the exact unit
+        # warning already documented in forward_sim.py's
+        # test_against_run_trajectory docstring): rb2d.rotation and
+        # rb2d.angularVelocity are ALREADY in degrees / deg-per-second
+        # (Unity's Rigidbody2D convention), not radians -- this was
+        # WRONGLY applying math.degrees() to an already-degree value,
+        # producing a rotation ~57x too large (confirmed live: setrot 45
+        # read back as raw rb2d.rotation=48.26, not 0.785 rad). This fed
+        # a nonsensical angle_deg to tsAI's pitch_action every cycle,
+        # which is almost certainly why it locked onto 'hold' at
+        # confidence 1.000 regardless of the craft's real attitude.
+        rot_deg = snapshot.get("rb2d.rotation", 0.0)
+        angv_dps = snapshot.get("rb2d.angularVelocity", 0.0)
         mass_t = snapshot.get("rb2d.mass", self.craft_mass_t)
         fuel_pct = max(0.0, min(100.0,
                                  100.0 * (mass_t - self.craft_dry_mass_t) /
@@ -516,6 +529,20 @@ class PilotRun:
             rejections_logged_total=self.rejections_logged,
         )
 
+        # HUD overlay -- one write per cycle, for the fullscreen judge-facing
+        # Swift overlay (hackathon/overlay/). Never allowed to affect flight
+        # control: any failure here is swallowed and logged, not raised.
+        try:
+            write_overlay_state(
+                status="active", cycle_id=cycle_id, t=t, phase=phase,
+                mission_target=self.mission_target, answers=answers,
+                gate_results=gate_results, menus=self.menus,
+                commanded_throttle=self.current_throttle, commanded_turn_axis=turn_axis,
+                watchdog_tag=tag,
+            )
+        except Exception as e:  # noqa: BLE001 -- cosmetic HUD write, never fatal
+            log(f"cycle {cycle_id}: [WARN] overlay write failed: {e}")
+
         act_fn(self.current_throttle, turn_axis, extra_commands,
                full_authority_throttle=(throttle_label == "launch"))
 
@@ -635,6 +662,11 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
     if not _preflight_feasibility_gate(mass_t, dry_mass_t, isp, mission_target):
         return run  # 0 cycles run -- nothing was ever commanded, nothing to shut down
 
+    try:
+        write_overlay_status_only("active")
+    except Exception as e:  # noqa: BLE001 -- cosmetic HUD write, never fatal
+        log(f"  [WARN] overlay status write failed: {e}")
+
     def act_fn(throttle, turn_axis, extra_commands=None, full_authority_throttle=False):
         for cmd in extra_commands or []:
             log(f"  -> sending live: {cmd!r}")
@@ -650,7 +682,9 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
     try:
         while True:
             snapshot = ai.observe(use_tcp=True)
-            angv_dps = abs(math.degrees(snapshot.get("rb2d.angularVelocity", 0.0)))
+            # rb2d.angularVelocity is already deg/s (see the unit note in
+            # _vehicle_from_snapshot above) -- no math.degrees() here either.
+            angv_dps = abs(snapshot.get("rb2d.angularVelocity", 0.0))
             if angv_dps > 500.0 or any(
                 math.isnan(snapshot.get(k, 0.0)) for k in
                 ("location.position.x", "location.position.y",
@@ -670,6 +704,10 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
             log(f"achieved rate: {cycle_id} cycles in {elapsed_s:.1f}s "
                 f"= {cycle_id / elapsed_s:.2f} Hz (--cycle-period-s was {cycle_period_s})")
         log("run ending -- commanding safe throttle-down/attitude-hold")
+        try:
+            write_overlay_status_only("ended")
+        except Exception as e:  # noqa: BLE001 -- cosmetic HUD write, never fatal
+            log(f"  [WARN] overlay status write failed: {e}")
         _safe_shutdown_act(ai, "throttle 0.0")
         _safe_shutdown_act(ai, "turn 0.0")
         if run.master_ignited:
