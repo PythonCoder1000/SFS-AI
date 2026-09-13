@@ -188,6 +188,15 @@ class PilotRun:
         # ongoing correction and a brand-new situation looked identical.
         # Capped at HISTORY_MAX_ENTRIES, oldest dropped first.
         self.cycle_history = []
+        # 2026-09-13 EVEN LATER SAME DAY addition (Christian's explicit
+        # request): set True once task_status is ACCEPTED (>=0.9
+        # confidence, guardrail.BANDS['task_completion']) with choice
+        # 'task_complete'. Checked by run_cycle()'s return value -- once
+        # True, the run ends on this cycle's return regardless of
+        # max_cycles. Deliberately a one-way flag (never reset back to
+        # False) -- a single confirmed-complete reading ends the run;
+        # this is not re-checked or reversible by a later cycle.
+        self.task_complete_confirmed = False
 
     def _vehicle_from_snapshot(self, snapshot: dict, torque_effective_raw: float) -> dict:
         px = snapshot.get("location.position.x", 0.0)
@@ -241,6 +250,21 @@ class PilotRun:
             delta_v_required_for_target_mps=self.mission_target.get(
                 "delta_v_required_for_target_mps", 0.0),
         )
+        # Phase must match the REAL state, not just always claim ascent --
+        # a "PAD_IDLE" craft (throttle 0, negligible speed, low altitude)
+        # mislabeled as mid-gravity-turn is exactly the kind of
+        # note-sec-5-warns-about ambiguity that (correctly) drives tsAI's
+        # confidence down and the guardrail rejects on. Found live during
+        # this Checkpoint 4 run -- see BUILD_LOG.md.
+        # 2026-09-13 EVEN LATER SAME DAY: moved ABOVE the prediction-block
+        # call (was below it) so compute_coast_apoapsis_trend() can use
+        # the real current phase for its phase-consistency validity check
+        # -- see state_builder.compute_coast_apoapsis_trend()'s docstring.
+        speed = math.hypot(vehicle["horizontal_speed_mps"], vehicle["vertical_speed_mps"])
+        if vehicle["throttle"] <= 0.01 and speed < 5.0 and vehicle["altitude_m"] < 200.0:
+            phase = "PAD_IDLE"
+        else:
+            phase = "ASCENT_GRAVITY_TURN"
         # 2026-09-13 fix: this was ALWAYS build_prediction_block(None, ...)
         # -- a permanent null/low-confidence stub, every cycle, live
         # flight included. tsAI's own menu instructions explicitly tell it
@@ -273,18 +297,11 @@ class PilotRun:
             current_vertical_speed_mps=vehicle["vertical_speed_mps"],
             g_local_mps2=g_local,
             current_t=t,
-            prev_history_entry=(self.cycle_history[-1] if self.cycle_history else None))
-        # Phase must match the REAL state, not just always claim ascent --
-        # a "PAD_IDLE" craft (throttle 0, negligible speed, low altitude)
-        # mislabeled as mid-gravity-turn is exactly the kind of
-        # note-sec-5-warns-about ambiguity that (correctly) drives tsAI's
-        # confidence down and the guardrail rejects on. Found live during
-        # this Checkpoint 4 run -- see BUILD_LOG.md.
-        speed = math.hypot(vehicle["horizontal_speed_mps"], vehicle["vertical_speed_mps"])
-        if vehicle["throttle"] <= 0.01 and speed < 5.0 and vehicle["altitude_m"] < 200.0:
-            phase = "PAD_IDLE"
-        else:
-            phase = "ASCENT_GRAVITY_TURN"
+            prev_history_entry=(self.cycle_history[-1] if self.cycle_history else None),
+            current_phase=phase,
+            mass_t=mass_t,
+            total_thrust_t=self.craft_total_thrust_t,
+            current_throttle=vehicle["throttle"])
         return build_state(cycle_id, t, phase, self.mission_target,
                             vehicle, feasibility, prediction,
                             history=list(self.cycle_history[-HISTORY_MAX_ENTRIES:]))
@@ -371,6 +388,23 @@ class PilotRun:
                 else:
                     log(f"cycle {cycle_id}: stage_now for stage {active_stage} suppressed "
                         f"(already fired -- idempotency)")
+
+            # 2026-09-13 EVEN LATER SAME DAY addition (Christian's
+            # explicit request): only meaningful once actually flying
+            # (PAD_IDLE has no ascent to be done with) -- same
+            # phase-gating convention as launch_decision/throttle_score
+            # above. task_status's own guardrail class
+            # ('task_completion', reject_below=0.9 -- see guardrail.BANDS)
+            # already did the confidence check inside evaluate() above;
+            # this just acts on an ACCEPTED result.
+            task_status_gate = gate_results.get("task_status")
+            if (phase == "ASCENT_GRAVITY_TURN" and task_status_gate
+                    and task_status_gate.accepted
+                    and answers.get("task_status", {}).get("choice") == "task_complete"):
+                self.task_complete_confirmed = True
+                log(f"cycle {cycle_id}: task_status ACCEPTED as task_complete "
+                    f"(confidence >= 0.9) -- ending the run after this cycle's "
+                    f"safe-hold commands are sent.")
 
         outcome = self.watchdog.resolve(SAFE_HOLD_THROTTLE_CHOICE, SAFE_HOLD_PITCH_CHOICE)
         pitch_choice = outcome.pitch_choice or SAFE_HOLD_PITCH_CHOICE
@@ -486,7 +520,15 @@ class PilotRun:
                full_authority_throttle=(throttle_label == "launch"))
 
         self.cycles_run += 1
-        return self.cycles_run < self.max_cycles
+        # 2026-09-13 EVEN LATER SAME DAY: max_cycles == -1 means
+        # unlimited (Christian's explicit request) -- the run now ends
+        # ONLY when task_complete_confirmed flips True (task_status
+        # accepted at >=0.9 confidence) or, if a finite --max-cycles was
+        # explicitly passed, that count is reached first (whichever
+        # comes first still applies -- max_cycles remains a hard backstop
+        # when set, not overridden by the infinite default).
+        cycles_exhausted = self.max_cycles != -1 and self.cycles_run >= self.max_cycles
+        return not self.task_complete_confirmed and not cycles_exhausted
 
 
 def _safe_shutdown_act(ai_module, command: str, max_attempts: int = 3,
@@ -661,8 +703,13 @@ def run_replay(log_path: str, max_cycles: int, mission_target: dict) -> PilotRun
     # not measured. Only affects the new thrust_to_weight fields' realism
     # in replay mode, not the guardrail/watchdog plumbing this harness
     # actually tests.
+    # 2026-09-13 EVEN LATER SAME DAY: max_cycles == -1 (the new infinite
+    # default) has no meaning against a FIXED recorded tick sequence --
+    # replay is bounded by len(ticks) regardless, so -1 here just means
+    # "use every tick", same as passing len(ticks) explicitly.
+    effective_max_cycles = len(ticks) if max_cycles == -1 else min(max_cycles, len(ticks))
     run = PilotRun(SystemOneClient(), mission_target, mass_t, dry_mass_t, isp, total_thrust,
-                   min(max_cycles, len(ticks)), cycle_period_s=0.0, live=False)
+                   effective_max_cycles, cycle_period_s=0.0, live=False)
 
     if not _preflight_feasibility_gate(mass_t, dry_mass_t, isp, mission_target):
         return run  # 0 cycles run
@@ -674,8 +721,8 @@ def run_replay(log_path: str, max_cycles: int, mission_target: dict) -> PilotRun
             log(f"  (replay -- would also send: {cmd!r})")
         log(f"  (replay -- would send: throttle {throttle:.3f}, turn {turn_axis:.3f})")
 
-    step = max(1, len(ticks) // max_cycles)
-    selected = ticks[::step][:max_cycles]
+    step = max(1, len(ticks) // effective_max_cycles)
+    selected = ticks[::step][:effective_max_cycles]
     for cycle_id, tick in enumerate(selected):
         snapshot = {
             "t": tick["t"],
@@ -698,7 +745,15 @@ def run_replay(log_path: str, max_cycles: int, mission_target: dict) -> PilotRun
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["live", "replay"], default="live")
-    parser.add_argument("--max-cycles", type=int, default=50)
+    # 2026-09-13 EVEN LATER SAME DAY: -1 means unlimited (Christian's
+    # explicit request) -- the run now ends when tsAI's own task_status
+    # answer is ACCEPTED as task_complete (>=0.9 confidence, see
+    # guardrail.BANDS['task_completion'] and menus.TASK_STATUS_MENU's
+    # docstring for the calibration behind that floor), not a fixed
+    # cycle count. A positive value still works as a hard backstop cap
+    # (whichever -- task_complete or the cycle count -- comes first ends
+    # the run; see PilotRun.run_cycle()'s return logic).
+    parser.add_argument("--max-cycles", type=int, default=-1)
     # 2026-09-13 LATER SAME DAY: lowered from 0.5 (Christian's explicit
     # request -- 1Hz effective loop rate was too slow to catch a
     # fast-closing coast_apoapsis_error_m in time, confirmed live: 14

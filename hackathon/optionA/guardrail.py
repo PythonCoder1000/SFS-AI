@@ -24,6 +24,17 @@ from menus import TURN_AXIS_DELTA, QUESTION_CLASS, throttle_score_to_delta
 BANDS = {
     "routine": {"reject_below": 0.5, "caution_below": 0.7},
     "irreversible": {"reject_below": 0.7, "caution_below": 0.9},
+    # 2026-09-13 EVEN LATER SAME DAY addition (Christian's explicit
+    # choice): task_status's own class, deliberately the strictest band
+    # in the system -- ending the pilot loop is a coarser, less-reversible
+    # action than any single throttle/turn/stage command (those each
+    # only affect one cycle; a confirmed task_complete stops the whole
+    # run). caution_below == reject_below on purpose: no caution band,
+    # just a hard floor -- below 0.9 the answer is rejected outright and
+    # the loop keeps flying, exactly like every other rejected answer.
+    # See TASK_STATUS_MENU's docstring (menus.py) for the calibration
+    # data (4 synthetic states) this floor was set from.
+    "task_completion": {"reject_below": 0.9, "caution_below": 0.9},
 }
 
 

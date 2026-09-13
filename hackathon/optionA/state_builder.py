@@ -164,7 +164,8 @@ def build_physics_block(mass_t: float, g_local_mps2: Optional[float],
 
 
 def compute_coast_apoapsis_trend(current_error_m: Optional[float], current_t: Optional[float],
-                                  prev_history_entry: Optional[dict]) -> dict:
+                                  prev_history_entry: Optional[dict],
+                                  current_phase: Optional[str] = None) -> dict:
     """2026-09-13 LATER SAME DAY addition (Christian's explicit request,
     following the real-flight finding that the remaining overshoot after
     the confidence-gate fix wasn't a reasoning bug -- score WAS tracking
@@ -187,30 +188,126 @@ def compute_coast_apoapsis_trend(current_error_m: Optional[float], current_t: Op
     matches this file's existing closed-form-over-full-integration
     philosophy (see compute_coast_apoapsis_m's docstring).
 
-    Returns {'closure_rate_mps': None, 'seconds_to_crossover': None} when
-    there's no usable prior point (first real cycle, missing fields, or
-    non-positive dt) -- never fabricates a trend from one data point.
-    seconds_to_crossover is left None (not a negative or nonsensical
-    number) when the extrapolation doesn't point at an upcoming crossover
-    (error moving away from zero, or already past it and continuing to
-    diverge) -- the caller should read a None here as 'no crossover
-    predicted at the current rate', not as missing data."""
+    2026-09-13 EVEN LATER SAME DAY -- three fixes after external review
+    flagged real risks in how this gets USED, not how it's computed:
+
+    (1) Renamed the crossover field to `linear_seconds_to_crossover`
+        (was `seconds_to_crossover`) -- a bare `error / rate` from ONE
+        step is a local linear extrapolation, not a forecast in the same
+        sense as the real 15s forward-integrator (`terminal_error`). The
+        old name invited treating a decimal-precision number as an event
+        schedule. The name itself is now the caveat.
+    (2) Returns `valid: bool` -- False whenever the trend shouldn't be
+        trusted numerically: no prior point, non-positive/absurd dt
+        (>2s -- spans a watchdog hold/degrade or a slow cycle, not a
+        clean back-to-back sample), OR the prior entry's phase differs
+        from `current_phase` (a PAD_IDLE->ASCENT_GRAVITY_TURN transition
+        produces a meaningless 'closure rate' across the launch step).
+        `closure_rate_mps`/`linear_seconds_to_crossover` are still
+        returned even when invalid (never silently swapped for None) so
+        a caller can still see the raw number if it wants to -- but the
+        menu instructions tell tsAI to check `valid` before leaning on
+        it numerically.
+    (3) `current_phase` is optional and defaults to None (skips the
+        phase check, same permissive behavior as before) so existing
+        callers/tests that don't pass it keep working.
+
+    Returns `closure_rate_mps`/`linear_seconds_to_crossover` as None
+    (with `valid: False`) when there's no usable prior point at all --
+    never fabricates a trend from one data point.
+    `linear_seconds_to_crossover` is left None (not a negative or
+    nonsensical number) when the extrapolation doesn't point at an
+    upcoming crossover (error moving away from zero, or already past it
+    and continuing to diverge) -- the caller should read a None here as
+    'no crossover predicted at the current rate', not as missing data."""
     if current_error_m is None or current_t is None or not prev_history_entry:
-        return {"closure_rate_mps": None, "seconds_to_crossover": None}
+        return {"closure_rate_mps": None, "linear_seconds_to_crossover": None, "valid": False}
     prev_error_m = prev_history_entry.get("coast_apoapsis_error_m")
     prev_t = prev_history_entry.get("t")
     if prev_error_m is None or prev_t is None:
-        return {"closure_rate_mps": None, "seconds_to_crossover": None}
+        return {"closure_rate_mps": None, "linear_seconds_to_crossover": None, "valid": False}
     dt = current_t - prev_t
     if dt <= 0:
-        return {"closure_rate_mps": None, "seconds_to_crossover": None}
+        return {"closure_rate_mps": None, "linear_seconds_to_crossover": None, "valid": False}
     closure_rate_mps = (current_error_m - prev_error_m) / dt
-    seconds_to_crossover = None
+    linear_seconds_to_crossover = None
     if closure_rate_mps != 0:
         dt_future = -current_error_m / closure_rate_mps
         if dt_future > 0:
-            seconds_to_crossover = dt_future
-    return {"closure_rate_mps": closure_rate_mps, "seconds_to_crossover": seconds_to_crossover}
+            linear_seconds_to_crossover = dt_future
+    valid = dt <= 2.0
+    prev_phase = prev_history_entry.get("phase")
+    if current_phase is not None and prev_phase is not None and prev_phase != current_phase:
+        valid = False
+    return {"closure_rate_mps": closure_rate_mps,
+            "linear_seconds_to_crossover": linear_seconds_to_crossover,
+            "valid": valid}
+
+
+def compute_action_conditioned_apoapsis(altitude_m: float, vertical_speed_mps: float,
+                                         g_local_mps2: Optional[float], mass_t: Optional[float],
+                                         total_thrust_t: Optional[float], current_throttle: float,
+                                         target_altitude_m: Optional[float] = None,
+                                         lookahead_s: float = 1.0) -> Optional[dict]:
+    """2026-09-13 EVEN LATER SAME DAY addition (Christian's explicit
+    request, following external review of the state shape): the single
+    `coast_apoapsis_m` above answers ONE question -- 'where do I end up
+    if I cut thrust THIS INSTANT' -- but throttle_score's real choices
+    range from full cut to full increase, and the model was left to
+    mentally interpolate between 'coast_apoapsis_m' (implicitly the cut
+    case) and 'current trajectory continues' for everything in between.
+    This computes the SAME closed-form coast-apoapsis answer for a small
+    set of CANDIDATE ACTIONS instead of just the cut case, so the model
+    is choosing between precomputed CONSEQUENCES rather than
+    interpolating between two implicit anchors.
+
+    Mechanism, per candidate throttle: project vertical velocity/altitude
+    forward `lookahead_s` seconds under that throttle held constant
+    (thrust_accel = total_thrust_t * 9.8 * throttle / mass_t, same
+    confirmed formula as the retired build_physics_block() -- reused
+    here, but its OUTPUT is exposed, not the formula terms themselves,
+    same 'hand it answers, not a scratchpad' philosophy as
+    compute_coast_apoapsis_m), then run the existing coast_apoapsis_m
+    closed form from that projected point. Same documented
+    simplifications as the rest of this file (ignores drag, horizontal
+    motion, off-vertical thrust) -- a short, cheap, closed-form estimate
+    per candidate, not a full integrator run per candidate.
+
+    Candidates are the four THROTTLE_SCORE_LEVELS anchors that represent
+    a genuinely distinct action (cut/decrease_large/hold/increase_large
+    -- the two 'small' anchors are skipped to keep this a small,
+    scannable set, per the external-review request to avoid an
+    overwhelming number of near-duplicate fields). Each candidate's
+    throttle is clamped to [0, 1] against the CURRENT throttle, matching
+    how a real correction would actually be applied.
+
+    Returns None (not a null dict) if g_local/mass_t aren't usable --
+    same fail-safe convention as the rest of this file. Each candidate's
+    value is itself an {'apoapsis_m', 'error_m'} pair, `error_m` being
+    apoapsis_m minus target_altitude_m (omitted/None if no target is
+    supplied) so the model doesn't have to subtract on its own."""
+    if g_local_mps2 is None or g_local_mps2 <= 0 or mass_t is None or mass_t <= 0:
+        return None
+    thrust_t = total_thrust_t or 0.0
+    candidate_throttles = {
+        "if_cut": 0.0,
+        "if_decrease_large": max(0.0, current_throttle - 0.20),
+        "if_hold": current_throttle,
+        "if_increase_large": min(1.0, current_throttle + 0.20),
+    }
+    result = {}
+    for label, throttle in candidate_throttles.items():
+        thrust_accel_mps2 = thrust_t * 9.8 * throttle / mass_t
+        net_accel_mps2 = thrust_accel_mps2 - g_local_mps2
+        vy_after = vertical_speed_mps + net_accel_mps2 * lookahead_s
+        alt_after = (altitude_m + vertical_speed_mps * lookahead_s
+                     + 0.5 * net_accel_mps2 * (lookahead_s ** 2))
+        apo = compute_coast_apoapsis_m(alt_after, vy_after, g_local_mps2)
+        entry = {"apoapsis_m": apo}
+        if apo is not None and target_altitude_m is not None:
+            entry["error_m"] = apo - target_altitude_m
+        result[label] = entry
+    return result
 
 
 def build_prediction_block(predict_result: Optional[dict], horizon_s: float,
@@ -220,7 +317,11 @@ def build_prediction_block(predict_result: Optional[dict], horizon_s: float,
                             current_vertical_speed_mps: Optional[float] = None,
                             g_local_mps2: Optional[float] = None,
                             current_t: Optional[float] = None,
-                            prev_history_entry: Optional[dict] = None) -> dict:
+                            prev_history_entry: Optional[dict] = None,
+                            current_phase: Optional[str] = None,
+                            mass_t: Optional[float] = None,
+                            total_thrust_t: Optional[float] = None,
+                            current_throttle: Optional[float] = None) -> dict:
     """Adapts agent_interface.predict()'s return shape into sec 5's
     compact `prediction` block. predict_result may be None (e.g. first
     cycle, no prior prediction to compare against) -- returns a
@@ -241,7 +342,15 @@ def build_prediction_block(predict_result: Optional[dict], horizon_s: float,
     entry is appended) are supplied. Both optional and default None so
     existing callers/tests that don't pass them keep working -- the trend
     fields come back as None in that case, same fail-safe convention as
-    the rest of this function."""
+    the rest of this function. `current_phase` (also optional) enables
+    compute_coast_apoapsis_trend()'s phase-consistency validity check.
+
+    2026-09-13 EVEN LATER SAME DAY: also computes
+    `action_conditioned_apoapsis` (see
+    compute_action_conditioned_apoapsis()'s docstring) when `mass_t`,
+    `total_thrust_t`, and `current_throttle` are all supplied -- omitted
+    entirely (key absent, not a null dict) when any is missing, same
+    convention as `physics`/`history` in build_state()."""
     coast_apoapsis_m = None
     coast_apoapsis_error_m = None
     if current_altitude_m is not None and current_vertical_speed_mps is not None:
@@ -250,15 +359,27 @@ def build_prediction_block(predict_result: Optional[dict], horizon_s: float,
         if coast_apoapsis_m is not None and target_altitude_m is not None:
             coast_apoapsis_error_m = coast_apoapsis_m - target_altitude_m
 
-    trend = compute_coast_apoapsis_trend(coast_apoapsis_error_m, current_t, prev_history_entry)
+    trend = compute_coast_apoapsis_trend(coast_apoapsis_error_m, current_t, prev_history_entry,
+                                          current_phase=current_phase)
+
+    action_conditioned = None
+    if (mass_t is not None and total_thrust_t is not None and current_throttle is not None
+            and current_altitude_m is not None and current_vertical_speed_mps is not None):
+        action_conditioned = compute_action_conditioned_apoapsis(
+            current_altitude_m, current_vertical_speed_mps, g_local_mps2,
+            mass_t, total_thrust_t, current_throttle, target_altitude_m=target_altitude_m)
 
     if predict_result is None:
-        return {"confidence": "low", "horizon_s": horizon_s,
-                "terminal_error": {"altitude_m": None, "speed_mps": None},
-                "coast_apoapsis_m": coast_apoapsis_m,
-                "coast_apoapsis_error_m": coast_apoapsis_error_m,
-                "coast_apoapsis_closure_rate_mps": trend["closure_rate_mps"],
-                "coast_apoapsis_seconds_to_crossover": trend["seconds_to_crossover"]}
+        block = {"confidence": "low", "horizon_s": horizon_s,
+                 "terminal_error": {"altitude_m": None, "speed_mps": None},
+                 "coast_apoapsis_m": coast_apoapsis_m,
+                 "coast_apoapsis_error_m": coast_apoapsis_error_m,
+                 "coast_apoapsis_closure_rate_mps": trend["closure_rate_mps"],
+                 "coast_apoapsis_linear_seconds_to_crossover": trend["linear_seconds_to_crossover"],
+                 "coast_apoapsis_trend_valid": trend["valid"]}
+        if action_conditioned is not None:
+            block["action_conditioned_apoapsis"] = action_conditioned
+        return block
 
     final = predict_result.get("final", {}) or {}
     alt_err = None
@@ -268,15 +389,19 @@ def build_prediction_block(predict_result: Optional[dict], horizon_s: float,
     if target_speed_mps is not None and "v" in final:
         speed_err = final["v"] - target_speed_mps
 
-    return {
+    block = {
         "confidence": predict_result.get("confidence", "low"),
         "horizon_s": horizon_s,
         "terminal_error": {"altitude_m": alt_err, "speed_mps": speed_err},
         "coast_apoapsis_m": coast_apoapsis_m,
         "coast_apoapsis_error_m": coast_apoapsis_error_m,
         "coast_apoapsis_closure_rate_mps": trend["closure_rate_mps"],
-        "coast_apoapsis_seconds_to_crossover": trend["seconds_to_crossover"],
+        "coast_apoapsis_linear_seconds_to_crossover": trend["linear_seconds_to_crossover"],
+        "coast_apoapsis_trend_valid": trend["valid"],
     }
+    if action_conditioned is not None:
+        block["action_conditioned_apoapsis"] = action_conditioned
+    return block
 
 
 def build_state(cycle_id: int, t: float, phase: str, mission_target: dict,

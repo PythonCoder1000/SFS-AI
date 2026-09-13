@@ -197,11 +197,100 @@ THROTTLE_SCORE_MENU = {
         "right correction sits between two anchor points (e.g. more than "
         "a small decrease but less than a large one), score accordingly "
         "in between them rather than rounding to the nearest anchor. "
+        "WEIGH THE SIGNALS BELOW IN THIS ORDER -- do not treat them as a "
+        "democratic committee of equally-trustworthy numbers; they answer "
+        "different questions with different reliability: "
+        "(1) FEASIBILITY (`state.feasibility`) -- the hard budget "
+        "constraint; an increase the delta-v budget can't support is "
+        "wrong regardless of what anything else below says. "
+        "(2) COAST APOAPSIS -- ACTION-CONDITIONED WHEN AVAILABLE, ELSE "
+        "CUT-ONLY -- your PRIMARY signal for magnitude, detailed below. "
+        "(3) RECENT PHYSICAL HISTORY (`state.history`) -- real telemetry "
+        "trend, secondary to (2), used to tell whether a correction is "
+        "already working. "
+        "(4) 15s TERMINAL PREDICTION (`state.prediction.terminal_error`) "
+        "-- a cross-check only, answers a different question than (2). "
+        "(5) RAW TELEMETRY (`state.vehicle`, `mass_t`, thrust-to-weight) "
+        "-- context for the above, not an independent signal to weigh on "
+        "its own. "
+        "`state.prediction.coast_apoapsis_m` is the altitude this "
+        "trajectory would coast up to if thrust were cut THIS INSTANT "
+        "(closed-form, ignores drag/horizontal motion) -- "
+        "`coast_apoapsis_error_m` is that minus the mission's target "
+        "apoapsis, so a large POSITIVE coast_apoapsis_error_m means even "
+        "an immediate full cutoff still overshoots by that much, and a "
+        "large NEGATIVE value means continuing to coast alone won't reach "
+        "the target even without cutting. This is a more concrete basis "
+        "for the score than eyeballing raw altitude/speed/feasibility "
+        "numbers, and it directly answers 'how far off would doing "
+        "nothing more leave me'. "
+        "`state.prediction.action_conditioned_apoapsis` (when present) "
+        "goes further: it gives you the SAME coast-apoapsis answer for "
+        "each of four CANDIDATE ACTIONS -- `if_cut` (score 0), "
+        "`if_decrease_large` (score 1), `if_hold` (score 3), and "
+        "`if_increase_large` (score 5) -- each as {apoapsis_m, error_m}, "
+        "projected ~1s ahead under that throttle. Use this as your MOST "
+        "DIRECT signal when present. COMMITMENT RULE, not a suggestion: "
+        "find the candidate with the smallest |error_m|. If that "
+        "candidate's |error_m| is clearly smaller than every other "
+        "candidate's -- roughly half or less of the next-best candidate's "
+        "|error_m|, a margin that isn't close -- your score MUST land "
+        "within 0.5 of THAT candidate's anchor point (0/1/3/5), full "
+        "stop. Do not soften this toward the middle of the scale, and do "
+        "NOT let `state.history` pull you back toward your own recent "
+        "scores in this situation -- a clear action-conditioned winner "
+        "overrides continuity with what you scored last cycle. This is a "
+        "real, previously-observed failure mode: on one real flight, "
+        "`if_cut` showed error_m=+393 against +1019/+1234/+1438 for the "
+        "other three candidates -- an unambiguous winner -- and the "
+        "score still came out 1.47 instead of near 0, dragged there by a "
+        "run of recent scores in the 3.0-3.2 range. That is the exact "
+        "mistake this rule exists to prevent: recent-history continuity "
+        "is a WEAKER signal than a clear action-conditioned winner, not a "
+        "competing vote of equal weight. Only when the two or three "
+        "closest candidates' |error_m| values are genuinely close to each "
+        "other (no clear single winner by the margin above) should you "
+        "interpolate between their anchors instead -- e.g. if "
+        "`if_decrease_large` and `if_hold` both land close to zero error, "
+        "the right score is BETWEEN their anchors (2, not 1 or 3). "
+        "`coast_apoapsis_m`/`coast_apoapsis_error_m` above answer only "
+        "the `if_cut` case implicitly; `action_conditioned_apoapsis` "
+        "makes all four candidates explicit instead of requiring you to "
+        "interpolate between 'cut' and 'do nothing'."
+        "CRITICAL, on a powerful vehicle: coast_apoapsis_error_m can move "
+        "by thousands of meters in a SINGLE cycle once vertical speed is "
+        "high (it scales with speed squared), so waiting until it's "
+        "already positive to start backing off is often already too "
+        "late. `coast_apoapsis_closure_rate_mps` (how fast the error is "
+        "moving toward/through zero, computed from this cycle vs the "
+        "last) and `coast_apoapsis_linear_seconds_to_crossover` exist "
+        "specifically so you can start reducing throttle BEFORE "
+        "coast_apoapsis_error_m itself goes positive, proportional to how "
+        "soon and how fast it's closing -- a short "
+        "linear_seconds_to_crossover with still-negative "
+        "coast_apoapsis_error_m calls for an early, partial decrease now, "
+        "not waiting for confirmation. IMPORTANT: "
+        "linear_seconds_to_crossover is named that way deliberately -- it "
+        "is a ONE-STEP LINEAR EXTRAPOLATION (current error / current "
+        "closing rate), not a physics-integrated forecast the way "
+        "terminal_error is. Treat its decimal value as directionally "
+        "useful (a short number means 'soon', a long or null one means "
+        "'not imminent'), not as a scheduled event to count down to. "
+        "Also check `coast_apoapsis_trend_valid`: when false (no usable "
+        "prior cycle, a large/gappy time step, or a phase transition "
+        "since the last cycle), do not lean on closure_rate/"
+        "linear_seconds_to_crossover numerically -- fall back to "
+        "coast_apoapsis_error_m alone for that cycle. "
         "`state.history` (when present) lists your last few cycles' "
-        "throttle/score/confidence/coast_apoapsis_error_m, oldest first -- "
-        "use it to tell whether this is a NEW situation or a CONTINUATION "
-        "of a correction already underway: if coast_apoapsis_error_m has "
-        "been shrinking toward zero cycle over cycle, that correction is "
+        "throttle/score/confidence/coast_apoapsis_error_m, oldest first. "
+        "The PHYSICAL fields in it -- `coast_apoapsis_error_m`, actual "
+        "`throttle`, and `accepted_this_cycle` -- are real evidence of "
+        "what has actually been happening and outrank your own past "
+        "`throttle_score` values, which are just your own prior opinions, "
+        "not independent confirmation. Use the physical trend to tell "
+        "whether this is a NEW situation or a CONTINUATION of a "
+        "correction already underway: if coast_apoapsis_error_m has been "
+        "shrinking toward zero cycle over cycle, that correction is "
         "WORKING and a similar or smaller score is likely still right; if "
         "it has been flat or growing despite recent corrections, the "
         "prior magnitude was insufficient and a LARGER score is likely "
@@ -211,37 +300,17 @@ THROTTLE_SCORE_MENU = {
         "during a sustained correction, not evidence of ambiguity; judge "
         "confidence from how clearly the CURRENT numbers support a "
         "choice, the same as if `state.history` were empty. "
-        "`state.prediction.coast_apoapsis_m` is the altitude this "
-        "trajectory would coast up to if thrust were cut THIS INSTANT "
-        "(closed-form, ignores drag/horizontal motion) -- "
-        "`coast_apoapsis_error_m` is that minus the mission's target "
-        "apoapsis, so a large POSITIVE coast_apoapsis_error_m means even "
-        "an immediate full cutoff still overshoots by that much, and a "
-        "large NEGATIVE value means continuing to coast alone won't reach "
-        "the target even without cutting. Use this as your PRIMARY signal "
-        "for magnitude -- it directly answers 'how far off would doing "
-        "nothing more leave me', which is a more concrete basis for the "
-        "score than eyeballing raw altitude/speed/feasibility numbers. "
-        "CRITICAL, on a powerful vehicle: coast_apoapsis_error_m can move "
-        "by thousands of meters in a SINGLE cycle once vertical speed is "
-        "high (it scales with speed squared), so waiting until it's "
-        "already positive to start backing off is often already too "
-        "late. `coast_apoapsis_closure_rate_mps` (how fast the error is "
-        "moving toward/through zero, computed from this cycle vs the "
-        "last) and `coast_apoapsis_seconds_to_crossover` (a linear "
-        "extrapolation of how many seconds until it crosses zero AT THAT "
-        "RATE, or null if no crossover is currently projected) exist "
-        "specifically so you can start reducing throttle BEFORE "
-        "coast_apoapsis_error_m itself goes positive, proportional to how "
-        "soon and how fast it's closing -- a short seconds_to_crossover "
-        "with still-negative coast_apoapsis_error_m calls for an early, "
-        "partial decrease now, not waiting for confirmation. "
         "`terminal_error` (the 15s forward-simulated prediction assuming "
-        "throttle/turn_axis HOLD UNCHANGED) is a secondary cross-check, "
-        "not the primary signal, since it reflects a fixed future horizon "
-        "rather than an immediate what-if. Also weigh `mass_t` and "
+        "throttle/turn_axis HOLD UNCHANGED) answers a DIFFERENT question "
+        "than coast_apoapsis_error_m (a fixed future horizon under "
+        "unchanged control, vs. an immediate what-if-cut-now) -- the two "
+        "can legitimately disagree without either being wrong; treat that "
+        "as 'they measure different things', not as evidence of "
+        "uncertainty. terminal_error is a secondary cross-check, never "
+        "the primary signal. Also weigh `mass_t` and "
         "`thrust_to_weight_current`/`thrust_to_weight_max`, and the "
-        "feasibility budget (delta-v remaining vs required)."
+        "feasibility budget (delta-v remaining vs required), as context "
+        "for the above, not as independent signals of their own."
     ),
     "criteria": [
         "0 -- cut: stop thrust immediately -- an off-nominal condition "
@@ -400,6 +469,81 @@ STAGE_CHECK_MENU = {
     },
 }
 
+# 2026-09-13 EVEN LATER SAME DAY addition (Christian's explicit request):
+# lets tsAI itself decide when the ASCENT CONTROL TASK is done, replacing
+# a fixed --max-cycles cutoff with "run until the model says stop". Only
+# meaningful during ASCENT_GRAVITY_TURN (PAD_IDLE has no ascent to be
+# done with) -- pilot_loop.py only acts on it in that phase, same
+# phase-gating convention as launch_decision/throttle_score.
+#
+# Calibrated via 4 hand-built synthetic states sent directly through
+# tsai_client.SystemOneClient before this was wired in (not a live
+# flight -- a deliberate offline calibration pass):
+#   EARLY (200m, vy=95, error=-3340m)      -> task_in_progress, conf 1.00
+#   NEAR_DONE (4950m, vy=8, error=-20m)    -> task_complete,    conf 0.86
+#   AT_5000 (5000m, vy=5, error=+1.3m)     -> task_complete,    conf 0.95
+#   OVERSHOOT (5500m, vy=-30, error=+500m) -> task_complete,    conf 0.99
+# The OVERSHOOT case was the real finding: it FIRST read as genuinely
+# ambiguous (conf 0.42, probabilities split 61/30/9) because the initial
+# instructions never said what a large POSITIVE coast_apoapsis_error_m
+# (overshoot) means for completion -- only the negative (undershoot)
+# case was covered. Fixed by explicitly separating "done" from
+# "succeeded": once the craft has passed apoapsis and is descending,
+# the task is done regardless of how far off target the peak was --
+# thrust can't undo an overshoot after the fact. After that fix,
+# OVERSHOOT re-tested at conf 0.99 (was 0.42).
+#
+# Floor set at 0.9 (Christian's explicit choice, stricter than every
+# other question class's bands -- see guardrail.BANDS) specifically to
+# avoid an accidental early stop: ending the pilot loop is not easily
+# reversible (see pilot_loop.py's PilotRun.task_complete_confirmed) the
+# way a single throttle/turn cycle is, so this question gets the
+# strictest bar in the whole system, deliberately tighter than even the
+# 'irreversible' class's 0.7 reject_below used for staging.
+TASK_STATUS_MENU = {
+    "type": "choice",
+    "instructions": (
+        "You are piloting a rocket on a vertical-hop mission "
+        "(`state.mission_target.apoapsis_m` is the target altitude, "
+        "`periapsis_m` <= 0 -- no orbit, just reach the target altitude "
+        "and come back down). Decide whether this ASCENT CONTROL TASK is "
+        "DONE -- meaning no further throttle action can meaningfully "
+        "change the outcome, NOT whether the mission was a success. "
+        "'Done' and 'succeeded' are different questions: a flight that "
+        "overshot or undershot the target by a wide margin is still "
+        "DONE, and correctly task_complete, once nothing further can be "
+        "done about it -- do not answer task_in_progress just because "
+        "the outcome wasn't close to ideal. Specifically: (1) if the "
+        "craft has already passed apoapsis and is now descending "
+        "(`state.vehicle.vertical_speed_mps` clearly negative), the task "
+        "is DONE regardless of how far off the peak altitude was from "
+        "the target -- thrust cannot undo an overshoot or add altitude "
+        "after the fact, so there is nothing left to control. (2) if the "
+        "craft is still climbing and `coast_apoapsis_error_m` is small "
+        "(roughly within a few percent of the target apoapsis), the task "
+        "is DONE -- coasting alone will land it close enough, no further "
+        "correction needed. (3) if the craft is still climbing with a "
+        "large negative coast_apoapsis_error_m, or is early in a hard "
+        "vertical climb, the task is clearly NOT done -- continued "
+        "throttle control still matters."
+    ),
+    "criteria": {
+        "task_complete": "The ascent control task is DONE -- either the "
+            "craft has already passed apoapsis and is now descending (at "
+            "ANY altitude, whether that matched the target closely, "
+            "overshot, or undershot -- outcome quality is irrelevant "
+            "here), or it is still climbing with a small "
+            "coast_apoapsis_error_m such that coasting alone will finish "
+            "the job. No further throttle correction can usefully change "
+            "what happens.",
+        "task_in_progress": "The craft is still climbing and continued "
+            "throttle control can still meaningfully change the outcome "
+            "-- coast_apoapsis_error_m is not yet small, or the craft is "
+            "early in a hard vertical climb.",
+        "insufficient_data": INSUFFICIENT_DATA_PHRASING,
+    },
+}
+
 def build_menus(mission_target: dict) -> dict:
     """Builds the per-run menu set FROM the actual mission target,
     instead of a single static module-level dict that can silently go
@@ -414,6 +558,7 @@ def build_menus(mission_target: dict) -> dict:
         "throttle_score": THROTTLE_SCORE_MENU,
         "pitch_action": _pitch_action_menu(profile),
         "stage_check": STAGE_CHECK_MENU,
+        "task_status": TASK_STATUS_MENU,
     }
 
 # Confidence-band question class, used by guardrail.py (BUILD_SPEC sec 4.1).
@@ -422,4 +567,7 @@ QUESTION_CLASS = {
     "throttle_score": "routine",
     "pitch_action": "routine",
     "stage_check": "irreversible",
+    # 2026-09-13 EVEN LATER SAME DAY: its own class, stricter than
+    # 'irreversible' -- see TASK_STATUS_MENU's docstring for why 0.9.
+    "task_status": "task_completion",
 }
