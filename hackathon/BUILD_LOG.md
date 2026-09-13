@@ -247,3 +247,129 @@ fallback path even though the live path is what actually satisfied this
 checkpoint's exit condition.
 
 **Commit:** `checkpoint 4: live loop wired, dry run complete`
+
+## Checkpoint 5 — Wrap-up
+
+### What got built
+
+All under `hackathon/optionA/`, a self-contained architecture distinct
+from the existing hackathon submission (`controller.py`/`supervisor.py`/
+`gateway.py`, the Claude-as-supervisor-over-a-PD-loop design). This
+build implements sec 2's alternative: tsAI (`jev-latest` via
+`/v1/systemone`) as the direct pilot, answering a fixed safe-by-
+construction menu every cycle.
+
+| File | Role |
+|---|---|
+| `tsai_client.py` | `SystemOneClient` -- thin `/v1/systemone` wrapper, auth from `.env`, timeout, freshness check |
+| `menus.py` | `throttle_action`/`pitch_action`/`stage_check` menus -- `insufficient_data` always present, `ignite`/blanket-fire never in vocabulary |
+| `state_builder.py` | Builds the sec-5 enriched state; Tsiolkovsky delta-v (this codebase's isp convention, no g0) and `alpha_max` (reuses `forward_sim.compute_turn_axis`'s mass-penalty law) |
+| `guardrail.py` | Confidence bands (sec 4.1, class-specific) + feasibility check (sec 4.2), chained in `evaluate()` |
+| `watchdog.py` | `Watchdog` (miss-count, hold-1, degrade-at-2) + `StagingTracker` (edge-triggered staging idempotency) |
+| `pilot_loop.py` | Full loop, live or replay mode, `PilotRun` |
+| `cartesian_check.py` | Design-time offline Cartesian-product safety check (sec 4.3.4) |
+| `test_checkpoint{1,2,3}.py` | Per-checkpoint exit-condition tests |
+
+### What got tested
+
+- Checkpoint 1: real `/v1/systemone` calls against 4 real states from
+  `manual_flight_log.jsonl` -- bounded, in-menu answers. PASS.
+- Checkpoint 1 (design-time): Cartesian-product worst-case combo
+  forward-simulated via `predict()`/`forward_simulate()` -- no
+  collision; structural argument (independent, individually-bounded
+  commands) is the primary safety basis. PASS, with an honestly-flagged
+  low-altitude terrain-resolution caveat (see that section above).
+- Checkpoint 2: synthetic low-confidence and synthetic
+  high-confidence-but-infeasible answers both correctly rejected with
+  typed reasons; a feasible+confident control case correctly accepted.
+  PASS, 3/3 cases.
+- Checkpoint 3: mocked dropped-response (hold-then-degrade) and mocked
+  duplicate stage response (no double-fire) both correct. PASS, 2/2
+  cases.
+- Checkpoint 4: **real live SFS session**, 15 real cycles, real
+  telemetry, real `/v1/systemone` calls, guardrail rejected every
+  throttle/pitch answer this run (30 rejections) and suppressed a
+  repeated `stage_now` via idempotency; ended in a confirmed-stable,
+  undamaged state (throttle 0, mass/rotation unchanged from start). No
+  crash. `--mode replay` also exercised end-to-end as the documented
+  fallback path (12 rejections/6 cycles, same guardrail/watchdog logic).
+
+### What's still a placeholder / known gap (per sec 8, not re-researched)
+
+- **`DEGRADE_AFTER_MISSES = 2`** is still the spec's own placeholder,
+  not a computed FTTI -- the live dry run never actually got an
+  ACCEPTED answer to establish a real "how often does a good answer
+  land" baseline, so there was no data to tighten it against. Left as
+  spec's own conservative default.
+- **Confidence bands (sec 4.1: 0.5/0.7/0.9)** unchanged from the spec --
+  no rigorous calibration set exists (per spec's own sec 8 disclosure).
+  The live dry run's actual numbers (throttle_action never above 0.35,
+  stage_check consistently 0.73-0.86) are a small additional data point
+  suggesting these bands are doing real work (correctly gating out a
+  genuinely ambiguous PAD_IDLE throttle decision), not evidence they're
+  perfectly tuned.
+- **`dry_mass_t` estimate (35% of current wet mass)** in `pilot_loop.py`
+  live mode is a documented ballpark, not measured -- this craft has no
+  independent dry-mass telemetry channel. Affects the delta-v
+  feasibility check's precision, not its existence/correctness as a
+  mechanism.
+- **`stage_check` is never sent live** (see Checkpoint 4's safety-
+  deviation note) -- computed and gated correctly, but a real
+  `stage <index>` send was deliberately scoped out of this unattended
+  run pending independent re-verification of this craft's stage-index
+  mapping. Follow-up, not a blocker.
+- **PAD_IDLE menu framing gap** (Checkpoint 4 finding): the current
+  `throttle_action`/`pitch_action` instructions assume an in-progress
+  ascent; a genuinely idle, unlaunched craft has no clean "launch now"
+  framing distinct from "shape the ascent," which measurably lowered
+  tsAI's confidence below the accept floor and kept the craft grounded
+  for the whole live dry run. Not fixed here -- fixing it means adding
+  PAD_IDLE-specific menu criteria AND re-running the sec 4.3 Cartesian-
+  product safety argument for that new option, which is real follow-up
+  work, not a quick patch to make under this session's time budget.
+- `trust_prediction`-style calibration (sec 8) was not built at all --
+  `state_builder.build_prediction_block()` passes through
+  `predict()`'s own `confidence` label unchanged; no separate
+  tsAI-facing weighting logic was added, consistent with sec 8's own
+  guidance not to rely on tsAI perfectly discounting a bad forecast.
+
+### Deviations from the spec's literal text, summarized
+
+1. Missing example data files (`manual_flight_log.jsonl`,
+   `telemetry_flat_*`) were absent from the isolated build worktree
+   (gitignored, not tracked) -- copied in from the main working copy
+   rather than treated as a blocker, since they clearly exist in the
+   project and the spec explicitly names them.
+2. `manual_flight_log.jsonl`'s actual schema (`t`/`altitude_m`/`vx`/`vy`/
+   `avg_throttle` only) is thinner than sec 5's full vehicle schema --
+   missing fields filled with clearly-labeled real-derived values
+   (angle from velocity heading) or documented placeholders, never
+   silently treated as real telemetry.
+3. Tsiolkovsky delta-v implemented WITHOUT the standard g0 multiplier,
+   because this codebase's own `isp` convention (confirmed by reading
+   `forward_sim._engine_thrust`) already omits it -- a correctness fix
+   relative to the textbook formula, not a deviation from validated
+   physics.
+4. `stage_check` is computed/gated live but never actually sent to the
+   game this session (safety-motivated scope reduction, Checkpoint 4).
+5. Checkpoint 4's exit was met via a genuine live run (the game was, in
+   fact, reachable) rather than the replay fallback -- the replay path
+   was still built and verified per spec, just not the one that ended
+   up satisfying the exit condition.
+
+### Bottom line
+
+The tsAI-as-pilot architecture from sec 2 is fully wired end-to-end and
+was proven live: every cycle's flight-control decision really did come
+from `/v1/systemone`, and the guardrail (confidence bands + feasibility
++ pre-vetted menu vocabulary + watchdog + staging idempotency) really
+did do the job of preventing an under-confident/infeasible answer from
+reaching the game, without a human in the loop. The specific outcome
+this run (craft stayed safely grounded) is less visually dramatic than
+a full ascent, but it is the CORRECT and SAFE outcome given what tsAI
+actually reported about its own confidence in a state genuinely ambiguous
+for the current menu wording -- and this project's own explicit safety
+priority is exactly a guardrail that will accept "no flight" over
+guessing.
+
+**Final commit:** `checkpoint 5: Option A build complete, see BUILD_LOG.md`
