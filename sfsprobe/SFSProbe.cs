@@ -1,11 +1,15 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -31,7 +35,7 @@ namespace SFSProbe
         // Log() message, a real (if harmless) inconsistency risk. Now also
         // exposed live via the 'ping' command so sfsprobe_status can report
         // it without a separate round trip.
-        public const string VersionString = "0.69.0";
+        public const string VersionString = "0.70.0";
 
         public override string ModNameID => "sfs_probe";
         public override string DisplayName => "SFS Probe (remote)";
@@ -41,6 +45,23 @@ namespace SFSProbe
         public override string Description => "Remote-controlled data probe. Poll command.txt.";
 
         public static string OutDir;
+
+        // tcp-rewrite (v0.70.0): persistent TCP socket alongside the existing
+        // command.txt/result.txt file-polling protocol -- see
+        // TCP_REWRITE_SPEC.md. Loopback-only, fixed port. Not a replacement:
+        // the file path stays fully functional and is still the default for
+        // Python callers until agent_interface.py is explicitly told to use
+        // TCP (checkpoint 4).
+        public const int TcpPort = 47821;
+
+        // Set by ProbeRunner immediately before calling Probe.Command(line)
+        // for a line that arrived over TCP (null for file-protocol commands
+        // or Update()-driven ones like key bindings). Result() below checks
+        // this so the same ProbeMod.Result(msg) call sites used by every
+        // existing command handler transparently also reach the TCP client
+        // that issued the command -- zero changes needed to command dispatch
+        // itself, per the spec's "Probe.Command() needs zero changes" goal.
+        internal static TcpProbeConn ActiveTcpConn;
 
         public override void Load()
         {
@@ -90,8 +111,26 @@ namespace SFSProbe
 
         public static void Result(string msg)
         {
-            Append("result.txt", DateTime.Now.ToString("HH:mm:ss") + "  " + msg);
+            string line = DateTime.Now.ToString("HH:mm:ss") + "  " + msg;
+            Append("result.txt", line);
             Log("-> " + msg);
+
+            // tcp-rewrite: also push the same result line back over the
+            // socket of whichever TCP client's command is currently being
+            // processed (set by ProbeRunner.DrainTcpCommands()). File-
+            // protocol commands leave ActiveTcpConn null, so this is a
+            // pure addition -- result.txt/probe.log behavior is unchanged.
+            var conn = ActiveTcpConn;
+            if (conn != null && conn.Alive)
+            {
+                try
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(line + "\n");
+                    conn.Stream.Write(bytes, 0, bytes.Length);
+                    conn.Stream.Flush();
+                }
+                catch { conn.Alive = false; }
+            }
         }
 
         public static void Append(string file, string line)
@@ -101,12 +140,132 @@ namespace SFSProbe
         }
     }
 
+    // tcp-rewrite: one accepted TCP connection. Reading happens on its own
+    // background thread (TcpReadLoop); the Stream field is only ever written
+    // to from Unity's main thread (inside ProbeMod.Result(), itself only
+    // called while draining on the main thread), so no lock is needed there.
+    internal class TcpProbeConn
+    {
+        public TcpClient Client;
+        public NetworkStream Stream;
+        public volatile bool Alive = true;
+    }
+
     public class ProbeRunner : MonoBehaviour
     {
         float poll, retry;
 
+        // tcp-rewrite state -- see TCP_REWRITE_SPEC.md section 2.2/2.3. Accept +
+        // per-connection read loops run on background threads and only ever
+        // enqueue completed lines; Probe.Command() itself is only ever
+        // invoked from here, inside Update(), on Unity's main thread.
+        TcpListener tcpListener;
+        Thread tcpAcceptThread;
+        volatile bool tcpRunning;
+        readonly ConcurrentQueue<(TcpProbeConn conn, string line)> tcpQueue =
+            new ConcurrentQueue<(TcpProbeConn, string)>();
+        readonly List<TcpProbeConn> tcpConns = new List<TcpProbeConn>();
+
+        void Start()
+        {
+            StartTcp();
+        }
+
+        void StartTcp()
+        {
+            try
+            {
+                tcpListener = new TcpListener(IPAddress.Loopback, ProbeMod.TcpPort);
+                tcpListener.Start();
+                tcpRunning = true;
+                tcpAcceptThread = new Thread(TcpAcceptLoop) { IsBackground = true };
+                tcpAcceptThread.Start();
+                ProbeMod.Log("tcp listener started on 127.0.0.1:" + ProbeMod.TcpPort +
+                             " (file-polling command.txt/result.txt path also still active)");
+            }
+            catch (Exception e)
+            {
+                ProbeMod.Log("tcp listener FAILED to start on port " + ProbeMod.TcpPort +
+                             ": " + e.Message + " -- file-protocol path unaffected");
+            }
+        }
+
+        void TcpAcceptLoop()
+        {
+            while (tcpRunning)
+            {
+                TcpClient client;
+                try { client = tcpListener.AcceptTcpClient(); }
+                catch { break; } // listener Stop()ped -- normal shutdown path
+
+                try
+                {
+                    var conn = new TcpProbeConn { Client = client, Stream = client.GetStream() };
+                    lock (tcpConns) { tcpConns.Add(conn); }
+                    var t = new Thread(() => TcpReadLoop(conn)) { IsBackground = true };
+                    t.Start();
+                    ProbeMod.Log("tcp client connected (" + tcpConns.Count + " active)");
+                }
+                catch (Exception e) { ProbeMod.Log("tcp accept handling failed: " + e.Message); }
+            }
+        }
+
+        void TcpReadLoop(TcpProbeConn conn)
+        {
+            try
+            {
+                var reader = new StreamReader(conn.Stream, Encoding.UTF8);
+                string line;
+                while (tcpRunning && (line = reader.ReadLine()) != null)
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed.Length == 0) continue;
+                    tcpQueue.Enqueue((conn, trimmed));
+                }
+            }
+            catch { /* client dropped / socket reset -- fall through to cleanup */ }
+            finally
+            {
+                conn.Alive = false;
+                try { conn.Client.Close(); } catch { }
+                lock (tcpConns) { tcpConns.Remove(conn); }
+            }
+        }
+
+        // Drains everything already queued as of this call -- if a client's
+        // single write contained multiple newline-terminated commands, the
+        // reader thread will typically have enqueued all of them before the
+        // next Update() tick, so they're processed here in the same frame,
+        // matching PollCommands()'s existing multi-line batching behavior.
+        void DrainTcpCommands()
+        {
+            while (tcpQueue.TryDequeue(out var item))
+            {
+                ProbeMod.ActiveTcpConn = item.conn;
+                try { Probe.Command(item.line); }
+                catch (Exception e) { ProbeMod.Result("ERROR '" + item.line + "' " + e.Message); }
+                finally { ProbeMod.ActiveTcpConn = null; }
+            }
+        }
+
+        void StopTcp()
+        {
+            tcpRunning = false;
+            try { tcpListener?.Stop(); } catch { }
+            lock (tcpConns)
+            {
+                foreach (var c in tcpConns) { try { c.Client.Close(); } catch { } }
+                tcpConns.Clear();
+            }
+        }
+
+        void OnDestroy() { StopTcp(); }
+        void OnApplicationQuit() { StopTcp(); }
+
         void Update()
         {
+            DrainTcpCommands();
+
             try
             {
                 if (Input.GetKeyDown(KeyCode.F9)) Probe.DumpFlight("F9");
