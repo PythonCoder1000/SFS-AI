@@ -57,3 +57,28 @@ agent_interface.py wiring + live pilot_loop dry run (4), wrap-up (5).
 Local-only note: `sfsprobe/lib/harmonyx_2.16.0/` was copied into this
 worktree from the main checkout to make local `mcs` compilation possible
 (it's git-ignored/untracked in both places, not a repo change).
+
+## Checkpoint 2 — status: COMPLETE
+
+Ran `analysis/sfsprobe_tcp_client.py` for real against the live mod
+(same game session as Checkpoint 1's smoke test, port 47821 already
+confirmed open before running). 10/10 `ping` round trips succeeded, no
+reconnects triggered (each call hit the `try` branch, not the
+except/reconnect fallback), game and mod stayed up throughout and
+after (`nc -z 127.0.0.1 47821` still open post-test).
+
+Real numbers: **min=7.7ms mean=12.6ms max=13.6ms** for 10x `ping` over
+the persistent TCP connection — all 10 calls returned the same live
+`pong  scene=World_PC  rockets=1  fixedDelta=0.0166666675
+gameVersion=1.6.00.16  modVersion=0.69.0`, matching the file-protocol
+`ping` content/format from Checkpoint 1.
+
+For reference, this is already far below the ~0.055s (55ms)
+file-protocol mean noted in the spec for `poll_s=0.01` — expected, since
+this is a single persistent socket paying zero reconnect or poll-interval
+cost per call. Real head-to-head latency methodology (batching +
+`act`-equivalent commands, not just `ping`) is Checkpoint 3's job, not
+claimed as final here.
+
+Exit condition met (SFSProbe_SPEC.md/TCP_REWRITE_SPEC.md §3, Checkpoint
+2). Next: Checkpoint 3 (batching + latency).
