@@ -8,17 +8,30 @@ Two modes:
   manual_flight_log.jsonl tick sequence instead (sec 7 Checkpoint 4's
   explicit documented fallback when a live session can't be reached).
 
-Safety note (logged in BUILD_LOG.md Checkpoint 4 entry): in LIVE mode,
-stage_check answers are still computed, confidence-gated, and
-feasibility-checked exactly like the other two questions -- but the
-resulting choice is only LOGGED, never sent to the game as a real
-`stage <index>` command. This run's actual craft's stage-index mapping
-was not independently re-verified before this unattended session, and
-sec 1's own catalogued failure mode (misapplied staging destroys the
-craft) is exactly the risk this project has no tolerance for running
-unsupervised. throttle_action and pitch_action ARE sent live -- both
-are continuous, reversible, and already hard-clamped by
-agent_interface.act() independent of anything here.
+Safety note -- UPDATED (Christian's explicit decision, 2026-09-12):
+throttle_action/pitch_action are sent live as before (continuous,
+reversible, hard-clamped by agent_interface.act()). Two more real
+commands are now ALSO sent live, both previously log-only:
+  (B) `master on` -- sent once, the first cycle an ACCEPTED
+      (post-watchdog) throttle_choice resolves to `launch`. Idempotent
+      via self.master_ignited. Safe/reversible -- rocket-wide
+      throttleOn, independent of throttle amount and per-engine
+      engineOn.
+  (C) `stage <active_stage_index>` -- sent (i) when stage_check's answer
+      is ACCEPTED as `stage_now`, or (ii) as part of the full liftoff
+      sequence the first time `launch` fires (2026-09-13 addition --
+      see below), gated in BOTH cases by StagingTracker's shared
+      edge-triggered idempotency (fires at most once per stage index,
+      regardless of which code path requests it).
+      THIS REOPENS THE RISK THE ORIGINAL CHECKPOINT 4 CUT EXISTED TO
+      AVOID: this craft's stage-index mapping was not independently
+      re-verified, and sec 1's catalogued failure mode (misapplied
+      staging destroys the craft) is real. `active_stage` is also still
+      a hardcoded 0 in state_builder's vehicle snapshot -- multi-stage
+      progression is not tracked, so this will only ever fire `stage 0`
+      until that's built. Requires a human present and watching --
+      do not run unattended. See git history for the prior (safer,
+      log-only) version if this needs reverting.
 """
 import argparse
 import json
@@ -27,16 +40,27 @@ import sys
 import time
 import math
 
+import weave
+from dotenv import load_dotenv
+
+load_dotenv()  # picks up .env in the repo root (or CWD) if present
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "analysis"))
 
 import forward_sim as fsim  # noqa: E402
+import agent_interface as ai_predict  # noqa: E402  -- predict()/observe_to_state() are
+# pure computation (forward_sim.py only), no game I/O -- safe to import
+# unconditionally at module level, unlike observe()/act() which touch
+# the live mod's file protocol and stay behind run_live()'s local import.
 from tsai_client import SystemOneClient  # noqa: E402
-from menus import MENUS, THROTTLE_DELTA, TURN_AXIS_DELTA  # noqa: E402
-from guardrail import evaluate  # noqa: E402
+from menus import build_menus, mission_profile, throttle_score_to_delta, TURN_AXIS_DELTA  # noqa: E402
+from guardrail import evaluate, confidence_of  # noqa: E402
 from watchdog import Watchdog, StagingTracker  # noqa: E402
-from state_builder import build_state, build_feasibility, build_prediction_block  # noqa: E402
+from state_builder import (  # noqa: E402
+    build_state, build_feasibility, build_prediction_block, compute_delta_v_remaining_mps,
+)
 
 SAFE_HOLD_THROTTLE_CHOICE = "hold"
 SAFE_HOLD_PITCH_CHOICE = "hold"
@@ -46,15 +70,93 @@ def log(msg: str) -> None:
     print(f"[pilot_loop] {msg}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Weave/W&B tracing -- same convention as hackathon/controller.py (that
+# project's spec sec 10): thin @weave.op() wrappers at named boundary
+# calls, one shared project ("sfs-ai-hackathon") so both architectures'
+# traces land in the same place for judges/analysis. Guarded on
+# WANDB_API_KEY exactly like controller.py -- that file's own 2026-09-12
+# finding was that weave.init() with no key blocks forever on an
+# interactive `wandb login` prompt instead of failing cleanly, which would
+# hang this live flight loop, not just a script.
+# ---------------------------------------------------------------------------
+if os.environ.get("WANDB_API_KEY"):
+    weave.init("sfs-ai-hackathon")
+else:
+    log("WANDB_API_KEY not set -- skipping weave.init(), @weave.op() calls "
+        "will no-op (no tracing, but nothing hangs or breaks). Add "
+        "WANDB_API_KEY to .env to enable real Weave logging.")
+
+
+@weave.op()
+def traced_tsai_ask(client: SystemOneClient, state: dict, menus: dict) -> dict:
+    """Weave-traced wrapper around SystemOneClient.ask() -- the tsAI
+    equivalent of controller.py's traced_observe/traced_act/traced_predict
+    boundary-tracing convention. Captures the full per-cycle request
+    (state + menus) and the raw systemone response, independent of
+    anything the guardrail later decides to do with it."""
+    return client.ask(state, menus)
+
+
+@weave.op()
+def log_pilot_cycle(
+    cycle_id: int, phase: str, result_ok: bool, result_stale: bool,
+    result_error: str, latency_s: float, raw_answers: dict, gate_summary: dict,
+    accepted_throttle_choice: str, accepted_pitch_choice: str,
+    commanded_throttle: float, commanded_turn_axis: float,
+    extra_commands: list, watchdog_tag: str, watchdog_miss_count: int,
+    rejections_logged_total: int,
+) -> dict:
+    """One traced call per pilot cycle -- the tsAI-pilot equivalent of
+    controller.py's log_cycle_decision, bundling everything needed to
+    analyze a flight after the fact without cross-referencing multiple
+    traces: tsAI's raw per-menu choice+confidence, the guardrail's
+    accept/reject+band+reason per menu, the post-watchdog choice that
+    actually got acted on, and the real commands sent to the game this
+    cycle (including (B)/(C)'s `master on`/`stage <index>`)."""
+    return {
+        "cycle_id": cycle_id, "phase": phase,
+        "tsai_call": {"ok": result_ok, "stale": result_stale, "error": result_error,
+                      "latency_s": round(latency_s, 3)},
+        "raw_answers": raw_answers, "gate_summary": gate_summary,
+        "accepted": {"throttle_choice": accepted_throttle_choice,
+                     "pitch_choice": accepted_pitch_choice},
+        "commanded": {"throttle": round(commanded_throttle, 3),
+                      "turn_axis": round(commanded_turn_axis, 3),
+                      "extra_commands": extra_commands},
+        "watchdog": {"tag": watchdog_tag, "miss_count": watchdog_miss_count},
+        "rejections_logged_total": rejections_logged_total,
+    }
+
+
 class PilotRun:
     def __init__(self, client: SystemOneClient, mission_target: dict,
                  craft_mass_t: float, craft_dry_mass_t: float, craft_isp: float,
+                 craft_total_thrust_t: float,
                  max_cycles: int, cycle_period_s: float, live: bool):
         self.client = client
-        self.mission_target = mission_target
+        self.mission_target = dict(mission_target)  # copy -- don't mutate caller's dict
+        # 2026-09-13 fix: derive the flight profile from the mission
+        # target itself and build the menus FROM it, instead of one
+        # static, profile-blind module-level MENUS dict. See
+        # menus.mission_profile()'s docstring for the live failure this
+        # replaces. `profile` is also stored back onto mission_target so
+        # it shows up in every cycle's state.mission_target -- visible
+        # and auditable in the Weave trace, not just an internal
+        # assumption.
+        self.mission_target["profile"] = mission_profile(self.mission_target)
+        self.menus = build_menus(self.mission_target)
         self.craft_mass_t = craft_mass_t
         self.craft_dry_mass_t = craft_dry_mass_t
         self.craft_isp = craft_isp
+        self.craft_total_thrust_t = craft_total_thrust_t  # summed engine thrust
+        # (tonnes-force @ throttle=1.0) -- used to expose thrust-to-weight
+        # to tsAI (2026-09-13, Christian's explicit request), alongside
+        # mass_t. Real finding that motivated this: the craft sat on the
+        # pad at throttle 0.30 producing T/W < 1 (not enough to lift off)
+        # for an entire run with no way for tsAI to know that -- it could
+        # only see throttle and fuel_remaining_pct, neither of which says
+        # whether the CURRENT thrust level can overcome gravity at all.
         self.max_cycles = max_cycles
         self.cycle_period_s = cycle_period_s
         self.live = live
@@ -64,6 +166,10 @@ class PilotRun:
         self.current_throttle = 0.0
         self.rejections_logged = 0
         self.cycles_run = 0
+        self.master_ignited = False  # tracks whether `master on` has been sent this run (B)
+        self.last_turn_axis = 0.0  # last commanded turn_axis, fed to predict() as the
+        # hypothetical continuation default ("if I keep doing what I'm
+        # currently doing, where do I end up") -- see build_cycle_state.
 
     def _vehicle_from_snapshot(self, snapshot: dict, torque_effective_raw: float) -> dict:
         px = snapshot.get("location.position.x", 0.0)
@@ -71,13 +177,29 @@ class PilotRun:
         vx = snapshot.get("location.velocity.x", 0.0)
         vy = snapshot.get("location.velocity.y", 0.0)
         body = fsim.PLANET_CONSTANTS["Earth"]
-        altitude_m = math.hypot(px, py) - body["radius_m"]
+        r = math.hypot(px, py)
+        altitude_m = r - body["radius_m"]
         rot_deg = math.degrees(snapshot.get("rb2d.rotation", 0.0))
         angv_dps = math.degrees(snapshot.get("rb2d.angularVelocity", 0.0))
         mass_t = snapshot.get("rb2d.mass", self.craft_mass_t)
         fuel_pct = max(0.0, min(100.0,
                                  100.0 * (mass_t - self.craft_dry_mass_t) /
                                  max(1e-6, self.craft_mass_t - self.craft_dry_mass_t)))
+        # 2026-09-13 addition (Christian's explicit request): mass_t and
+        # thrust-to-weight, both current and at full throttle, now exposed
+        # directly in state.vehicle. g_local uses the same confirmed
+        # gravity formula as everywhere else in this project (g = mu/r^2)
+        # rather than assuming a flat 9.8 -- the sim's own thrust formula
+        # (F = thrust_t * 9.8 * throttle) bakes in a FIXED 9.8 conversion
+        # constant unrelated to the actual body
+        # (sfs_physics_reference.md sec 2.2), so weight must be computed
+        # in the SAME units for the ratio to mean anything: weight_equiv =
+        # mass_t * (g_local / 9.8).
+        g_local = body["mu"] / (r * r) if r > 1.0 else 9.8
+        weight_equiv_t = mass_t * (g_local / 9.8)
+        thrust_to_weight_max = (self.craft_total_thrust_t / weight_equiv_t
+                                 if weight_equiv_t > 1e-9 else 0.0)
+        thrust_to_weight_current = thrust_to_weight_max * self.current_throttle
         return {
             "altitude_m": altitude_m,
             "vertical_speed_mps": vy,
@@ -87,18 +209,51 @@ class PilotRun:
             "throttle": self.current_throttle,
             "active_stage": 0,
             "fuel_remaining_pct": fuel_pct,
-        }, mass_t
+            "mass_t": mass_t,
+            "thrust_to_weight_max": thrust_to_weight_max,
+            "thrust_to_weight_current": thrust_to_weight_current,
+        }, mass_t, g_local
 
     def build_cycle_state(self, cycle_id: int, t: float, snapshot: dict,
                            torque_effective_raw: float) -> dict:
-        vehicle, mass_t = self._vehicle_from_snapshot(snapshot, torque_effective_raw)
+        vehicle, mass_t, g_local = self._vehicle_from_snapshot(snapshot, torque_effective_raw)
         feasibility = build_feasibility(
             current_mass_t=mass_t, dry_mass_t=self.craft_dry_mass_t, isp=self.craft_isp,
             torque_effective_raw=torque_effective_raw,
             delta_v_required_for_target_mps=self.mission_target.get(
                 "delta_v_required_for_target_mps", 0.0),
         )
-        prediction = build_prediction_block(None, horizon_s=15.0)
+        # 2026-09-13 fix: this was ALWAYS build_prediction_block(None, ...)
+        # -- a permanent null/low-confidence stub, every cycle, live
+        # flight included. tsAI's own menu instructions explicitly tell it
+        # to weigh "the forward prediction supplied in state" for ascent-
+        # shaping decisions; with that always null, pitch_action had zero
+        # real trajectory feedback during an actual ascent (confirmed:
+        # confidence never exceeded ~0.35, rejected by the guardrail every
+        # cycle, zero steering commanded for 13 straight cycles -- see
+        # BUILD_LOG.md's 2026-09-13 crash entry). predict()/
+        # observe_to_state() are pure forward-sim computation, no live
+        # game I/O, so this is safe to call in replay mode too.
+        predict_result = None
+        try:
+            predict_state = ai_predict.observe_to_state(snapshot)
+            predict_result = ai_predict.predict(
+                predict_state, waypoints=[], duration_s=15.0,
+                default_throttle=self.current_throttle,
+                default_turn_axis=self.last_turn_axis,
+            )
+        except Exception as e:  # noqa: BLE001 -- never let a predict() failure crash
+            # the flight loop; falling back to the old null stub is a
+            # regression to prior (safe, if uninformative) behavior, not
+            # a new failure mode.
+            log(f"cycle {cycle_id}: predict() failed ({e}) -- falling back to "
+                f"low-confidence stub")
+        prediction = build_prediction_block(
+            predict_result, horizon_s=15.0,
+            target_altitude_m=self.mission_target.get("apoapsis_m"),
+            current_altitude_m=vehicle["altitude_m"],
+            current_vertical_speed_mps=vehicle["vertical_speed_mps"],
+            g_local_mps2=g_local)
         # Phase must match the REAL state, not just always claim ascent --
         # a "PAD_IDLE" craft (throttle 0, negligible speed, low altitude)
         # mislabeled as mid-gravity-turn is exactly the kind of
@@ -119,37 +274,57 @@ class PilotRun:
         reached this call)."""
         t = snapshot.get("t", float(cycle_id))
         state = self.build_cycle_state(cycle_id, t, snapshot, torque_effective_raw)
+        phase = state["phase"]
+        extra_commands = []  # real non-throttle/turn commands to send this cycle (B/C)
+        answers = {}
+        gate_results = {}
 
-        result = self.client.ask(state, MENUS)
+        result = traced_tsai_ask(self.client, state, self.menus)
         if not result["ok"] or result["stale"]:
             reason = result["error"] or f"stale response ({result['latency_s']:.2f}s)"
             log(f"cycle {cycle_id}: MISS ({reason})")
             self.watchdog.record_miss()
         else:
             answers = result["answers"].get("answers", {})
-            gate_results = {}
-            for qname in MENUS:
+            for qname in self.menus:
                 ans = answers.get(qname)
                 if ans is None:
                     gate_results[qname] = None
                     continue
                 gate_results[qname] = evaluate(qname, ans, state)
                 gr = gate_results[qname]
-                log(f"cycle {cycle_id}: {qname} choice={ans.get('choice')!r} "
-                    f"conf={ans.get('confidence')} -> "
+                shown = ans.get("choice", ans.get("score"))
+                log(f"cycle {cycle_id}: {qname} answer={shown!r} "
+                    f"conf={confidence_of(ans):.3f} -> "
                     f"{'ACCEPT' if gr.accepted else 'REJECT'} band={gr.band} "
                     f"reason={gr.reason}")
                 if not gr.accepted:
                     self.rejections_logged += 1
 
-            throttle_gate = gate_results.get("throttle_action")
+            # 2026-09-13: throttle control is now phase-split across two
+            # separate questions -- launch_decision (meaningful only
+            # PAD_IDLE) and throttle_score (meaningful only
+            # ASCENT_GRAVITY_TURN) -- both asked every cycle in parallel
+            # like everything else, but only the phase-relevant one is
+            # ever acted on below; the other's answer this cycle is
+            # logged above and otherwise ignored (see menus.py's
+            # LAUNCH_DECISION_MENU/THROTTLE_SCORE_MENU docstrings for why
+            # a `score` question can't also carry the PAD_IDLE liftoff
+            # decision in one question).
+            throttle_gate = gate_results.get(
+                "launch_decision" if phase == "PAD_IDLE" else "throttle_score")
             pitch_gate = gate_results.get("pitch_action")
             stage_gate = gate_results.get("stage_check")
 
             if throttle_gate and throttle_gate.accepted and pitch_gate and pitch_gate.accepted:
-                throttle_choice = answers["throttle_action"]["choice"]
-                pitch_choice = answers["pitch_action"]["choice"]
-                self.watchdog.record_hit(throttle_choice, pitch_choice)
+                pitch_choice_hit = answers["pitch_action"]["choice"]
+                # Throttle marker is always a dummy "hold" here -- see the
+                # HOLD-LAST handling below for why the real value is
+                # never read back for throttle (persistent/cumulative
+                # state; replaying any nonzero delta would double-apply
+                # it, the same class of bug 'launch' had before this
+                # rework, now closed for the whole throttle channel).
+                self.watchdog.record_hit("hold", pitch_choice_hit)
             else:
                 # A rejection with no vetted substitute this cycle counts
                 # as a miss (sec 6) -- there is no safe accepted answer
@@ -161,30 +336,167 @@ class PilotRun:
                 active_stage = state["vehicle"]["active_stage"]
                 if self.staging_tracker.should_fire(active_stage):
                     log(f"cycle {cycle_id}: stage_now ACCEPTED for stage {active_stage} "
-                        f"(NOT sent live -- see module docstring safety note)")
+                        f"-- SENDING `stage {active_stage}` LIVE this cycle (C)")
+                    extra_commands.append(f"stage {active_stage}")
                 else:
                     log(f"cycle {cycle_id}: stage_now for stage {active_stage} suppressed "
                         f"(already fired -- idempotency)")
 
         outcome = self.watchdog.resolve(SAFE_HOLD_THROTTLE_CHOICE, SAFE_HOLD_PITCH_CHOICE)
-        throttle_choice = outcome.throttle_choice or SAFE_HOLD_THROTTLE_CHOICE
         pitch_choice = outcome.pitch_choice or SAFE_HOLD_PITCH_CHOICE
-
-        throttle_delta = THROTTLE_DELTA.get(throttle_choice, 0.0)
-        if throttle_choice == "cut":
-            self.current_throttle = 0.0
-        else:
-            self.current_throttle = max(0.0, min(1.0, self.current_throttle + throttle_delta))
         turn_axis = TURN_AXIS_DELTA.get(pitch_choice, 0.0)
+        self.last_turn_axis = turn_axis  # fed to next cycle's predict() call
+
+        # 2026-09-13 fix, generalizing the earlier 'launch'-specific fix
+        # to the WHOLE throttle channel: throttle is persistent,
+        # cumulative state (self.current_throttle carries across cycles),
+        # unlike turn_axis (a fresh per-cycle rate command, safe to
+        # replay as-is). HOLD-LAST replaying ANY throttle delta -- not
+        # just 'launch's old +0.30 -- would double-apply it on top of
+        # what's already set. So HOLD-LAST for throttle now ALWAYS means
+        # "hold steady", same as DEGRADED-SAFE-HOLD, regardless of what
+        # was last accepted. Only a genuinely fresh, THIS-cycle LIVE
+        # accept ever changes self.current_throttle.
+        fresh_accept = not outcome.held_from_last and not outcome.degraded
+        throttle_label = "hold"
+
+        if fresh_accept and phase == "PAD_IDLE":
+            launch_choice = (answers.get("launch_decision") or {}).get("choice", "hold")
+            if launch_choice == "launch" and not self.master_ignited:
+                # 2026-09-13 (Christian's explicit request): 'launch' now
+                # fires the FULL liftoff sequence -- master ignition +
+                # stage arm + throttle -- instead of relying on
+                # stage_check to separately decide to arm engines. Real
+                # finding that led here: stage_check correctly says
+                # 'hold_stage' on a fresh, full-fuel stage (there's no
+                # fuel-exhaustion evidence yet), so on a previous run
+                # 'launch' fired but the engines were NEVER armed
+                # (engineOn stayed false) -- master on + throttle were
+                # both sent for real but produced zero thrust. Routed
+                # through the SAME staging_tracker idempotency
+                # stage_check uses, so if stage_check later also tries to
+                # fire this same index, it correctly sees it already
+                # fired (no double-toggle -- `stage <index>` is NOT
+                # idempotent, confirmed elsewhere in this project:
+                # repeated calls on the same index TOGGLE engineOn, they
+                # don't no-op).
+                active_stage = state["vehicle"]["active_stage"]
+                log(f"cycle {cycle_id}: launch accepted -- sending full liftoff "
+                    f"sequence LIVE this cycle: `master on` (B) + `stage {active_stage}` "
+                    f"(C) + throttle to 100%")
+                extra_commands.insert(0, "master on")
+                if self.staging_tracker.should_fire(active_stage):
+                    extra_commands.append(f"stage {active_stage}")
+                else:
+                    log(f"cycle {cycle_id}: stage {active_stage} already fired earlier -- "
+                        f"not re-arming (idempotency)")
+                self.master_ignited = True
+                self.current_throttle = 1.0
+                throttle_label = "launch"
+            # else: launch_choice == "hold"/"insufficient_data" -- stay put,
+            # throttle_label/current_throttle already correctly "hold".
+        elif fresh_accept:  # ASCENT_GRAVITY_TURN, fresh accept
+            score = answers["throttle_score"]["score"]
+            delta = throttle_score_to_delta(score)
+            self.current_throttle = max(0.0, min(1.0, self.current_throttle + delta))
+            throttle_label = f"score={score:.2f}(delta={delta:+.3f})"
+        # else: HOLD-LAST or DEGRADED-SAFE-HOLD -- self.current_throttle
+        # unchanged, throttle_label stays "hold".
 
         tag = "DEGRADED-SAFE-HOLD" if outcome.degraded else (
             "HOLD-LAST" if outcome.held_from_last else "LIVE")
-        log(f"cycle {cycle_id}: [{tag}] -> throttle={self.current_throttle:.2f} turn_axis={turn_axis:.2f}")
+        log(f"cycle {cycle_id}: [{tag}] throttle_decision={throttle_label!r} -> "
+            f"throttle={self.current_throttle:.2f} turn_axis={turn_axis:.2f}")
 
-        act_fn(self.current_throttle, turn_axis)
+        gate_summary = {
+            qname: (None if gr is None else
+                    {"accepted": gr.accepted, "band": gr.band, "reason": gr.reason})
+            for qname, gr in gate_results.items()
+        }
+        raw_answers = {
+            qname: (None if ans is None else
+                    {"choice": ans.get("choice"), "score": ans.get("score"),
+                     "confidence": confidence_of(ans)})
+            for qname, ans in answers.items()
+        }
+        log_pilot_cycle(
+            cycle_id=cycle_id, phase=state["phase"],
+            result_ok=result["ok"], result_stale=result["stale"], result_error=result["error"],
+            latency_s=result["latency_s"], raw_answers=raw_answers, gate_summary=gate_summary,
+            accepted_throttle_choice=throttle_label, accepted_pitch_choice=pitch_choice,
+            commanded_throttle=self.current_throttle, commanded_turn_axis=turn_axis,
+            extra_commands=list(extra_commands), watchdog_tag=tag,
+            watchdog_miss_count=self.watchdog.miss_count,
+            rejections_logged_total=self.rejections_logged,
+        )
+
+        act_fn(self.current_throttle, turn_axis, extra_commands,
+               full_authority_throttle=(throttle_label == "launch"))
 
         self.cycles_run += 1
         return self.cycles_run < self.max_cycles
+
+
+def _safe_shutdown_act(ai_module, command: str, max_attempts: int = 3,
+                        retry_delay_s: float = 0.5) -> None:
+    """Retries a shutdown command a bounded number of times before giving
+    up -- the same 2026-09-12 mod-unresponsive finding controller.py's
+    _call_with_retry exists for (sfsprobe can go unresponsive for a few
+    seconds, independent of anything wrong with the flight itself; this
+    live dry run hit it for real, right on this exact shutdown call).
+    This is the LAST line of defense (the run is already ending, in a
+    `finally` block) -- failure here must never crash silently or mask
+    whatever exception got us into `finally` in the first place: catch
+    broadly, warn loudly, never re-raise."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ai_module.act(command, allow_full_authority=True)
+            return
+        except TimeoutError as e:
+            log(f"  [WARN] shutdown command {command!r} timed out "
+                f"(attempt {attempt}/{max_attempts}): {e}")
+            if attempt < max_attempts:
+                time.sleep(retry_delay_s)
+        except Exception as e:  # noqa: BLE001 -- deliberately broad: this is the
+            # safety net, nothing here should ever propagate and hide the
+            # real error or leave a later shutdown command unsent.
+            log(f"  [CRITICAL] shutdown command {command!r} failed unexpectedly: {e}")
+            return
+    log(f"  [CRITICAL] shutdown command {command!r} failed after {max_attempts} attempts -- "
+        f"MANUAL INTERVENTION MAY BE NEEDED, check the game directly")
+
+
+def _preflight_feasibility_gate(mass_t: float, dry_mass_t: float, isp: float,
+                                 mission_target: dict) -> bool:
+    """ONE-TIME check, run once before the first cycle -- separate from
+    the per-cycle `feasibility` block in state_builder.py, which tracks
+    MARGIN as fuel burns DURING flight and is correctly recomputed every
+    cycle. This answers a different question, asked at a different time:
+    can this craft, at full fuel, ever reach this mission target at all?
+
+    2026-09-13 finding this exists to fix: without this, an infeasible
+    mission (this run's actual case -- see BUILD_LOG.md) never surfaced
+    as a clear, loud, one-time stop. It just looked like tsAI quietly
+    hesitating on the pad forever (cycle after cycle of ambiguous
+    low-confidence 'hold'), indistinguishable from ordinary caution
+    without pulling the Weave traces. Same underlying dry-mass-estimate
+    ballpark as the per-cycle check -- this doesn't fix that estimate's
+    accuracy, it just stops silently retrying an infeasible mission.
+
+    Returns True if feasible, False (after logging loudly) if not."""
+    available = compute_delta_v_remaining_mps(mass_t, dry_mass_t, isp)
+    required = mission_target.get("delta_v_required_for_target_mps", 0.0)
+    log(f"PREFLIGHT: available delta-v ~{available:.0f}m/s (isp={isp:.0f}, "
+        f"mass={mass_t:.1f}t, dry_est={dry_mass_t:.1f}t) vs required "
+        f"{required:.0f}m/s for mission target {mission_target}")
+    if available < required:
+        log(f"PREFLIGHT FAILED: MISSION INFEASIBLE -- need {required:.0f}m/s, "
+            f"craft has ~{available:.0f}m/s at full fuel. Not starting the "
+            f"pilot loop -- lower the mission target, or improve the "
+            f"dry-mass estimate, before trying again.")
+        return False
+    log("PREFLIGHT OK -- proceeding.")
+    return True
 
 
 def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> PilotRun:
@@ -208,11 +520,17 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
     log(f"live craft: mass={mass_t:.1f}t dry_est={dry_mass_t:.1f}t isp={isp:.0f} "
         f"total_thrust={total_thrust:.0f}t torque_idle={torque_idle}")
 
-    run = PilotRun(SystemOneClient(), mission_target, mass_t, dry_mass_t, isp,
+    run = PilotRun(SystemOneClient(), mission_target, mass_t, dry_mass_t, isp, total_thrust,
                    max_cycles, cycle_period_s, live=True)
 
-    def act_fn(throttle, turn_axis):
-        ai.act(f"throttle {throttle:.3f}")
+    if not _preflight_feasibility_gate(mass_t, dry_mass_t, isp, mission_target):
+        return run  # 0 cycles run -- nothing was ever commanded, nothing to shut down
+
+    def act_fn(throttle, turn_axis, extra_commands=None, full_authority_throttle=False):
+        for cmd in extra_commands or []:
+            log(f"  -> sending live: {cmd!r}")
+            ai.act(cmd)
+        ai.act(f"throttle {throttle:.3f}", allow_full_authority=full_authority_throttle)
         ai.act(f"turn {turn_axis:.3f}")
 
     cycle_id = 0
@@ -235,8 +553,36 @@ def run_live(max_cycles: int, cycle_period_s: float, mission_target: dict) -> Pi
             time.sleep(cycle_period_s)
     finally:
         log("run ending -- commanding safe throttle-down/attitude-hold")
-        ai.act("throttle 0.0", allow_full_authority=True)
-        ai.act("turn 0.0", allow_full_authority=True)
+        _safe_shutdown_act(ai, "throttle 0.0")
+        _safe_shutdown_act(ai, "turn 0.0")
+        if run.master_ignited:
+            log("run ending -- master ignition was sent this run, sending `master off` cleanup")
+            _safe_shutdown_act(ai, "master off")
+        # 2026-09-13 fix (#3): the script's own control ends here, but the
+        # game keeps running -- if the craft is still meaningfully
+        # airborne and moving, that's not obvious unless someone is
+        # watching closely (this is exactly what got missed before the
+        # 2026-09-13 crash: the run ended mid-climb at 170m/s with no
+        # loud signal that manual attention was now needed). Best-effort,
+        # read-only, never allowed to raise past this point.
+        try:
+            final_snapshot = ai.observe()
+            final_alt = math.hypot(
+                final_snapshot.get("location.position.x", 0.0),
+                final_snapshot.get("location.position.y", 0.0),
+            ) - fsim.PLANET_CONSTANTS["Earth"]["radius_m"]
+            final_vy = final_snapshot.get("location.velocity.y", 0.0)
+            if final_alt > 200.0 and abs(final_vy) > 10.0:
+                log(f"  [ATTENTION] craft is still airborne at shutdown: "
+                    f"altitude~{final_alt:.0f}m, vertical_speed~{final_vy:+.0f}m/s -- "
+                    f"pilot_loop control has ended, this needs YOUR attention now "
+                    f"(throttle/attitude/parachute) -- it will NOT auto-recover.")
+            else:
+                log(f"  final state: altitude~{final_alt:.0f}m, "
+                    f"vertical_speed~{final_vy:+.0f}m/s")
+        except Exception as e:  # noqa: BLE001 -- best-effort reporting only,
+            # never let this final check mask whatever got us into finally.
+            log(f"  [WARN] could not read final state for the airborne check: {e}")
 
     return run
 
@@ -250,12 +596,22 @@ def run_replay(log_path: str, max_cycles: int, mission_target: dict) -> PilotRun
                 ticks.append(d)
 
     mass_t, dry_mass_t, isp, torque_idle = 12.4, 6.0, 260.0, 850.0
-    run = PilotRun(SystemOneClient(), mission_target, mass_t, dry_mass_t, isp,
+    total_thrust = 20.0  # placeholder, same spirit as the other hardcoded
+    # replay-craft numbers above -- a rough single-small-engine figure,
+    # not measured. Only affects the new thrust_to_weight fields' realism
+    # in replay mode, not the guardrail/watchdog plumbing this harness
+    # actually tests.
+    run = PilotRun(SystemOneClient(), mission_target, mass_t, dry_mass_t, isp, total_thrust,
                    min(max_cycles, len(ticks)), cycle_period_s=0.0, live=False)
+
+    if not _preflight_feasibility_gate(mass_t, dry_mass_t, isp, mission_target):
+        return run  # 0 cycles run
 
     body = fsim.PLANET_CONSTANTS["Earth"]
 
-    def act_fn(throttle, turn_axis):
+    def act_fn(throttle, turn_axis, extra_commands=None, full_authority_throttle=False):
+        for cmd in extra_commands or []:
+            log(f"  (replay -- would also send: {cmd!r})")
         log(f"  (replay -- would send: throttle {throttle:.3f}, turn {turn_axis:.3f})")
 
     step = max(1, len(ticks) // max_cycles)
@@ -283,12 +639,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["live", "replay"], default="live")
     parser.add_argument("--max-cycles", type=int, default=20)
-    parser.add_argument("--cycle-period-s", type=float, default=1.0)
+    parser.add_argument("--cycle-period-s", type=float, default=0.5)
     parser.add_argument("--replay-log", default=os.path.join(HERE, "..", "manual_flight_log.jsonl"))
     args = parser.parse_args()
 
+    # 2026-09-13: lowered from 400 -- that value exceeded BOTH the live
+    # craft's (~252m/s) and replay craft's (~189m/s) delta-v estimates
+    # under state_builder's own 35%-wet-mass dry-mass ballpark, which
+    # meant the mission was infeasible before a single cycle ran (see
+    # _preflight_feasibility_gate and BUILD_LOG.md's 2026-09-13 entry).
+    # 150 clears both known estimates with margin. Still a placeholder,
+    # not a physically-derived number -- the real fix is a better
+    # dry-mass estimate, tracked separately.
     mission_target = {"apoapsis_m": 5000, "periapsis_m": 0,
-                       "delta_v_required_for_target_mps": 400.0}
+                       "delta_v_required_for_target_mps": 150.0}
 
     if args.mode == "live":
         run = run_live(args.max_cycles, args.cycle_period_s, mission_target)

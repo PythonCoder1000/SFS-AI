@@ -522,3 +522,114 @@ effect on real loop behavior (PAD_IDLE cycles now ACCEPT instead of
 REJECT) without any live game involvement.
 
 **Commit:** `checkpoint 6: PAD_IDLE menu framing fix + re-validated Cartesian check`
+
+## Checkpoint 7 — First attended live launches, four real bugs found and fixed, throttle_score switch, coast_apoapsis physics hint
+
+**Attended session, human watching throughout, multiple real `--mode
+live` runs, several real crashes/overshoots and reverts along the way.**
+This is the checkpoint Checkpoint 6 explicitly deferred to. Summarized
+here rather than at the same per-run detail level as Checkpoints 1-6 --
+see the Weave project `sfs-ai-hackathon` for full per-cycle traces of
+every run this session.
+
+**Four real bugs found live and fixed, in order:**
+1. **HOLD-LAST double-applied throttle deltas.** `launch`'s old +0.30
+   delta got replayed a second time by HOLD-LAST on the very next
+   missed/rejected cycle (confirmed live: 0.30 -> 0.60 with no real
+   tsAI decision behind the second jump). Generalized fix: throttle is
+   persistent/cumulative state, unlike turn_axis (a fresh per-cycle
+   rate command) -- HOLD-LAST for throttle now always means "hold
+   steady," never replays a delta, regardless of what was last
+   accepted.
+2. **`prediction` was permanently a null stub.** `build_cycle_state()`
+   always called `build_prediction_block(None, ...)` -- real
+   `predict()`/`observe_to_state()` (pure forward-sim, no live game
+   I/O) is now actually wired in every cycle, live and replay both.
+3. **No loud signal when the script's own control ended mid-flight.**
+   Added a best-effort final-state check in `run_live()`'s `finally`
+   block -- logs `[ATTENTION]` with real altitude/vertical-speed if the
+   craft is still meaningfully airborne when the run exits, since
+   pilot_loop.py ending does not mean the game stops.
+4. **`launch` fired master+throttle but never actually armed the
+   engines.** `stage_check` correctly says `hold_stage` on a fresh
+   full-fuel stage, so engines were never armed via that path --
+   `launch` now bundles `master on` + `stage <active_stage_index>` +
+   throttle together, routed through the same `StagingTracker`
+   idempotency `stage_check` uses.
+
+**Christian's explicit design changes, same session:**
+- `launch` sets throttle to 100% directly (not a delta), sent with
+  `allow_full_authority` to bypass the normal per-call clamp.
+- `mass_t`/`thrust_to_weight_max`/`thrust_to_weight_current` added to
+  `state.vehicle` (real finding: craft sat at throttle 0.30 producing
+  T/W<1, unable to lift off, with no way for tsAI to know that).
+- Mission-profile-aware pitch menu (`mission_profile()`/`build_menus()`
+  in `menus.py`): `periapsis_m<=0` now derives a `vertical_hop` profile
+  with pitch instructions that say `hold` is DEFAULT-correct and
+  `prograde`/`retrograde` are NOT an altitude fix -- fixes a real live
+  finding where the old generic "gravity-turn shaping" framing left
+  pitch genuinely torn between prograde/retrograde for an entire flight
+  that had no orbit to shape toward.
+- **`throttle_action` (choice, 6 fixed buckets) replaced by two
+  questions:** `launch_decision` (choice, PAD_IDLE-only binary) +
+  `throttle_score` (score, continuous, ASCENT_GRAVITY_TURN-only).
+  Motivated by a real live finding: a genuine correction need split
+  3 ways across adjacent discrete buckets (0.39/0.34/0.18), never
+  clearing the 0.5 confidence floor even though ~0.57 combined
+  probability agreed on SOME decrease.
+- **`score`-type native `confidence` investigated, NOT actually
+  broken.** Read as always-0 in early samples; a temporary
+  max-probability-derived workaround was built, then REMOVED after
+  testing deliberately extreme/unambiguous situations showed native
+  confidence tracks real situation clarity correctly (0.94/0.70 when
+  genuinely obvious). The real issue was never the confidence field --
+  it was genuine model uncertainty about magnitude in a moderate,
+  three-way-ambiguous overshoot.
+- **`coast_apoapsis_m`/`coast_apoapsis_error_m` added to
+  `state.prediction`** (`state_builder.compute_coast_apoapsis_m`):
+  closed-form energy-conservation estimate of where the craft would
+  coast to if thrust were cut THIS INSTANT, told to tsAI as the
+  PRIMARY magnitude signal for `throttle_score`. Directly motivated by
+  Christian's framing that tsAI wasn't trained on spaceflight physics,
+  so the fix is to hand it pre-computed physics answers instead of
+  making it eyeball raw numbers. Re-tested against the exact real
+  states that caused an earlier crash: max probability on the correct
+  bucket went from 0.36 (3-way split, rejected) to 0.70 (decisively
+  concentrated on `cut`, accepted) -- confirmed working on real crash
+  data, not just synthetic cases.
+
+**Live outcome, honestly: mixed, real progress, not fully solved.**
+Multiple live launches this session, most ending in the craft still
+airborne/overshooting at shutdown (`[ATTENTION]` firing as designed)
+and Christian reverting. The LAST run of the session (40 cycles, all
+four bugs fixed + `coast_apoapsis` hint in place) is the first run
+where the pilot ever made a confident, correct, LIVE throttle
+correction mid-flight (cycle 14: `score=2.10 conf=0.73 ACCEPT`,
+throttle 1.00->0.93, then 0.74 by cycle 15) -- previously unprecedented
+in this build. But the correction was insufficient in magnitude (0.74
+throttle still T/W~2.3, well above 1.0) and confidence for a FURTHER
+correction dropped back into reject territory for the rest of the
+flight, so the craft still ended airborne (~14-27km, +500-700 m/s) and
+was reverted. `stage_check` correctly recognized low fuel late in the
+flight (confidence rose to 0.81) and wanted to stage -- correctly
+suppressed by idempotency since stage 0 had already fired, no
+double-toggle.
+
+**Explicitly NOT done, carried to next session (Christian's stated
+focus):** `cartesian_check.py` has NOT been re-run against `launch` at
+100% throttle + bundled stage-arm -- the safety argument for that
+combination is flagged unverified in both `menus.py`'s and
+`pilot_loop.py`'s docstrings, not re-confirmed. Next session's explicit
+focus is different from a re-verification pass, though: how to
+communicate with tsAI more efficiently given it was never trained on
+spaceflight physics specifically -- reducing how much it has to guess,
+since guessing shows up as low confidence and gets correctly rejected.
+`coast_apoapsis_m` is one instance of that pattern (hand it a computed
+answer, not raw numbers to interpret) and it measurably worked on the
+crash-case retest -- but the live run shows one such hint isn't enough
+on its own to carry a full flight. See `bookkeeping/active_state.md`
+for the concrete next step.
+
+**Commit:** not yet made -- `guardrail.py`/`menus.py`/`pilot_loop.py`/
+`state_builder.py` all modified, uncommitted at session end (see
+`bookkeeping/active_state.md`).

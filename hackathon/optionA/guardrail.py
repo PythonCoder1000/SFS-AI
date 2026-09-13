@@ -11,7 +11,7 @@ loud, not swallowed.
 from dataclasses import dataclass
 from typing import Optional
 
-from menus import TURN_AXIS_DELTA, THROTTLE_DELTA, QUESTION_CLASS
+from menus import TURN_AXIS_DELTA, QUESTION_CLASS, throttle_score_to_delta
 
 # ---------------------------------------------------------------------------
 # 4.1 -- confidence bands
@@ -33,7 +33,17 @@ def confidence_of(answer: dict) -> float:
     BUILD_SPEC sec 3 -- so we use the documented analog
     abs(noul - 0.5) * 2 for that case. Never reads `.confidence` on a
     noul answer -- see the spec's explicit warning; that field simply
-    isn't there)."""
+    isn't there).
+
+    2026-09-13: previously had a temporary workaround here deriving
+    score's confidence from `probabilities` (max-probability proxy),
+    added after early samples all happened to show native confidence at
+    or near 0. Removed after further testing: deliberately extreme,
+    unambiguous situations showed native confidence tracking real
+    situation clarity correctly (0.94/0.70 when genuinely obvious, low
+    only when the situation was itself genuinely ambiguous) -- it was
+    never broken, just an honest signal. Trust it directly, same as
+    choice."""
     if "noul" in answer:
         return abs(answer["noul"] - 0.5) * 2.0
     return float(answer.get("confidence", 0.0))
@@ -73,23 +83,33 @@ def confidence_gate(question_name: str, answer: dict) -> GateResult:
 CAUTION_MARGIN = 1.5
 
 
-def check_throttle_feasibility(choice: str, state: dict, band: str) -> GateResult:
+def check_throttle_score_feasibility(score: float, state: dict, band: str) -> GateResult:
+    """2026-09-13: generalizes check_throttle_feasibility (below, now
+    unused/removed) to throttle_score's continuous scale -- same margin
+    logic, continuous instead of two fixed buckets. Only an INCREASE
+    (delta > 0) spends additional delta-v budget and needs a margin
+    check; hold/decrease/cut are always feasible from a budget
+    standpoint, same as before."""
+    delta = throttle_score_to_delta(score)
+    if delta <= 0.0:
+        return GateResult(True, band, None)
+
     feas = state.get("feasibility", {})
     dv_remaining = feas.get("delta_v_remaining_mps", 0.0)
     dv_required = feas.get("delta_v_required_for_target_mps", 0.0)
     margin = CAUTION_MARGIN if band == "caution" else 1.0
 
-    if choice in ("increase_small", "increase_large"):
-        # Spending more delta-v requires it to actually exist, with margin
-        # over what the remaining ascent still needs.
-        needed_margin_mps = 25.0 * margin if choice == "increase_small" else 75.0 * margin
-        if dv_remaining < dv_required + needed_margin_mps:
-            return GateResult(False, "reject",
-                               f"throttle {choice}: delta_v_remaining "
-                               f"{dv_remaining:.1f} < required {dv_required:.1f} "
-                               f"+ margin {needed_margin_mps:.1f}")
-    # decrease_small/decrease_large/hold/cut never spend additional
-    # delta-v budget -- always feasible from a budget standpoint.
+    # Scale the needed margin continuously with the size of the increase
+    # requested (25m/s at a token increase, up to 75m/s at the full
+    # +0.20 increase_large anchor) instead of two fixed thresholds --
+    # same spirit as the old 25/75 buckets, continuous instead of
+    # stepped.
+    needed_margin_mps = (25.0 + (delta / 0.20) * 50.0) * margin
+    if dv_remaining < dv_required + needed_margin_mps:
+        return GateResult(False, "reject",
+                           f"throttle_score {score:.2f} (delta={delta:+.3f}): "
+                           f"delta_v_remaining {dv_remaining:.1f} < required "
+                           f"{dv_required:.1f} + margin {needed_margin_mps:.1f}")
     return GateResult(True, band, None)
 
 
@@ -157,31 +177,44 @@ def check_stage_feasibility(choice: str, state: dict, band: str) -> GateResult:
 
 
 FEASIBILITY_CHECKS = {
-    "throttle_action": check_throttle_feasibility,
+    "throttle_score": check_throttle_score_feasibility,
     "pitch_action": check_pitch_feasibility,
     "stage_check": check_stage_feasibility,
 }
+# No entry for launch_decision -- same as before (the old code never had
+# a feasibility function for the 'launch' choice either): the confidence
+# gate plus tsAI's own thrust_to_weight_max/feasibility-aware criteria
+# are the only checks on that one, and the preflight gate
+# (_preflight_feasibility_gate in pilot_loop.py) already establishes the
+# mission is achievable at full fuel before launch is ever offered.
 
 
 def evaluate(question_name: str, answer: dict, state: dict) -> GateResult:
     """Full guardrail: confidence gate, then (if not already rejected)
-    feasibility check for the chosen option. `insufficient_data`/
-    `hold_stage` are never fed through feasibility -- they're always the
-    safe no-op regardless of confidence band, so accepting them needs no
-    physics check."""
+    feasibility check. `insufficient_data`/`hold_stage` are never fed
+    through feasibility -- they're always the safe no-op regardless of
+    confidence band, so accepting them needs no physics check.
+
+    2026-09-13: throttle_score answers carry `score`, not `choice` (no
+    named no-op value to skip the way insufficient_data/hold_stage are
+    for the choice-type questions) -- always run its feasibility check
+    once the confidence gate passes."""
     conf_result = confidence_gate(question_name, answer)
     if not conf_result.accepted:
-        return conf_result
-
-    choice = answer.get("choice")
-    if choice in ("insufficient_data", "hold_stage", None):
         return conf_result
 
     feasibility_fn = FEASIBILITY_CHECKS.get(question_name)
     if feasibility_fn is None:
         return conf_result
 
-    feas_result = feasibility_fn(choice, state, conf_result.band)
+    if question_name == "throttle_score":
+        feas_result = feasibility_fn(answer.get("score", 0.0), state, conf_result.band)
+    else:
+        choice = answer.get("choice")
+        if choice in ("insufficient_data", "hold_stage", None):
+            return conf_result
+        feas_result = feasibility_fn(choice, state, conf_result.band)
+
     if not feas_result.accepted:
         return feas_result
     return conf_result
